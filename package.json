@@ -1,0 +1,32 @@
+{
+  "name": "koda-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.7.0",
+  "scripts": {
+    "agent": "tsx src/cli.ts",
+    "calibrate:model": "tsx src/cli.ts calibrate-model",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "format": "prettier --write src tests/*.ts *.json README.md benchmarks",
+    "format:check": "prettier --check src tests/*.ts *.json README.md benchmarks"
+  },
+  "dependencies": {
+    "commander": "^14.0.0",
+    "execa": "^9.6.0",
+    "openai": "^5.0.0",
+    "smol-toml": "^1.8.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "prettier": "^3.9.6",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.0"
+  }
+}

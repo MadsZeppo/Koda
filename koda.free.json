@@ -1,0 +1,22 @@
+{
+  "maxParallel": 3,
+  "budgetUsd": 1,
+  "maxTokens": 200000,
+  "maxIterations": 18,
+  "maxMinutes": 20,
+  "commandTimeoutMs": 120000,
+  "maxOutputTokens": 4096,
+  "maxInputPrice": 1e-06,
+  "maxOutputPrice": 1e-06,
+  "stageMaxTokens": 30000,
+  "stageMaxUsd": 0.1,
+  "stageMaxMinutes": 4,
+  "race": false,
+  "models": {
+    "SCOUT_MODEL": "dots-studio/dots-3-note-preview:free",
+    "CHEAP_CODER_A": "dots-studio/dots-3-note-preview:free",
+    "CHEAP_CODER_B": "dots-studio/dots-3-note-preview:free",
+    "STRONG_MODEL": "dots-studio/dots-3-note-preview:free",
+    "FRONTIER_MODEL": "dots-studio/dots-3-note-preview:free"
+  }
+}

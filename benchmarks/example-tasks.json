@@ -1,0 +1,12 @@
+[
+  {
+    "name": "Arithmetic and dependent report",
+    "repo": "/absolute/path/to/initialized-math-fixture",
+    "baseCommit": "0000000000000000000000000000000000000000",
+    "task": "Fix signed addition and multiplication, then implement report(a,b) returning {sum, product} using both functions.",
+    "verify": [
+      "node --test tests/*.test.cjs",
+      "node -e \"const a=require('node:assert/strict');a.deepEqual(require('./report.cjs')(-4,7),{sum:3,product:-28})\""
+    ]
+  }
+]

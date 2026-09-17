@@ -1,0 +1,121 @@
+import { dirname, extname } from "node:path";
+import type { Subtask } from "../planner/schemas.js";
+import type { RepoProfile, VerificationResult } from "../types.js";
+import type { Features } from "./features.js";
+
+export type TaskKind =
+  | "implementation" | "debugging" | "frontend_ui" | "backend" | "fullstack"
+  | "testing" | "refactor" | "architecture" | "review" | "repo_scanning"
+  | "shell" | "devops" | "sql_database" | "documentation";
+export type Difficulty = "low" | "medium" | "high";
+export interface TaskDifficulty {
+  technicalComplexity: Difficulty;
+  visualComplexity: Difficulty;
+  architecturalComplexity: Difficulty;
+  interactionComplexity: Difficulty;
+  repoReasoningComplexity: Difficulty;
+  changeRisk: Difficulty;
+  contextUncertainty: Difficulty;
+}
+export interface TaskFingerprint {
+  primary: TaskKind;
+  secondary: TaskKind[];
+  languages: string[];
+  frameworks: string[];
+  scope: "single" | "localized" | "multi-file" | "cross-component";
+  effort: "tiny" | "normal" | "complex";
+  executionStrategy: string;
+  visualRelevant: boolean;
+  browserRelevant: boolean;
+  terminalHeavy: boolean;
+  repoReasoningHeavy: boolean;
+  architectureHeavy: boolean;
+  toolsRequired: boolean;
+  visionRequired: boolean;
+  verificationStrength: "strong" | "medium" | "weak";
+  difficulty: TaskDifficulty;
+  confidence: "high" | "medium";
+  reasons: string[];
+}
+
+/** Deterministic, per-subtask classification; no model call or history lookup. */
+export function taskFingerprint(
+  subtask: Subtask,
+  profile: RepoProfile,
+  features: Features,
+  effort: "tiny" | "normal" | "complex",
+  verification?: VerificationResult,
+): TaskFingerprint {
+  const text = `${subtask.title} ${subtask.objective}`.toLowerCase();
+  const paths = [...subtask.likelyReadPaths, ...subtask.likelyWritePaths];
+  const signal = `${text} ${paths.join(" ").toLowerCase()}`;
+  const kinds: TaskKind[] = [];
+  const add = (kind: TaskKind, yes: boolean) => { if (yes) kinds.push(kind); };
+  const frontend = /\b(?:ui|ux|frontend|react|vue|svelte|css|styling|component|layout|responsive|browser)\b|\.(?:tsx|jsx|css|scss)\b/.test(signal);
+  const backend = /\b(?:backend|api|server|endpoint|service|controller)\b/.test(signal);
+  add("architecture", /\b(?:architect|migration|schema redesign|system design)\b/.test(text));
+  add("sql_database", /\b(?:sql|database|postgres|sqlite|query|migration)\b|\.sql\b/.test(signal));
+  add("devops", /\b(?:deploy|docker|kubernetes|ci|pipeline|terraform|infra)\b/.test(signal));
+  add("fullstack", frontend && backend);
+  add("frontend_ui", frontend && !backend);
+  add("backend", backend && !frontend);
+  add("debugging", /\b(?:debug|bug|trace|investigat|diagnos|fix|repair)\w*\b/.test(text));
+  add("testing", /\b(?:test|regression|spec|coverage)\w*\b/.test(text));
+  add("refactor", /\brefactor\w*\b/.test(text));
+  add("review", /\breview\w*\b/.test(text));
+  add("repo_scanning", /\b(?:scan|search|inspect|find)\w*\b/.test(text));
+  add("shell", /\b(?:shell|command|script|bash)\b/.test(text));
+  add("documentation", paths.some((p) => /\.(?:md|mdx|rst|txt)$/i.test(p)) || /\b(?:readme|documentation|docs)\b/.test(text));
+  const primary: TaskKind = kinds.includes("debugging") ? "debugging"
+    : kinds.includes("refactor") ? "refactor"
+    : /\b(?:implement|add|build|create|introduce)\b/i.test(text) &&
+        !/^\s*(?:add|create|write)\s+(?:focused\s+)?(?:tests?|regression\s+tests?)\b/i.test(text)
+      ? "implementation"
+      : kinds[0] ?? "implementation";
+  const directories = new Set(subtask.likelyWritePaths.map(dirname));
+  const scope = features.requiresCrossModuleReasoning || directories.size > 1
+    ? "cross-component"
+    : subtask.likelyWritePaths.length > 1 ? "multi-file"
+    : subtask.likelyWritePaths.length === 1 ? "single" : "localized";
+  const visualRelevant = frontend || /\b(?:visual|design|screenshot|image|pixel)\b/.test(text);
+  const visionRequired = /\b(?:inspect|compare|read|analy[sz]e)\b.{0,40}\b(?:screenshot|image|picture)\b/.test(text);
+  const checks = verification?.checks ?? [];
+  // Generic build/typecheck is not evidence that subjective UI or prose meets the task.
+  const subjective = (visualRelevant && /\b(?:polish|redesign|design|look|feel|layout|spacing|color|visual|style|appearance|interface)\b/.test(text)) || kinds.includes("documentation");
+  const focusedCheck = subtask.verificationCommands.some((command) =>
+    /(?:^|\s)(?:tests?\/|[^\s]+\.test\.[cm]?[jt]s|[^\s]+\.spec\.[cm]?[jt]s)/.test(command) &&
+    !/[\*?]/.test(command));
+  const verificationStrength = subjective && !focusedCheck ? "weak"
+    : focusedCheck && checks.some((c) => c.outcome === "CHECK_PASS" || c.outcome === "CHECK_FAIL") ? "strong"
+    : focusedCheck || checks.length || profile.verificationCommands.length ? "medium" : "weak";
+  const high = (pattern: RegExp) => pattern.test(text);
+  const architecture = high(/\b(?:architect|migration|migrate|redesign|restructure|schema|cross.module)\w*\b/) || scope === "cross-component";
+  const stateFlow = high(/\b(?:state|data.flow|concurren|race.condition|distributed|auth|transaction)\w*\b/);
+  const interactions = high(/\b(?:interactive|animation|drag|workflow|form|navigation|accessibility)\w*\b/);
+  const technical: Difficulty = architecture || (stateFlow && scope !== "single") || effort === "complex" ? "high"
+    : stateFlow || kinds.includes("debugging") || scope === "multi-file" ? "medium" : "low";
+  const difficulty: TaskDifficulty = {
+    technicalComplexity: technical,
+    visualComplexity: visualRelevant ? high(/\b(?:redesign|design.system|complex.layout|pixel.perfect)\b/) ? "high" : "medium" : "low",
+    architecturalComplexity: architecture ? "high" : scope === "multi-file" ? "medium" : "low",
+    interactionComplexity: interactions && architecture ? "high" : interactions || stateFlow ? "medium" : "low",
+    repoReasoningComplexity: scope === "cross-component" || features.dependencyCount > 1 ? "high" : scope === "multi-file" || kinds.includes("repo_scanning") ? "medium" : "low",
+    changeRisk: high(/\b(?:security|auth|payment|database|migration|production|breaking)\b/) ? "high" : scope === "cross-component" ? "medium" : "low",
+    contextUncertainty: subtask.likelyWritePaths.length === 0 ? "high" : kinds.includes("repo_scanning") || features.contextBytes < 256 ? "medium" : "low",
+  };
+  const reasons = [`${primary} from task text and paths`, `${scope} write scope`, `${verificationStrength} executable verification evidence`];
+  return {
+    primary, secondary: kinds.filter((kind) => kind !== primary),
+    languages: [...new Set([...features.languages, ...paths.map(extname).filter((ext) => ext === ".sql").map(() => "sql")])],
+    frameworks: features.frameworks,
+    scope, effort, executionStrategy: features.executionStrategy,
+    visualRelevant, browserRelevant: /\b(?:browser|playwright|puppeteer|web page)\b/.test(text),
+    terminalHeavy: kinds.includes("shell") || kinds.includes("devops"),
+    repoReasoningHeavy: scope === "cross-component" || features.dependencyCount > 0 || kinds.includes("repo_scanning"),
+    architectureHeavy: kinds.includes("architecture") || features.requiresArchitectureReasoning,
+    toolsRequired: !subtask.readOnly,
+    visionRequired, verificationStrength, difficulty,
+    confidence: subtask.likelyWritePaths.length ? "high" : "medium",
+    reasons,
+  };
+}

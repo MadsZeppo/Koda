@@ -1,0 +1,1 @@
+{"name":"koda-e2e-fixture","private":true,"scripts":{"test":"node --test tests/*.test.cjs"}}
