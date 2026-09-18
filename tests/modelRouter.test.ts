@@ -9,6 +9,8 @@ import { extractFeatures, taskBucket } from "../src/router/features.js";
 import { rankCandidates } from "../src/router/modelRouter.js";
 import { History } from "../src/router/history.js";
 import { Catalog } from "../src/openrouter/catalog.js";
+import { Logger } from "../src/telemetry/logger.js";
+import { summarize } from "../src/telemetry/summary.js";
 const features = extractFeatures(
   {
     id: "fix",
@@ -115,6 +117,42 @@ test("durable smoothed history changes routing for matching task features", asyn
     assert.ok(rank([cheap, frontier], ledger.read())!.quality < 1);
     await writeFile(join(dir, "attempts.jsonl"), "partial", { flag: "a" });
     assert.equal(ledger.read().length, 50);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+test("failed final integration does not turn a worker success into model-quality failure", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "koda-history-final-"));
+  try {
+    const ledger = new History(dir);
+    ledger.record({ timestamp: new Date().toISOString(), runId: "failed-run", subtaskId: "fix",
+      modelRequested: cheap.id, modelServed: cheap.id, features,
+      verification: "VERIFIED_SUCCESS", wallClockMs: 1000,
+      inputTokens: 100, outputTokens: 20, costUsd: 0.001, escalated: false });
+    ledger.finalize("failed-run", "FAILED");
+    assert.equal(ledger.read().length, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+test("frontier rescue metric excludes initial frontier routing and counts later quality rescue", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "koda-frontier-metric-"));
+  try {
+    const logger = new Logger(dir, "metric-run", true);
+    const call = { subtaskId: "direct", role: "FRONTIER_MODEL", modelRequested: "frontier",
+      modelReturned: "frontier", stage: "implement", promptTokens: 10,
+      completionTokens: 10, costUsd: 0.01, wallClockMs: 100, cachedTokens: 0,
+      cacheWriteTokens: 0 };
+    const verification = { status: "VERIFIED_SUCCESS", dimensions: {}, checks: [] } as any;
+    logger.log("model_call", call);
+    assert.equal(summarize(logger, "VERIFIED_SUCCESS", 100, verification, []).frontierCalls, 0);
+    logger.log("escalation", { subtaskId: "direct", from: "CHEAP_CODER_A", to: "FRONTIER_MODEL" });
+    logger.log("model_call", call);
+    assert.equal(summarize(logger, "VERIFIED_SUCCESS", 200, verification, []).frontierCalls, 1);
+    logger.log("model_fallback", { subtaskId: "stable", from: "cheap", to: "frontier",
+      verifiedQualityFailure: true });
+    logger.log("model_call", { ...call, subtaskId: "stable" });
+    assert.equal(summarize(logger, "VERIFIED_SUCCESS", 300, verification, []).frontierCalls, 2);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -313,6 +351,11 @@ test("verified history moves inspect-fix-test from cheap to strong without conta
     choose(stable, [failure(0)])?.model.id,
     "cheap",
     "one failure is not a blacklist",
+  );
+  assert.equal(
+    choose(stable, [{ ...failure(0), reason: "HTTP 429 Too Many Requests" }])?.model.id,
+    "cheap",
+    "provider rate limits are not coding-quality failures",
   );
   const failures = Array.from({ length: 6 }, (_, i) => failure(i));
   assert.equal(

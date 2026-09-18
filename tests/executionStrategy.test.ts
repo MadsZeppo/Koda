@@ -40,7 +40,9 @@ test("execution strategy: an explicit tiny calculator correction is direct", () 
   }
   assert.deepEqual(directWritePaths(["calculator.cjs"], profile()), [
     "calculator.cjs",
-    "tests/calculator.test.cjs",
+  ]);
+  assert.deepEqual(directWritePaths(["calculator.cjs"], profile(), "Fix calculator and add a regression test"), [
+    "calculator.cjs", "tests/calculator.test.cjs",
   ]);
 });
 test("execution strategy: one explicit documentation or configuration path is direct", () => {
@@ -85,7 +87,7 @@ test("execution strategy: precise source target stays narrow while vague inferen
   assert.deepEqual(precise.likelyFiles, ["src/foo.ts"]);
   const vague = chooseExecutionStrategy("Fix the foo bug.", repository);
   assert.equal(vague.preciseTarget, undefined);
-  assert.ok(directWritePaths(vague.likelyFiles, repository).length > 1);
+  assert.deepEqual(directWritePaths(vague.likelyFiles, repository, "Fix the foo bug."), ["src/foo.ts"]);
 });
 test("execution strategy: monorepo complexity does not override one explicit target", () => {
   const monorepo = profile([

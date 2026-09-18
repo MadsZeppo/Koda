@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolve } from "node:path";
@@ -132,7 +132,7 @@ test("quality escalation is bounded and ignores infrastructure checks", () => {
   assert.equal(qualityFailure([{ outcome: "CHECK_PASS" }], false), false);
 });
 
-test("Pareto requests use tier plugin and per-attempt session; telemetry records served model and charged cost", async () => {
+test("Pareto requests use tier plugin and stable worker session; telemetry records served model and charged cost", async () => {
   const requests: any[] = [];
   const server = createServer(async (req, res) => {
     let body = "";
@@ -209,6 +209,8 @@ test("Pareto requests use tier plugin and per-attempt session; telemetry records
     assert.equal(requests[0].provider.require_parameters, true);
     assert.equal(requests[0].session_id, requests[1].session_id);
     assert.notEqual(requests[0].session_id, requests[2].session_id);
+    assert.deepEqual(requests[0].provider.sort, { by: "price", partition: "none" });
+    assert.deepEqual(requests[0].provider.preferred_max_latency, { p90: 3 });
     assert.equal(
       logger.events.find((e) => e.type === "model_call")?.modelReturned,
       "served-cheap-model",
@@ -356,6 +358,7 @@ for (const rescueToFrontier of [false, true])
             ],
           },
           adaptiveCoding: true,
+          specialistRouting: false,
           baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`,
           routing: { stateDirectory: join(root, "state") },
         });
@@ -383,3 +386,81 @@ for (const rescueToFrontier of [false, true])
       }
     },
   );
+
+for (const cheapFails of [false, true])
+  test(cheapFails
+    ? "specialist DIRECT routes cheap failed verification to stronger candidate"
+    : "specialist DIRECT completes focused fix cheaply with one terminal success", async () => {
+    const root = await mkdtemp(join(tmpdir(), "koda-specialist-direct-"));
+    const requests: any[] = [];
+    const server = createServer(async (req, res) => {
+      res.setHeader("content-type", "application/json");
+      if (req.url?.endsWith("/models")) {
+        res.end(JSON.stringify({ data: ["cheap", "strong"].map((id) => ({
+          id, context_length: 100000, supported_parameters: ["tools"],
+          pricing: { prompt: id === "cheap" ? "0.0000001" : "0.00001",
+            completion: id === "cheap" ? "0.0000002" : "0.00002" },
+        })) }));
+        return;
+      }
+      if (!req.url?.includes("chat/completions")) {
+        res.end(JSON.stringify({ data: [] }));
+        return;
+      }
+      let raw = "";
+      for await (const part of req) raw += part;
+      const body = JSON.parse(raw);
+      requests.push(body);
+      const bad = cheapFails && body.model === "cheap";
+      res.end(JSON.stringify({ id: `mock-${requests.length}`, model: body.model,
+        choices: [{ index: 0, finish_reason: "tool_calls", message: {
+          role: "assistant", content: null, tool_calls: [{ id: `write-${requests.length}`,
+            type: "function", function: { name: "write_file", arguments: JSON.stringify({
+              path: "src/calculator.js",
+              content: bad ? "export function add(a,b){return a-b}" : "export function add(a,b){return a+b}",
+            }) } }],
+        } }], usage: { prompt_tokens: 20, completion_tokens: 10, cost: 0.0001 } }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      await execa(process.execPath, [resolve("scripts/create-routing-fixtures.mjs"), root]);
+      const settings = await config(undefined, {
+        modelPool: { provider: "openrouter", models: [
+          { id: "cheap", tier: "cheap", qualityPrior: 0.94, latencyPriorMs: 500,
+            strengths: ["coding", "tool_use"] },
+          { id: "strong", tier: "strong", qualityPrior: 0.99, latencyPriorMs: 3000,
+            strengths: ["coding", "tool_use", "reasoning"] },
+        ] }, adaptiveCoding: false, specialistRouting: true,
+        baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`,
+        routing: { stateDirectory: join(root, "state") },
+      });
+      // Metadata is refreshed before execution; worker selection only reads the snapshot.
+      await new Gateway(settings, new Logger(join(root, "refresh-log"), "refresh", true),
+        new Budget(1, 10000, 30000)).modelRouter!.capabilities.refresh();
+      const result = await run({ repo: join(root, "direct"),
+        task: "Find why the test is failing, fix the implementation, and verify that all tests pass.",
+        config: settings, quiet: true, output: join(root, "report") });
+      assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
+      assert.equal(result.frontierCalls, 0);
+      assert.deepEqual(requests.map((request) => request.model),
+        cheapFails ? ["cheap", "strong"] : ["cheap"]);
+      const events = (await readFile(join(root, "report", "events.jsonl"), "utf8"))
+        .trim().split("\n").map((line) => JSON.parse(line));
+      assert.deepEqual(events.find((event) => event.type === "worker_scope")?.allowed_write_paths,
+        ["src/calculator.js"]);
+      assert.equal(events.find((event) => event.type === "coding_route_decision")?.task_bucket,
+        "localized_bugfix");
+      assert.equal(events.find((event) => event.type === "coding_route_decision")?.verification_strength,
+        "strong");
+      const attempts = events.filter((event) => event.type === "model_attempt");
+      assert.deepEqual(attempts.map((event) => event.verification),
+        cheapFails ? ["FAILED", "VERIFIED_SUCCESS"] : ["VERIFIED_SUCCESS"]);
+      assert.equal(attempts.some((event) => event.reason === "worker ended"), false);
+      assert.equal(events.find((event) => event.type === "coding_route_decision")?.candidate, "cheap");
+      if (cheapFails) assert.equal(events.find((event) =>
+        event.type === "coding_route_escalation")?.to, "strong");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(root, { recursive: true, force: true });
+    }
+  });

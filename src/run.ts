@@ -21,6 +21,7 @@ import {
 import {
   compileContext,
   compileTargetContext,
+  isTestPath,
 } from "./context/compiler.js";
 import { normalizePlan } from "./orchestrator/coalesce.js";
 import { compileTask } from "./planner/taskCompiler.js";
@@ -250,6 +251,8 @@ export async function run(options: RunOptions) {
           integration.path, options.task, prepared.writePaths, profile,
           profile.verificationCommands, gateway.config.context.maxPromptBytes,
           prepared.evidence,
+          "deterministic" in prepared && prepared.deterministic
+            ? prepared.evidence.relevantFiles.filter(isTestPath) : [],
         );
       logger.log("stable_context_focused", {
         subtaskId: subtask.id,
@@ -272,8 +275,6 @@ export async function run(options: RunOptions) {
         {
           compiledContext: implementationContext,
           evidence: prepared.evidence,
-          selectedCandidate: prepared.selected,
-          model: prepared.model,
           finalVerificationOnly: true,
           stableHandoff: prepared.handoff,
           repairPacket,
@@ -324,6 +325,7 @@ export async function run(options: RunOptions) {
           : directWritePaths(
               [...strategy.likelyFiles, ...context.localDependencies],
               profile,
+              options.task,
             ),
         integrationContract:
           "Satisfy the original task while preserving existing public interfaces",
@@ -503,7 +505,8 @@ export async function run(options: RunOptions) {
             branch: winner.wt.branch,
           });
         } else winner = await worker("");
-        if (winner.revision.changes.length)
+        if (winner.revision.changes.length) {
+          logger.log("integration_start", { subtaskId: subtask.id });
           await backend!.integrate(
             winner.revision,
             subtask.id,
@@ -541,6 +544,7 @@ export async function run(options: RunOptions) {
                 throw Error("Conflict resolution not verified");
             },
           );
+        }
         logger.log("task_complete", {
           subtaskId: subtask.id,
           verification: winner.result.verification.status,
@@ -698,8 +702,6 @@ export async function run(options: RunOptions) {
             {
               compiledContext: stableRepairContext.context,
               evidence: stableRepairContext.prepared.evidence,
-              selectedCandidate: stableRepairContext.prepared.selected,
-              model: stableRepairContext.prepared.model,
               finalVerificationOnly: true,
               adaptiveStartTier:
                 options.config.adaptiveCoding && !options.config.forceModel
@@ -1035,6 +1037,7 @@ export async function run(options: RunOptions) {
     console.log(
       `\n${status}\nWall clock: ${(summary.wallClockMs / 1000).toFixed(1)}s\nModel cost: $${summary.costUsd.toFixed(6)}${summary.costComplete ? "" : " (incomplete accounting)"}\nTotal tokens: ${summary.totalTokens}\nMax concurrent coding workers: ${summary.parallelPeak}\nEscalations: ${summary.escalations}\nFrontier rescue calls: ${summary.frontierCalls}`,
     );
+    console.log(`Latency (ms): ${JSON.stringify(summary.latencyBreakdown)}`);
     for (const [model, cost] of Object.entries(summary.models))
       console.log(`${model}: $${cost.costUsd.toFixed(6)}`);
     console.log(

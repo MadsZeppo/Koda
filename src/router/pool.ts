@@ -23,7 +23,7 @@ export const modelSchema = z.object({
 });
 export const poolSchema = z
   .object({
-    provider: z.literal("openrouter").default("openrouter"),
+    provider: z.string().min(1).default("openrouter"),
     models: z.array(modelSchema).min(1),
   })
   .refine(

@@ -987,6 +987,7 @@ test("large README TINY request uses a bounded edit_file window and preserves su
           ],
         },
         adaptiveCoding: true,
+        specialistRouting: false,
         baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`,
         routing: { stateDirectory: join(f.parent, "history") },
         context: {
@@ -1122,6 +1123,7 @@ test("Pareto endpoint parameter incompatibility falls back without raising TINY 
           ],
         },
         adaptiveCoding: true,
+        specialistRouting: false,
         baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`,
         routing: { stateDirectory: join(f.parent, "history") },
       }),
@@ -1217,6 +1219,7 @@ for (const recover of [true, false]) {
         config: await config(undefined, {
           models: {},
           adaptiveCoding: recover,
+          specialistRouting: false,
           modelPool: recover
             ? {
                 provider: "openrouter",

@@ -148,6 +148,7 @@ export class AgentTools {
   ) {}
   private contextRequests = 0;
   async execute(name: string, args: any) {
+    const started = Date.now();
     this.actions.push(
       `${name}:${args.path ?? args.command ?? args.query ?? ""}`,
     );
@@ -425,6 +426,7 @@ export class AgentTools {
       subtaskId: this.subtaskId,
       name,
       result: truncateBytes(text, this.resultBytes),
+      wallClockMs: Date.now() - started,
     });
     return truncateBytes(text, this.resultBytes);
   }

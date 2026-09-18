@@ -1,5 +1,7 @@
 import { WriteScope } from "../repo/writeScope.js";
-import { extractFeatures } from "../router/features.js";
+import { extractFeatures, taskBucket } from "../router/features.js";
+import { taskFingerprint } from "../router/taskFingerprint.js";
+import type { SpecialistEstimate } from "../router/routeOptimizer.js";
 import {
   codingDemand,
   nextCodingTier,
@@ -368,15 +370,27 @@ export async function implement(
   const effort =
     gateway.logger.events.findLast((e) => e.type === "execution_strategy")
       ?.execution_effort ?? "normal";
+  const fingerprint = taskFingerprint(subtask, profile, features, effort, verification);
   const demand =
     gateway.config.adaptiveCoding && !gateway.config.forceModel && pool
-      ? codingDemand(features, subtask, effort)
+      ? codingDemand(features, subtask, effort, fingerprint, gateway.config.routing.minimumQuality)
       : undefined;
-  let adaptiveTier: CodingTier | undefined = demand
+  const universalSelection = gateway.config.specialistRouting && !!pool &&
+    !gateway.config.forceModel && !options.selectedCandidate;
+  const specialistCascade: SpecialistEstimate[] = universalSelection
+    ? await pool!.selectSpecialist(fingerprint, features, subtask.id,
+        gateway.budget.remainingUsd(), options.raceGroup)
+    : [];
+  if (universalSelection && !specialistCascade.length)
+    throw Error("No discovered model has sufficient priced capability and quality evidence for this task");
+  let specialistIndex = 0;
+  let adaptiveTier: CodingTier | undefined = demand && !gateway.config.specialistRouting && !specialistCascade.length
     ? (options.adaptiveStartTier ?? demand.tier)
     : undefined;
   let adaptiveAttempt = 0;
-  let selected: Candidate | undefined = adaptiveTier
+  let selected: Candidate | undefined = specialistCascade.length
+    ? specialistCascade[0]
+    : adaptiveTier
     ? undefined
     : (options.selectedCandidate ??
       (pool
@@ -412,9 +426,30 @@ export async function implement(
     adaptiveTier && adaptiveTier !== "frontier"
       ? PARETO_CODE_MODEL
       : (selected?.model.id ?? options.model ?? gateway.config.registry[role]);
+  gateway.logger.log("coding_route_decision", {
+    subtaskId: subtask.id,
+    task_bucket: taskBucket(features),
+    verification_strength: fingerprint.verificationStrength,
+    task_risk: fingerprint.difficulty.changeRisk,
+    candidate: activeModel(),
+    estimated_success: specialistCascade[0]?.quality ?? null,
+    estimated_attempt_cost: specialistCascade[0]?.cost ?? null,
+    estimated_total_cost: specialistCascade[0]?.expectedCompletionCost ?? null,
+    quality_floor: specialistCascade[0]?.firstAttemptQualityFloor ??
+      demand?.qualityFloor ?? gateway.config.routing.minimumQuality,
+    evidence_source: specialistCascade[0]?.evidence.map((e) => e.source) ?? ["pareto_fallback"],
+    fallback: specialistCascade.slice(1).map((c) => c.model.id),
+  });
   let attemptStart = gateway.logger.events.length;
+  let terminalAttemptRecorded = false;
   const record = (status: string, escalated = false, reason?: string) => {
-    if (selected)
+    if (terminalAttemptRecorded) return;
+    terminalAttemptRecorded = true;
+    const meaningfulFailure = status === "FAILED" && (escalated ||
+      (verification.checks.some((check) => check.outcome === "CHECK_FAIL") &&
+        gateway.logger.events.slice(attemptStart).some((event) =>
+          event.type === "write_success" && event.subtaskId === subtask.id)));
+    if (selected && (status === "VERIFIED_SUCCESS" || meaningfulFailure))
       pool!.record(
         selected.model,
         features,
@@ -423,8 +458,10 @@ export async function implement(
         status,
         escalated,
         reason,
+        fingerprint,
       );
-    else if (adaptiveTier)
+    else if (adaptiveTier) {
+      pool?.recordServed(features, subtask.id, attemptStart, status, escalated, reason, fingerprint);
       gateway.logger.log("coding_attempt", {
         subtaskId: subtask.id,
         tier: adaptiveTier,
@@ -433,6 +470,7 @@ export async function implement(
         escalated,
         reason,
       });
+    }
     attemptStart = gateway.logger.events.length;
   };
   const tools = new AgentTools(
@@ -671,6 +709,9 @@ export async function implement(
             : "") +
           (options.tinyDirect
             ? "\nThe task is already scoped. Current target content is provided. Do not read, search, inspect, or run commands. Make the requested mutation now with the available write tool. Verification runs after mutation; no completion announcement is needed."
+            : !options.stableHandoff && writeScope.paths.length > 0 &&
+                writeScope.paths.every((file) => context.files.some((entry) => entry.path === file))
+              ? "\nThe relevant source is already in the supplied context. If it is sufficient, mutate now; do not reread it or run redundant exploratory commands. The runtime performs authoritative verification."
             : ""),
       },
       {
@@ -1702,7 +1743,7 @@ export async function implement(
         ...assessment,
       });
       const verifiedQualityFailure =
-        !!adaptiveTier &&
+        (!!adaptiveTier || specialistCascade.length > 0) &&
         (tinyBoundedNoMutation ||
           (qualityFailure(after.checks, assessment.escalate) &&
             (diff !== beforeDiff || assessment.escalate)));
@@ -1766,14 +1807,30 @@ export async function implement(
           record("FAILED", true, "stalled or stage budget");
           excluded.push(previousCandidate.model.id);
           try {
-            selected = await pool.select(
-              features,
-              subtask.id,
-              excluded,
-              previousCandidate.model,
-              true,
-            );
+            selected = specialistCascade.length
+              ? specialistIndex + 1 < specialistCascade.length
+                ? specialistCascade[++specialistIndex]
+                : previousCandidate.model.tier === "frontier"
+                  ? undefined
+                  : await pool.selectFrontierRescue(features, subtask.id)
+              : await pool.select(
+                  features,
+                  subtask.id,
+                  excluded,
+                  previousCandidate.model,
+                  true,
+                );
+            if (!selected || selected.model.id === previousCandidate.model.id)
+              throw Error("No stronger eligible coding candidate remains");
             next = poolRole();
+            gateway.logger.log("coding_route_escalation", {
+              subtaskId: subtask.id,
+              from: previousCandidate.model.id,
+              to: selected!.model.id,
+              to_role: selected!.model.tier === "frontier" ? "FRONTIER_MODEL" : poolRole(),
+              reason: after.checks.some((check) => check.outcome === "CHECK_FAIL")
+                ? "focused_verification_failed" : "bounded_no_progress",
+            });
           } catch (error) {
             if (
               options.stableHandoff &&
@@ -1834,6 +1891,7 @@ export async function implement(
           handoff,
         });
         role = next;
+        terminalAttemptRecorded = false;
         stageIterations = 0;
         stageTokens = 0;
         stageCost = 0;
@@ -1869,7 +1927,7 @@ export async function implement(
     }
     throw Error("Subtask iteration budget exhausted");
   } finally {
-    if (!infrastructureFailure)
+    if (!infrastructureFailure && !terminalAttemptRecorded)
       record(
         verification.status === "NOT_FULLY_VERIFIED"
           ? verification.status

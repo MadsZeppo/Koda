@@ -13,10 +13,12 @@ import type { Subtask } from "../planner/schemas.js";
 import { evidenceSchema } from "../planner/schemas.js";
 
 import type { WorkerContext } from "../context/compiler.js";
-import { compactProfile, isTestPath, resolveImports } from "../context/compiler.js";
+import { compactProfile, isSourcePath, isTestPath, resolveImports } from "../context/compiler.js";
+import { requestsTestMutation } from "../router/executionStrategy.js";
 import { boundMessages } from "../context/bounds.js";
 
 import { extractFeatures } from "../router/features.js";
+import { taskFingerprint } from "../router/taskFingerprint.js";
 import { WriteScope } from "../repo/writeScope.js";
 
 import { AgentTools, currentDiff, safePath, toolDefinitions } from "./tools.js";
@@ -58,6 +60,88 @@ export type StableImplementationHandoff = z.infer<typeof declarationSchema>;
 
 class StableDeclarationError extends Error {}
 class StableScopeTimeoutError extends Error {}
+
+/** Resolve only a unique implementation anchor backed by an existing focused test. */
+async function localStableScope(
+  gateway: Gateway, root: string, task: string, subtask: Subtask,
+  profile: RepoProfile, context: WorkerContext,
+) {
+  if (!/\b(?:fix|repair|correct)\b/i.test(task) ||
+      /\b(?:architect|migrat|refactor|redesign|across|cross.module)\b/i.test(task) ||
+      requestsTestMutation(task))
+    return undefined;
+  const known = new Set(profile.files);
+  const sources = context.files.map((file) => file.path)
+    .filter((file) => known.has(file) && isSourcePath(file) && !isTestPath(file));
+  const action = task.split(/\b(?:while|preserv\w*|without)\b/i)[0]!
+    .replace(/\b[\w./-]+\.test\.[cm]?[jt]sx?\b/gi, " ").toLowerCase();
+  const explicit = sources.filter((file) => task.includes(file));
+  const named = sources.filter((file) => {
+    const stem = posix.basename(file).replace(/\.[^.]+$/, "").toLowerCase();
+    const names = [stem, ...(stem.endsWith("s") ? [stem.slice(0, -1)] : [])];
+    return names.some((name) => name.length >= 3 &&
+      new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(action));
+  });
+  const safeText = async (file: string) => {
+    try {
+      const target = await safePath(root, file);
+      const stat = await lstat(target);
+      if (!stat.isFile() || stat.nlink !== 1 || await realpath(target) !== target) return undefined;
+      const bytes = await readFile(target);
+      if (bytes.length > 1024 * 1024) return undefined;
+      const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      return text.includes("\0") ? undefined : text;
+    } catch { return undefined; }
+  };
+  const tests = await Promise.all(profile.files.filter(isTestPath).slice(0, 64)
+    .map(async (file) => ({ file, text: await safeText(file) })));
+  const taskTargets = explicit.length ? explicit : named.length ? named : sources.length === 1 ? sources : [];
+  const directlyTested = taskTargets.filter((candidate) => tests.some(({ file, text }) =>
+    text !== undefined && resolveImports(file, text, known).includes(candidate)));
+  const anchors = taskTargets.length > 1 && directlyTested.length === 1
+    ? directlyTested : taskTargets;
+  if (anchors.length !== 1) return undefined;
+  const source = anchors[0]!;
+  const sourceText = await safeText(source);
+  if (sourceText === undefined) return undefined;
+  const sourceImports = await Promise.all(sources.filter((file) => file !== source)
+    .map(async (file) => ({ file, text: await safeText(file) })));
+  const focused = tests.filter(({ file, text }) => {
+    if (text === undefined) return false;
+    const imported = resolveImports(file, text, known);
+    return imported.includes(source) ||
+      imported.some((wrapper) => sourceImports.some((entry) =>
+        entry.file === wrapper && entry.text !== undefined &&
+        resolveImports(wrapper, entry.text, known).includes(source))) ||
+      posix.basename(file).toLowerCase().startsWith(
+        posix.basename(source).replace(/\.[^.]+$/, "").toLowerCase() + ".");
+  });
+  if (!focused.length || !profile.verificationCommands.length) return undefined;
+  const writePaths = [source];
+  const before = await currentDiff(root);
+  const evidence = evidenceSchema.parse({
+    relevantFiles: [source, ...focused.map(({ file }) => file)], symbols: [],
+    reproduction: `Existing focused test imports or matches ${source}`,
+    failingTests: [], likelyRootCause: `Requested implementation repair in ${source}`,
+    dependencies: resolveImports(source, sourceText, known), uncertainty: "low",
+    suggestedApproach: task,
+    evidence: [`Read ${source} locally`, ...focused.map(({ file }) => `Focused existing test ${file}`)],
+  });
+  const handoff = declarationSchema.parse({
+    issue: `Repair the requested behavior in ${source}`,
+    writePaths, evidence,
+    requiredChange: `Implement the requested repair in ${source}; preserve existing behavior.`,
+    regressionTest: `Run the existing focused test for ${source} and required repository checks.`,
+  });
+  if (await currentDiff(root) !== before) throw Error("Stable local scope resolution mutated workspace");
+  const scope = new WriteScope(writePaths, gateway.logger, subtask.id);
+  gateway.logger.log("stable_scope_locked", {
+    subtaskId: subtask.id, allowed_write_paths: scope.paths, deterministic: true,
+    focused_test_paths: focused.map(({ file }) => file),
+  });
+  return { writePaths: [...scope.paths], evidence, handoff,
+    selected: undefined, model: undefined, deterministic: true };
+}
 
 /**
  * Legacy parser kept for compatibility with existing tests.
@@ -184,6 +268,8 @@ export async function prepareStableWorker(
   profile: RepoProfile,
   context: WorkerContext,
 ) {
+  const local = await localStableScope(gateway, path, task, subtask, profile, context);
+  if (local) return local;
   const pool = gateway.modelRouter;
 
   const features = extractFeatures(
@@ -193,10 +279,20 @@ export async function prepareStableWorker(
     undefined,
     "stable",
   );
+  const fingerprint = taskFingerprint(subtask, profile, features, "normal");
+  const universalSelection = gateway.config.specialistRouting && !!pool &&
+    !gateway.config.forceModel;
+  const specialistCascade = universalSelection
+    ? await pool!.selectSpecialist(fingerprint, features, subtask.id,
+        gateway.budget.remainingUsd())
+    : [];
+  if (universalSelection && !specialistCascade.length)
+    throw Error("No discovered model has sufficient priced capability and quality evidence for Stable inspection");
+  let specialistIndex = 0;
 
-  let selected: Candidate | undefined = pool
+  let selected: Candidate | undefined = specialistCascade[0] ?? (pool && !universalSelection
     ? await pool.select(features, subtask.id)
-    : undefined;
+    : undefined);
 
   let model = selected?.model.id ?? gateway.config.registry.CHEAP_CODER_A;
 
@@ -391,13 +487,16 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
 
         pool.disabled.add(previous.id);
 
-        selected = await pool.select(
+        selected = universalSelection
+          ? specialistCascade[++specialistIndex]
+          : await pool.select(
           features,
           subtask.id,
           excluded,
           previous,
           true,
         );
+        if (!selected) throw error;
 
         model = selected.model.id;
 
@@ -518,7 +617,8 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
       if (!tests.length || (tests.length > 1 && tests[0]!.slice(0, 3) === tests[1]!.slice(0, 3)))
         return undefined;
     }
-    const paths = [...sources, ...tests.slice(0, 1).map((entry) => entry.slice(4))];
+    const paths = [...sources, ...(requestsTestMutation(task)
+      ? tests.slice(0, 1).map((entry) => entry.slice(4)) : [])];
     if (paths.length > 6 || !(await Promise.all(paths.map(safeExistingFile))).every(Boolean)) return undefined;
     return paths;
   };
@@ -818,7 +918,10 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
         const previous = selected.model;
         excluded.push(previous.id);
         try {
-          selected = await pool.select(features, subtask.id, excluded, previous, true);
+          selected = universalSelection
+            ? specialistCascade[++specialistIndex]
+            : await pool.select(features, subtask.id, excluded, previous, true);
+          if (!selected) throw Error("No verified tool-compatible model for Stable scope finalization");
         } catch {
           throw Error("No verified tool-compatible model for Stable scope finalization");
         }

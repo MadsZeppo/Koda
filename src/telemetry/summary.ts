@@ -18,6 +18,48 @@ export function summarize(
     } else if (event.type === "coding_worker_stop") active.delete(key);
   }
   const calls = logger.events.filter((e) => e.type === "model_call");
+  const elapsed = (start: any, end: any) => start && end
+    ? Math.max(0, Date.parse(end.timestamp) - Date.parse(start.timestamp)) : 0;
+  const first = (type: string) => logger.events.find((event) => event.type === type);
+  const sumMs = (type: string) => logger.events.filter((event) => event.type === type)
+    .reduce((total, event) => total + (event.wallClockMs ?? 0), 0);
+  const profilingMs = elapsed(first("profiling"), first("profile"));
+  const planningMs = first("planner_summary")?.planner_latency_ms ?? 0;
+  const discoveryMs = calls.filter((call) => ["discover", "inspect"].includes(call.stage))
+    .reduce((total, call) => total + call.wallClockMs, 0);
+  const scopeResolutionMs = logger.events.filter((event) => event.type === "stable_scope_locked")
+    .reduce((total, event) => {
+      const start = logger.events.find((candidate) => candidate.type === "task_start" &&
+        candidate.subtaskId === event.subtaskId);
+      return total + elapsed(start, event);
+    }, 0);
+  const integrationMs = logger.events.filter((event) => event.type === "integrated")
+    .reduce((total, event) => {
+      const start = logger.events.findLast((candidate) =>
+        candidate.type === "integration_start" && candidate.subtaskId === event.subtaskId);
+      return total + elapsed(start, event);
+    }, 0);
+  const frontierRescueSubtasks = new Set<string>();
+  const pendingQualityFallbacks = new Set<string>();
+  let frontierCalls = 0;
+  for (const event of logger.events) {
+    if (event.type === "escalation" && event.to === "FRONTIER_MODEL" &&
+        event.from !== "FRONTIER_MODEL")
+      frontierRescueSubtasks.add(event.subtaskId);
+    if (event.type === "coding_route_escalation" && event.to_role === "FRONTIER_MODEL")
+      frontierRescueSubtasks.add(event.subtaskId);
+    if (event.type === "coding_quality_escalation" && event.to === "frontier")
+      frontierRescueSubtasks.add(event.subtaskId);
+    if (event.type === "model_fallback" && event.verifiedQualityFailure === true)
+      pendingQualityFallbacks.add(event.subtaskId);
+    if (event.type === "model_call") {
+      if (event.role === "FRONTIER_MODEL" && pendingQualityFallbacks.has(event.subtaskId))
+        frontierRescueSubtasks.add(event.subtaskId);
+      if (event.role !== "FRONTIER_MODEL") pendingQualityFallbacks.delete(event.subtaskId);
+      if (event.role === "FRONTIER_MODEL" && frontierRescueSubtasks.has(event.subtaskId))
+        frontierCalls++;
+    }
+  }
   const models: Record<
     string,
     { costUsd: number; tokens: number; wallClockMs: number; calls: number }
@@ -45,6 +87,14 @@ export function summarize(
     runId: logger.runId,
     status,
     wallClockMs,
+    latencyBreakdown: {
+      profiling_ms: profilingMs, planning_ms: planningMs,
+      discovery_ms: discoveryMs, scope_resolution_ms: scopeResolutionMs,
+      model_wait_ms: calls.reduce((total, call) => total + call.wallClockMs, 0),
+      tool_ms: sumMs("tool_result"), verification_ms: sumMs("verification"),
+      integration_ms: integrationMs, final_verification_ms: sumMs("final_verification"),
+      wall_clock_ms: wallClockMs,
+    },
     costUsd: calls.reduce((n, c) => n + (c.costUsd ?? 0), 0),
     costComplete: !calls.some((c) => c.costUsd === null),
     totalTokens: calls.reduce(
@@ -78,6 +128,13 @@ export function summarize(
       outputTokens: c.completionTokens,
       costUsd: c.costUsd,
       wallClockMs: c.wallClockMs,
+      provider: c.provider ?? null,
+      ttftMs: c.ttftMs ?? null,
+      generationDurationMs: c.generationDurationMs ?? null,
+      tokensPerSecond: c.tokensPerSecond ?? null,
+      cachedTokens: c.cachedTokens ?? 0,
+      cacheWriteTokens: c.cacheWriteTokens ?? 0,
+      providerPolicy: c.providerPolicy ?? null,
       outcome: c.outcome,
     })),
     totalModelCalls: calls.length,
@@ -139,7 +196,7 @@ export function summarize(
       })),
     finalVerificationStatus: verification.status,
     escalations: logger.events.filter((e) => e.type === "escalation").length,
-    frontierCalls: calls.filter((c) => c.role === "FRONTIER_MODEL").length,
+    frontierCalls,
     mergeConflicts: logger.events.filter((e) => e.type === "merge_conflict")
       .length,
     verification,

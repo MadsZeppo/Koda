@@ -138,7 +138,16 @@ export async function implementStablePacket(
   });
 
   const pool = gateway.modelRouter;
-  let selected = options.selectedCandidate;
+  const universalSelection = gateway.config.specialistRouting && !!pool &&
+    !gateway.config.forceModel && !options.selectedCandidate && !options.model;
+  const specialistCascade = universalSelection
+    ? await pool!.selectSpecialist(fingerprint, features, subtask.id,
+        gateway.budget.remainingUsd(), options.raceGroup)
+    : [];
+  if (universalSelection && !specialistCascade.length)
+    throw Error("No discovered model has sufficient priced capability and quality evidence for this task");
+  let specialistIndex = 0;
+  let selected = specialistCascade[0] ?? options.selectedCandidate;
   let explicitModel = options.model;
   let role: Role =
     selected?.model.tier === "frontier"
@@ -152,14 +161,16 @@ export async function implementStablePacket(
     (candidate.metadata.supportedParameters.includes("tools") &&
       candidate.metadata.supportedParameters.includes("tool_choice"));
 
-  if (!selected && !explicitModel && pool) {
+  if (!selected && !explicitModel && pool && !universalSelection) {
     selected = await pool.select(features, subtask.id);
   }
   if (selected && pool && !requiresToolChoice(selected)) {
     while (selected && !requiresToolChoice(selected)) {
-      const previous = selected.model;
+      const previous: Candidate["model"] = selected.model;
       if (!excluded.includes(previous.id)) excluded.push(previous.id);
-      const nextSelected = await pool.select(
+      const nextSelected: Candidate | undefined = universalSelection
+        ? specialistCascade[++specialistIndex]
+        : await pool.select(
         features,
         subtask.id,
         excluded,
@@ -167,6 +178,7 @@ export async function implementStablePacket(
         true,
         options.raceGroup,
       );
+      if (!nextSelected) throw Error("No tool_choice-compatible Stable coding model available");
       if (excluded.includes(nextSelected.model.id))
         throw Error("No tool_choice-compatible Stable coding model available");
       selected = nextSelected;
@@ -303,7 +315,9 @@ export async function implementStablePacket(
       if (!excluded.includes(selected.model.id)) excluded.push(selected.model.id);
       try {
         const prior = selected.model;
-        const nextSelected = await pool.select(
+        const nextSelected = universalSelection
+          ? specialistCascade[++specialistIndex]
+          : await pool.select(
           features,
           subtask.id,
           excluded,
@@ -311,6 +325,7 @@ export async function implementStablePacket(
           true,
           options.raceGroup,
         );
+        if (!nextSelected) return false;
         // A pool implementation must honor exclusions, but defend the executor
         // against a stale/buggy selector returning the same exhausted model.
         if (excluded.includes(nextSelected.model.id)) return false;

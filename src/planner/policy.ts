@@ -127,16 +127,10 @@ export async function planningPolicy(
     complexity === "complex"
       ? "Dependencies, ordering, or cross-cutting scope require model planning"
       : "Insufficient evidence for deterministic decomposition";
-  const safeWords = new Set(
-    "fix repair the broken failing helper helpers formatter formatters parser parsers function functions test tests so all pass these are independent independently unrelated bugs bug components they and in of a an".split(
-      " ",
-    ),
-  );
-  const covered =
-    /^[\x00-\x7f]*$/.test(remaining) &&
-    (remaining.toLowerCase().match(/[a-z0-9_/-]+/g) ?? []).every((t) =>
-      safeWords.has(t),
-    );
+  // Concrete ownership and independent focused checks establish the work;
+  // wording outside the paths need not come from a small vocabulary. An
+  // additional mutation request, however, has no assigned owner here.
+  const extraWork = /\b(?:also|add|change|update|implement|create|remove|delete|refactor)\b/i.test(remaining);
   const targetPaths = [...matched].sort();
   const tests = profile.files.filter(isTestPath);
   const texts = new Map<string, { text: string; complete: boolean }>();
@@ -179,7 +173,7 @@ export async function planningPolicy(
     complexity !== "complex" &&
     !coupled &&
     !ambiguous &&
-    covered &&
+    !extraWork && targetPaths.every((file) => mentioned(task, file)) &&
     task.length <= 600 &&
     targetPaths.length >= 2 &&
     targetPaths.length <= 4 &&

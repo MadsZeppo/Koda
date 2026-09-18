@@ -26,14 +26,16 @@ export async function buildRepairPacket(
   verificationCommands: string[],
   maxPromptBytes: number,
   inspectionEvidence?: EvidencePacket,
+  readOnlyTestPaths: readonly string[] = [],
 ): Promise<{ packet: RepairPacket; context: WorkerContext }> {
   const known = new Set(profile.files);
-  const perFile = Math.max(1200, Math.min(5000, Math.floor((maxPromptBytes - 2500) / paths.length)));
+  const contextPaths = [...new Set([...paths, ...readOnlyTestPaths.filter(isTestPath)])];
+  const perFile = Math.max(1200, Math.min(5000, Math.floor((maxPromptBytes - 2500) / contextPaths.length)));
   const terms = (objective.toLowerCase().match(/[a-z]{4,}/g) ?? [])
     .filter((term) => !/^(?:with|from|that|this|tests|test|focused|change|preserve|behavior|implementation)$/.test(term));
   const files: RepairPacket["files"] = [];
   const importLinks: [string, string][] = [];
-  for (const file of paths) {
+  for (const file of contextPaths) {
     if (!known.has(file)) throw Error(`Stable locked path is absent from repo profile: ${file}`);
     const target = await safePath(root, file);
     if (!(await stat(target)).isFile()) throw Error(`Stable locked path is not a file: ${file}`);
@@ -68,7 +70,7 @@ export async function buildRepairPacket(
     relevantSymbols: profile.symbols.filter((symbol) =>
       paths.some((file) => symbol.startsWith(`${file}:`))).slice(0, 20),
     importLinks,
-    focusedTestPaths: paths.filter(isTestPath),
+    focusedTestPaths: contextPaths.filter(isTestPath),
     verificationCommands,
     evidenceSummary: (inspectionEvidence?.evidence ?? []).slice(0, 8),
   };
@@ -78,7 +80,7 @@ export async function buildRepairPacket(
     packet,
     context: {
       files: files.map((file) => ({ path: file.path, snippet: file.content })),
-      repoMap: [...paths],
+      repoMap: [...contextPaths],
       localDependencies: [...new Set(importLinks.map(([, dependency]) => dependency))]
         .filter((file) => !paths.includes(file)),
     },

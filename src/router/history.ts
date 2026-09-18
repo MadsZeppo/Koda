@@ -25,6 +25,20 @@ export interface Attempt {
   escalated: boolean;
   reason?: string;
 }
+export interface OperationalCall {
+  type: "operational_call";
+  timestamp: string;
+  runId: string;
+  subtaskId: string;
+  stage: string;
+  taskBucket: string;
+  modelRequested: string;
+  modelServed: string | null;
+  provider: string | null;
+  wallClockMs: number;
+  outcome: "response" | "error";
+  costUsd: number | null;
+}
 /** One append syscall per record (O_APPEND); no read/modify/write race between workers. */
 export class History {
   readonly path: string;
@@ -55,18 +69,11 @@ export class History {
             r.features &&
             Array.isArray(r.features.languages) &&
             typeof r.modelRequested === "string" &&
-            Number.isFinite(r.wallClockMs),
-        )
-        .map((r) =>
-          r.verification === "VERIFIED_SUCCESS" &&
-          finals.has(r.runId) &&
-          finals.get(r.runId) !== "VERIFIED_SUCCESS"
-            ? {
-                ...r,
-                verification: "FAILED",
-                reason: "Final run verification did not succeed",
-              }
-            : r,
+            Number.isFinite(r.wallClockMs) &&
+            // A later run-level failure removes provisional positive evidence;
+            // it does not prove this worker/model made a bad edit.
+            !(r.verification === "VERIFIED_SUCCESS" && finals.has(r.runId) &&
+              finals.get(r.runId) !== "VERIFIED_SUCCESS"),
         );
     } catch {
       return [];
@@ -83,6 +90,21 @@ export class History {
   }
   record(record: Attempt) {
     this.append(record);
+  }
+  recordOperation(record: OperationalCall) {
+    this.append(record);
+  }
+  readOperations(): OperationalCall[] {
+    try {
+      return readFileSync(this.path, "utf8").split("\n").flatMap((line) => {
+        try {
+          const row = JSON.parse(line);
+          return row?.type === "operational_call" &&
+            Number.isFinite(row.wallClockMs) && typeof row.modelRequested === "string"
+            ? [row as OperationalCall] : [];
+        } catch { return []; }
+      }).slice(-2000);
+    } catch { return []; }
   }
   finalize(runId: string, status: string) {
     this.append({

@@ -1,4 +1,5 @@
 import { PoolRouter } from "../router/modelRouter.js";
+import type { ModelDiscoveryAdapter } from "../router/capabilityRegistry.js";
 import OpenAI from "openai";
 import type {
   ChatCompletionMessageParam,
@@ -43,10 +44,12 @@ export class Gateway {
     readonly config: Config,
     readonly logger: Logger,
     readonly budget: Budget,
+    adapter?: ModelDiscoveryAdapter,
   ) {
-    if (config.modelPool) this.modelRouter = new PoolRouter(config, logger);
+    if (config.modelPool) this.modelRouter = new PoolRouter(config, logger, adapter);
     this.sdk = new OpenAI({
-      apiKey: process.env.OPENROUTER_API_KEY || "missing",
+      apiKey: ((config.modelPool?.provider ?? "openrouter") === "openrouter"
+        ? process.env.OPENROUTER_API_KEY : process.env.KODA_MODEL_API_KEY) || "missing",
       baseURL: config.baseUrl,
       maxRetries: 0,
       timeout: 120000,
@@ -115,6 +118,50 @@ export class Gateway {
       throw Error("Model unavailable or context limit exceeded");
     const promptPrice = Math.min(inputPrice, this.config.maxInputPrice),
       completionPrice = Math.min(outputPrice, this.config.maxOutputPrice);
+    const route = this.logger.events.findLast((event) =>
+      event.subtaskId === subtaskId && event.type === "coding_route_decision");
+    const fingerprint = this.logger.events.findLast((event) =>
+      event.subtaskId === subtaskId && event.type === "task_fingerprint")?.fingerprint;
+    const interactive = maxOutputTokens <= 4096;
+    const providerPolicy = {
+      require_parameters: true,
+      allow_fallbacks: !this.config.forceModel,
+      sort: { by: "price", partition: "none" },
+      ...(interactive
+        ? { preferred_max_latency: { p90: 3 } }
+        : { preferred_min_throughput: { p90: 50 } }),
+      max_price: { prompt: promptPrice, completion: completionPrice },
+    };
+    const openrouter = (this.config.modelPool?.provider ?? "openrouter") === "openrouter";
+    const role = this.logger.events.findLast((event) =>
+      event.type === "route" && event.subtaskId === subtaskId)?.role;
+    const reasoningEffort = metadata?.supportedParameters?.includes("reasoning") && stage === "implement"
+      ? role === "FRONTIER_MODEL" || route?.task_risk === "high" ||
+          fingerprint?.difficulty?.changeRisk === "high" ||
+          route?.verification_strength === "weak"
+        ? "high"
+        : (route?.verification_strength === "strong" && route?.task_risk === "low")
+          ? "low" : "medium"
+      : undefined;
+    const sessionId = `${this.logger.runId}/${subtaskId}`;
+    this.logger.log("provider_policy", { subtaskId, stage, model,
+      session_id: openrouter ? sessionId : null, provider: openrouter ? providerPolicy : null,
+      reasoning_effort: reasoningEffort ?? null });
+    const operation = (outcome: "response" | "error", served: string | null,
+      provider: unknown, wallClockMs: number, costUsd: number | null) => {
+      if (!this.modelRouter) return;
+      const providerName = typeof provider === "string" ? provider
+        : provider && typeof provider === "object"
+          ? String((provider as any).name ?? (provider as any).id ?? "") || null : null;
+      this.modelRouter.history.recordOperation({
+        type: "operational_call", timestamp: new Date().toISOString(),
+        runId: this.logger.runId, subtaskId, stage,
+        taskBucket: route?.task_bucket ??
+          (fingerprint?.primary ? `${fingerprint.primary}_${fingerprint.scope}` : "general"),
+        modelRequested: model, modelServed: served, provider: providerName,
+        wallClockMs, outcome, costUsd,
+      });
+    };
     const estimated =
       (tokenBound * promptPrice) / 1e6 +
       (maxOutputTokens * completionPrice) / 1e6;
@@ -130,6 +177,7 @@ export class Gateway {
           tool_choice: limits?.requireTool ? "required" : undefined,
           max_tokens: maxOutputTokens,
           stream: false,
+          ...(reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
           ...({
             ...(pareto
               ? {
@@ -141,18 +189,7 @@ export class Gateway {
                   ],
                 }
               : {}),
-            session_id: pareto
-              ? `${this.logger.runId}:${subtaskId}:tier-${limits!.codingRoute!.tier}:attempt-${limits!.codingRoute!.attempt}`
-              : `${this.logger.runId}/${subtaskId}`,
-            provider: {
-              require_parameters: true,
-              allow_fallbacks: !this.config.forceModel,
-              sort: "latency",
-              max_price: {
-                prompt: promptPrice,
-                completion: completionPrice,
-              },
-            },
+            ...(openrouter ? { session_id: sessionId, provider: providerPolicy } : {}),
           } as any),
         },
         { timeout: timeoutMs },
@@ -177,6 +214,13 @@ export class Gateway {
         routeReason: limits?.codingRoute?.reason,
         routeAttempt: limits?.codingRoute?.attempt,
         provider: (response as any).provider ?? null,
+        providerPolicy: openrouter ? providerPolicy : null,
+        sessionId: openrouter ? sessionId : null,
+        ttftMs: (response as any).ttft_ms ?? null,
+        generationDurationMs: (response as any).generation_duration_ms ?? null,
+        tokensPerSecond: Number.isFinite((response as any).generation_duration_ms) &&
+          (response as any).generation_duration_ms > 0
+          ? usage.completionTokens / ((response as any).generation_duration_ms / 1000) : null,
         timestampStart: new Date(start).toISOString(),
         timestampEnd: new Date().toISOString(),
         wallClockMs: Date.now() - start,
@@ -186,6 +230,8 @@ export class Gateway {
         responseId: response.id,
       });
       responseLogged = true;
+      operation("response", response.model ?? null, (response as any).provider,
+        Date.now() - start, usage.costUsd);
       if (usage.costUsd === null)
         throw Error(
           "OpenRouter omitted charged cost; stopping to avoid untracked spend",
@@ -256,6 +302,8 @@ export class Gateway {
           outcome: "error",
           error: String(e),
         });
+      if (!responseLogged) operation("error", null, null, Date.now() - start,
+        rejected || transient ? 0 : null);
       this.logger.log("model_error", {
         subtaskId,
         stage,

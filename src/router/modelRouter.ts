@@ -6,8 +6,8 @@ import type { Logger } from "../telemetry/logger.js";
 import { Catalog } from "../openrouter/catalog.js";
 import { History } from "./history.js";
 import { historyMatches, taskBucket, type Features } from "./features.js";
-import { tierRank, type PoolModel, type Metadata } from "./pool.js";
-import { CapabilityRegistry } from "./capabilityRegistry.js";
+import { type PoolModel, type Metadata } from "./pool.js";
+import { CapabilityRegistry, type ModelDiscoveryAdapter } from "./capabilityRegistry.js";
 import { optimizeSpecialists } from "./routeOptimizer.js";
 import type { TaskFingerprint } from "./taskFingerprint.js";
 export interface Candidate {
@@ -34,6 +34,9 @@ export function rankCandidates(
       (r) =>
         r.modelRequested === model.id &&
         historyMatches(r.features, features) &&
+        !/provider|infra|timeout|rate.limit|transport|\b429\b|HTTP 5\d\d|unavailable|unknown pricing/i.test(
+          r.verification === "FAILED" ? r.reason ?? "" : "",
+        ) &&
         (features.taskKind === "planning"
           ? ["DAG_VALIDATED", "FAILED"]
           : ["VERIFIED_SUCCESS", "FAILED"]
@@ -115,6 +118,7 @@ export class PoolRouter {
   constructor(
     readonly config: Config,
     readonly logger: Logger,
+    adapter?: ModelDiscoveryAdapter,
   ) {
     const dir =
       config.routing.stateDirectory ??
@@ -131,7 +135,7 @@ export class PoolRouter {
       config.modelPool!.models,
     );
     this.history = new History(dir);
-    this.capabilities = new CapabilityRegistry(config, this.catalog);
+    this.capabilities = new CapabilityRegistry(config, this.catalog, adapter);
   }
   async selectSpecialist(
     fingerprint: TaskFingerprint,
@@ -145,6 +149,7 @@ export class PoolRouter {
     );
     const result = optimizeSpecialists(
       models, fingerprint, features, this.history.read(), this.config, budgetUsd,
+      this.history.readOperations(),
     );
     const reserved = raceGroup ? this.raceSelections.get(raceGroup) ?? new Set<string>() : new Set<string>();
     const cascade = result.cascade.filter((candidate) => !reserved.has(candidate.model.id));
@@ -156,6 +161,7 @@ export class PoolRouter {
       subtaskId, fingerprint, reason: result.reason,
       verification_strength: fingerprint.verificationStrength,
       allowed_quality_regret: result.allowedRegret,
+      first_attempt_quality_floor: result.considered[0]?.firstAttemptQualityFloor ?? this.config.routing.minimumQuality,
       reference_model: result.reference?.model.id ?? null,
       reference_expected_success: result.reference?.quality ?? null,
       reference_conservative_success: result.reference?.conservativeQuality ?? null,
@@ -175,7 +181,14 @@ export class PoolRouter {
         call_cost_usd: Number.isFinite(candidate.cost) ? candidate.cost : null,
         expected_completion_cost_usd: Number.isFinite(candidate.expectedCompletionCost) ? candidate.expectedCompletionCost : null,
         latency_ms: candidate.latency,
+        call_count: candidate.callCount,
+        latency_ewma_ms: candidate.latencyEwmaMs,
+        latency_p50_ms: candidate.latencyP50Ms,
+        latency_p90_ms: candidate.latencyP90Ms,
+        latency_sla_passed: candidate.latencySlaPassed,
+        operational_error_rate: candidate.operationalErrorRate,
         evidence: candidate.evidence,
+        capability_evidence: models.find((item) => item.model.id === candidate.model.id)?.capabilityEvidence ?? [],
       })),
     });
     return cascade;
@@ -214,8 +227,10 @@ export class PoolRouter {
     fallback = false,
     raceGroup?: string,
   ) {
+    const discovered = this.config.specialistRouting
+      ? await this.capabilities.all() : undefined;
     const metadata = await this.catalog.get();
-    let models = this.config.modelPool!.models;
+    let models = discovered?.map((item) => item.model) ?? this.config.modelPool!.models;
     if (
       features.taskKind === "planning" &&
       this.config.routing.plannerCandidates
@@ -239,10 +254,7 @@ export class PoolRouter {
       (c) =>
         !excluded.includes(c.model.id) &&
         !this.disabled.has(c.model.id) &&
-        (!previous ||
-          fallback ||
-          tierRank[c.model.tier] > tierRank[previous.tier] ||
-          c.quality > previous.qualityPrior),
+        (!previous || fallback || c.model.id !== previous.id),
     );
     // A pinned evaluation model may be used for successive turns of the same
     // task. Run-local exclusion is for fallback candidates, not the pin.

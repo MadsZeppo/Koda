@@ -88,6 +88,135 @@ test("stable completion rejects writes accompanied by a failed targeted command"
   assert.equal(stableReadyForFinalVerification(paths, events, "", []), false);
 });
 
+test("Stable inspection uses the universal selector when local scope remains ambiguous", async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-stable-universal-route-"));
+  try {
+    await mkdir(join(root, "src"));
+    await writeFile(join(root, "src/first.js"), "export const first = 1;\n");
+    await writeFile(join(root, "src/second.js"), "export const second = 2;\n");
+    await git(root, "init", "-q");
+    await git(root, "config", "user.name", "Stable Selector Test");
+    await git(root, "config", "user.email", "stable-selector@test.local");
+    await git(root, "add", ".");
+    await git(root, "commit", "-qm", "baseline");
+    const logger = new Logger(join(root, ".git", "log"), "stable-universal", true);
+    const gateway = new Gateway(await config(undefined, { models: {} }), logger,
+      new Budget(1, 100000, 60000));
+    (gateway.config as any).specialistRouting = true;
+    let specialistCalls = 0;
+    (gateway as any).modelRouter = {
+      selectSpecialist: async (fingerprint: any, features: any) => {
+        specialistCalls++;
+        assert.equal(features.executionStrategy, "stable");
+        assert.equal(fingerprint.primary, "debugging");
+        assert.equal(fingerprint.visualRelevant, false);
+        return [{ model: { id: "qualified-worker", tier: "cheap", strengths: ["tool_use"] },
+          metadata: { supportedParameters: ["tools", "tool_choice"] } }];
+      },
+      select: async () => { throw Error("legacy Stable selection must not run"); },
+    };
+    (gateway as any).call = async (model: string) => {
+      assert.equal(model, "qualified-worker");
+      return { role: "assistant", content: null, tool_calls: [{ id: "no-scope", type: "function",
+        function: { name: "report_no_scope", arguments: JSON.stringify({ reason: "The relevant implementation is ambiguous" }) } }] };
+    };
+    const objective = "Inspect the two local implementations and fix the specific bug";
+    const work: Subtask = { id: "stable", title: objective, objective, dependsOn: [],
+      likelyReadPaths: ["src/first.js", "src/second.js"], likelyWritePaths: [], readOnly: true,
+      integrationContract: "", verificationCommands: [], estimatedDifficulty: "normal", parallelSafe: false };
+    await assert.rejects(prepareStableWorker(gateway, root, objective, work,
+      await profileRepo(root), { files: [], repoMap: [], localDependencies: [] }), /no actionable scope/i);
+    assert.equal(specialistCalls, 1);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("deterministic Stable repair locks source before any inspection-model call and keeps test read-only", async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-stable-local-scope-"));
+  try {
+    await mkdir(join(root, "src"));
+    await mkdir(join(root, "tests"));
+    await writeFile(join(root, "src/checkout.js"),
+      "import { subtotal } from './subtotal.js'; export const total = (items) => subtotal(items) - 1;\n");
+    await writeFile(join(root, "src/subtotal.js"), "export const subtotal = (items) => items.length;\n");
+    await writeFile(join(root, "tests/checkout.test.js"),
+      "import { test } from 'node:test'; import { total } from '../src/checkout.js'; test('total', () => { if (total([1,2]) !== 2) throw Error('wrong'); });\n");
+    await writeFile(join(root, "package.json"), JSON.stringify({ type: "module", scripts: { test: "node --test" } }));
+    await git(root, "init", "-q");
+    await git(root, "config", "user.name", "Stable Scope Test");
+    await git(root, "config", "user.email", "stable-scope@test.local");
+    await git(root, "add", ".");
+    await git(root, "commit", "-qm", "baseline");
+    const logger = new Logger(join(root, "log"), "local-stable", true);
+    const gateway = new Gateway(await config(undefined, { models: {} }), logger,
+      new Budget(1, 100000, 60000));
+    (gateway as any).call = async () => { throw Error("inspection model must not be called"); };
+    const objective = "Fix src/checkout.js total while preserving subtotal behavior. Verify tests pass.";
+    const subtask: Subtask = { id: "stable", title: objective, objective, dependsOn: [],
+      likelyReadPaths: ["src/checkout.js", "src/subtotal.js", "tests/checkout.test.js"],
+      likelyWritePaths: [], readOnly: true, integrationContract: "Preserve subtotal",
+      verificationCommands: [], estimatedDifficulty: "normal", parallelSafe: false };
+    const prepared = await prepareStableWorker(gateway, root, objective, subtask,
+      await profileRepo(root), { files: [
+        { path: "src/checkout.js", snippet: "export const total = (items) => subtotal(items) - 1;" },
+        { path: "src/subtotal.js", snippet: "export const subtotal = (items) => items.length;" },
+        { path: "tests/checkout.test.js", snippet: "import { total } from '../src/checkout.js'" },
+      ], repoMap: ["src/checkout.js", "src/subtotal.js", "tests/checkout.test.js"], localDependencies: [] });
+    assert.deepEqual(prepared.writePaths, ["src/checkout.js"]);
+    assert.equal(logger.events.filter((event) => event.type === "model_call").length, 0);
+    assert.equal(logger.events.find((event) => event.type === "stable_scope_locked")?.deterministic, true);
+    assert.ok(prepared.evidence.relevantFiles.includes("tests/checkout.test.js"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Stable resolves a test-to-wrapper-to-implementation chain without model inspection", async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-stable-import-chain-"));
+  try {
+    await mkdir(join(root, "src"));
+    await mkdir(join(root, "tests"));
+    await writeFile(join(root, "src/response.js"),
+      "import { findUser } from './users.js'; export const response = (id) => findUser(id);\n");
+    await writeFile(join(root, "src/users.js"), "export const findUser = (id) => ({ id: -1 });\n");
+    await writeFile(join(root, "tests/response.test.js"),
+      "import { test } from 'node:test'; import { response } from '../src/response.js'; test('user lookup', () => { if (response(3).id !== 3) throw Error('wrong user'); });\n");
+    await writeFile(join(root, "package.json"), JSON.stringify({ type: "module", scripts: { test: "node --test" } }));
+    await git(root, "init", "-q");
+    await git(root, "config", "user.name", "Stable Scope Test");
+    await git(root, "config", "user.email", "stable-scope@test.local");
+    await git(root, "add", ".");
+    await git(root, "commit", "-qm", "baseline");
+    const logger = new Logger(join(root, "log"), "chain-stable", true);
+    const gateway = new Gateway(await config(undefined, { models: {} }), logger,
+      new Budget(1, 100000, 60000));
+    (gateway as any).call = async () => { throw Error("inspection model must not be called"); };
+    const objective = "Fix user lookup shown by tests/response.test.js; preserve the response wrapper.";
+    const subtask: Subtask = { id: "stable", title: objective, objective, dependsOn: [],
+      likelyReadPaths: ["tests/response.test.js", "src/response.js", "src/users.js"],
+      likelyWritePaths: [], readOnly: true, integrationContract: "Keep the wrapper",
+      verificationCommands: [], estimatedDifficulty: "normal", parallelSafe: false };
+    const prepared = await prepareStableWorker(gateway, root, objective, subtask,
+      await profileRepo(root), { files: [
+        { path: "tests/response.test.js", snippet: "response(3).id !== 3" },
+        { path: "src/response.js", snippet: "response = (id) => findUser(id)" },
+        { path: "src/users.js", snippet: "findUser = (id) => ({ id: -1 })" },
+      ], repoMap: ["tests/response.test.js", "src/response.js", "src/users.js"], localDependencies: [] });
+    assert.deepEqual(prepared.writePaths, ["src/users.js"]);
+    assert.ok(prepared.evidence.relevantFiles.includes("tests/response.test.js"));
+    assert.equal(logger.events.filter((event) => event.type === "model_call").length, 0);
+    const apiTask = "Fix the user API response behavior so existing users still work and missing users return the expected 404 response. Verify all tests.";
+    const apiPrepared = await prepareStableWorker(gateway, root, apiTask,
+      { ...subtask, title: apiTask, objective: apiTask }, await profileRepo(root),
+      { files: [
+        { path: "tests/response.test.js", snippet: "import { response } from '../src/response.js'" },
+        { path: "src/response.js", snippet: "response = (id) => findUser(id)" },
+        { path: "src/users.js", snippet: "findUser = (id) => ({ id: -1 })" },
+      ], repoMap: ["tests/response.test.js", "src/response.js", "src/users.js"], localDependencies: [] });
+    assert.deepEqual(apiPrepared.writePaths, ["src/response.js"]);
+    assert.equal(logger.events.filter((event) => event.type === "model_call").length, 0);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("coupled implementation and test paths lock together while unrelated files stay unwritable", async () => {
   const root = await mkdtemp(join(tmpdir(), "koda-coupled-scope-"));
   const repo = join(root, "repo");
@@ -932,6 +1061,8 @@ test("stable mode locks scope, preserves work across transient fallback, and ver
       firstCoderRequest.messages[0].content,
       /Inspection is complete\. Implement the change now/,
     );
+    assert.match(firstCoderRequest.messages[0].content, /The RepairPacket contains the locked file contents/);
+    assert.match(firstCoderRequest.messages[0].content, /Do not read, search, inspect, or run commands/);
     const coderInput = JSON.parse(firstCoderRequest.messages[1].content);
     assert.match(coderInput.inspectionHandoff.issue, /Fix addition/);
     assert.match(coderInput.inspectionHandoff.requiredChange, /Inspect src\/calculator\.cjs/);

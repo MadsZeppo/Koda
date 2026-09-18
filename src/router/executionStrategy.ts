@@ -276,11 +276,22 @@ export function chooseExecutionStrategy(
   };
 }
 
+export function requestsTestMutation(task: string): boolean {
+  return /\b(?:add|write|create|update|change|modify|fix|repair|remove|delete)\s+(?:(?:a|an|one|the|existing|focused|regression|unit|integration|failing|broken)\s+){0,5}tests?\b/i.test(task) ||
+    /\b(?:add|implement|create)\b[^\n]{0,160}\bwith\s+(?:focused|regression)\s+tests?\b/i.test(task) ||
+    /\btests?\b[^.;\n]{0,80}\b(?:is|are)\s+(?:wrong|broken|incorrect)\b/i.test(task);
+}
+
 export function directWritePaths(
   files: string[],
   profile: RepoProfile,
+  task = "",
 ): string[] {
-  const stems = files.map((f) =>
+  // A matching regression test is verification context, not write permission.
+  // Explicit requests to change tests retain a coupled implementation scope.
+  const changeTests = requestsTestMutation(task);
+  const implementation = files.filter((file) => !isTestPath(file));
+  const stems = implementation.map((f) =>
     posix
       .basename(f)
       .replace(/\.[^.]+$/, "")
@@ -289,14 +300,16 @@ export function directWritePaths(
 
   return [
     ...new Set([
-      ...files,
+      ...implementation,
       ...profile.files.filter(
         (f) =>
+          changeTests &&
           isTestPath(f) &&
           stems.some((stem) =>
             posix.basename(f).toLowerCase().split(/[._-]/).includes(stem),
           ),
       ),
+      ...(changeTests ? files.filter(isTestPath) : []),
     ]),
   ];
 }

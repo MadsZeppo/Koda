@@ -16,12 +16,30 @@ export class Catalog {
     readonly models: PoolModel[],
   ) {}
   get() {
+    if (this.models.every((model) => this.dynamic.has(model.id)))
+      return Promise.resolve(new Map(this.dynamic));
     return (this.pending ??= this.load()).then(
       (configured) => new Map([...configured, ...this.dynamic]),
     );
   }
   addDynamic(models: Iterable<[string, Metadata]>) {
     for (const [id, metadata] of models) this.dynamic.set(id, metadata);
+  }
+  /** Read-only routing snapshot. Metadata refresh belongs outside worker selection. */
+  async getCached() {
+    let entries: [string, Metadata][] = [];
+    try {
+      const cached = JSON.parse(await readFile(join(this.directory, "catalog.json"), "utf8"));
+      if (cached.baseUrl === this.baseUrl && Array.isArray(cached.entries))
+        entries = cached.entries.filter((entry: unknown) => Array.isArray(entry) &&
+          typeof entry[0] === "string" && metadataSchema.safeParse(entry[1]).success);
+    } catch {}
+    return new Map<string, Metadata>([
+      ...this.models.map((model): [string, Metadata] =>
+        [model.id, model.fallback ?? {}]),
+      ...entries,
+      ...this.dynamic,
+    ]);
   }
   private async load() {
     const path = join(this.directory, "catalog.json");

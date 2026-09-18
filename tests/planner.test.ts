@@ -14,6 +14,7 @@ import {
 import { compileTask } from "../src/planner/taskCompiler.js";
 import { rankPlanners, selectPlanner } from "../src/planner/routing.js";
 import { normalizePlan } from "../src/orchestrator/coalesce.js";
+import { schedule } from "../src/orchestrator/scheduler.js";
 import { Gateway } from "../src/openrouter/client.js";
 import { Budget } from "../src/openrouter/usage.js";
 import { Logger } from "../src/telemetry/logger.js";
@@ -236,6 +237,34 @@ for (const finalFailure of [false, true])
     }
   });
 
+test("two explicitly independent concrete repairs skip planner and scout calls and overlap", async () => {
+  const f = await fixture();
+  try {
+    const task = "Fix both independent bugs in src/a.ts and src/b.ts. They are independent repairs.";
+    const profile = await profileRepo(f.repo);
+    const c = await config(undefined, { models: {} });
+    const policy = await planningPolicy(task, profile, c.planner);
+    assert.equal(policy.strategy, "deterministic");
+    assert.deepEqual(policy.candidate?.subtasks.map((subtask) => subtask.likelyWritePaths),
+      [["src/a.ts"], ["src/b.ts"]]);
+    assert.ok(policy.candidate?.subtasks.every((subtask) =>
+      !subtask.readOnly && subtask.dependsOn.length === 0));
+    const gateway = new Gateway(c, new Logger(join(f.root, "local-plan"), "local-plan", true),
+      new Budget(1, 100000, 60000));
+    (gateway as any).call = async () => { throw Error("planner/scout model call forbidden"); };
+    const plan = await compileTask(gateway, task, profile);
+    assert.equal(gateway.logger.events.filter((event) => event.type === "model_call").length, 0);
+    let active = 0;
+    const result = await schedule(plan.subtasks, 2, async () => {
+      active++;
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      active--;
+    });
+    assert.equal(active, 0);
+    assert.equal(result.peak, 2);
+  } finally { await f.cleanup(); }
+});
+
 test("deterministic gate refuses missing tests, ambiguous aliases, extra requirements and coupled imports; context is bounded", async () => {
   const f = await fixture();
   try {
@@ -243,6 +272,15 @@ test("deterministic gate refuses missing tests, ambiguous aliases, extra require
     const profile = await profileRepo(f.repo);
     assert.equal(
       (await planningPolicy(task, profile, c.planner)).strategy,
+      "deterministic",
+    );
+    assert.equal(
+      (await planningPolicy("Repair the independent defects in src/a.ts and src/b.ts using their existing focused tests.", profile, c.planner)).strategy,
+      "deterministic",
+      "ordinary task wording must not force a paid planner or scouts when ownership is proven",
+    );
+    assert.equal(
+      (await planningPolicy("Fix both independent bugs in src/a.ts and src/b.ts. They are independent repairs. Make the smallest correct changes and verify all tests.", profile, c.planner)).strategy,
       "deterministic",
     );
     for (const text of [

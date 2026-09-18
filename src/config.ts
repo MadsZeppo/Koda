@@ -112,7 +112,7 @@ export async function config(
   const c = schema.parse({
     ...merged,
     adaptiveCoding: merged.adaptiveCoding ?? bundledPool,
-    specialistRouting: merged.specialistRouting ?? bundledPool,
+    specialistRouting: merged.specialistRouting ?? (bundledPool || merged.adaptiveCoding === true),
     ...Object.fromEntries(
       Object.entries(overrides).filter(([, v]) => v !== undefined),
     ),

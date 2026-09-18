@@ -7,13 +7,18 @@ import { createServer } from "node:http";
 import { modelSchema, routingSchema } from "../src/router/pool.js";
 import { Catalog } from "../src/openrouter/catalog.js";
 import { CapabilityRegistry } from "../src/router/capabilityRegistry.js";
+import { config } from "../src/config.js";
 import { PoolRouter } from "../src/router/modelRouter.js";
+import { Gateway } from "../src/openrouter/client.js";
+import { Budget } from "../src/openrouter/usage.js";
 import { Logger } from "../src/telemetry/logger.js";
 import { optimizeSpecialists } from "../src/router/routeOptimizer.js";
 import { taskFingerprint, type TaskFingerprint } from "../src/router/taskFingerprint.js";
 import { extractFeatures } from "../src/router/features.js";
+import { taskBucket } from "../src/router/features.js";
+import { chooseExecutionStrategy, directWritePaths } from "../src/router/executionStrategy.js";
 import type { SpecialistModel } from "../src/router/capabilityRegistry.js";
-import type { Attempt } from "../src/router/history.js";
+import type { Attempt, OperationalCall } from "../src/router/history.js";
 
 const profile = { files: ["src/Dashboard.tsx", "src/state.ts", "tests/dashboard.test.ts"], verificationCommands: ["pnpm test"] } as any;
 const subtask = (objective: string, paths = ["src/Dashboard.tsx"], checks: string[] = []) => ({
@@ -42,13 +47,246 @@ const strong: SpecialistModel = {
 };
 const settings = { maxOutputTokens: 1000, routing: routingSchema.parse({ maxQualityRegret: 0.025, latencyWeight: 0.4 }) } as any;
 const route = (fp: TaskFingerprint, features: ReturnType<typeof scenario>["features"],
-  history: Attempt[] = [], models = [cheap, strong]) =>
-  optimizeSpecialists(models, fp, features, history, settings, 10);
+  history: Attempt[] = [], models = [cheap, strong], operations: OperationalCall[] = []) =>
+  optimizeSpecialists(models, fp, features, history, settings, 10, operations);
 const observed = (model: string, fp: TaskFingerprint, features: ReturnType<typeof scenario>["features"],
   verification: string, reason?: string): Attempt => ({
   timestamp: "2026-01-01", runId: "r", subtaskId: "ui", modelRequested: model,
   modelServed: model, features, fingerprint: fp, verification, wallClockMs: 1000,
   inputTokens: 100, outputTokens: 100, costUsd: 0.01, escalated: verification !== "VERIFIED_SUCCESS", reason,
+});
+
+test("universal selector considers every discovered model and chooses the cheapest qualified specialty", () => {
+  const model = (id: string, strengths: string[], price: number): SpecialistModel => ({
+    model: modelSchema.parse({ id, tier: "fast", qualityPrior: 0.95,
+      latencyPriorMs: 1000, strengths: ["tool_use", ...strengths] }),
+    metadata: { available: true, inputPrice: price, outputPrice: price,
+      contextLength: 100000, supportedParameters: ["tools"] },
+    vision: false, configured: true,
+    evidence: [{ source: "configured_prior", value: 0.95, detail: "configured capability" }],
+  });
+  const fillers = Array.from({ length: 10 }, (_, i) => model(`filler-${i}`, ["coding"], 0.01));
+  const ui = model("ui-specialist", ["coding", "frontend_ui"], 0.2);
+  const database = model("database-specialist", ["coding", "sql_database"], 0.15);
+  const refactor = model("repo-refactor-specialist", ["coding", "refactor", "repo_scale"], 0.25);
+  const tiny = model("tiny-specialist", ["coding"], 0.005);
+  const all = [...fillers, ui, database, refactor, tiny];
+  const uiTask = scenario("Fix React UI layout", ["src/Dashboard.tsx"], ["node --test tests/dashboard.test.ts"]);
+  assert.equal(route(uiTask.fingerprint, uiTask.features, [], all).cascade[0]?.model.id, ui.model.id);
+  const dbTask = scenario("Fix SQL database query", ["src/query.sql"], ["node --test tests/query.test.ts"]);
+  assert.equal(route(dbTask.fingerprint, dbTask.features, [], all).cascade[0]?.model.id, database.model.id);
+  const refactorTask = scenario("Refactor repository module", ["src/state.ts"], ["node --test tests/state.test.ts"]);
+  assert.equal(route(refactorTask.fingerprint, refactorTask.features, [], all).cascade[0]?.model.id, refactor.model.id);
+  const tinyTask = scenario("Correct a value", ["src/state.ts"], ["node --test tests/state.test.ts"]);
+  const tinyResult = route(tinyTask.fingerprint, tinyTask.features, [], all);
+  assert.equal(tinyResult.considered.length, all.length, "no fixed shortlist truncates discovery");
+  assert.equal(tinyResult.cascade[0]?.model.id, tiny.model.id);
+  const unknown = model("unknown-specialty", [], 0.0001);
+  assert.match(route(dbTask.fingerprint, dbTask.features, [], [unknown, database]).considered
+    .find((candidate) => candidate.model.id === unknown.model.id)!.rejected!, /minimum quality|quality parity/);
+});
+
+test("missing soft domain tags remain eligible when benchmark evidence supports verified quality", () => {
+  const task = scenario("Debug backend request handling and refactor the failing path",
+    ["src/request.ts"], ["node --test tests/request.test.ts"]);
+  const economical: SpecialistModel = {
+    model: modelSchema.parse({ id: "economical-benchmarked", tier: "fast", qualityPrior: 0.99,
+      latencyPriorMs: 400, strengths: [] }),
+    metadata: { available: true, inputPrice: 0.1, outputPrice: 0.1,
+      contextLength: 100000, supportedParameters: ["tools"] },
+    vision: false, configured: true,
+    evidence: [{ source: "coding_benchmark", value: 0.98, detail: "coding" },
+      { source: "agentic_benchmark", value: 0.96, detail: "agentic" }],
+  };
+  const reference = { ...strong, model: { ...strong.model,
+    strengths: [...strong.model.strengths, "debugging", "refactor"] } };
+  const result = route(task.fingerprint, task.features, [], [economical, reference]);
+  const candidate = result.considered.find((entry) => entry.model.id === economical.model.id)!;
+  assert.equal(candidate.rejected, undefined);
+  assert.equal(result.cascade[0]?.model.id, economical.model.id);
+  assert.ok(candidate.uncertainty > 0);
+  const noTools = { ...economical, metadata: { ...economical.metadata, supportedParameters: [] } };
+  assert.equal(route(task.fingerprint, task.features, [], [noTools, reference]).considered
+    .find((entry) => entry.model.id === economical.model.id)?.rejected, "tools unsupported");
+});
+
+test("worker selection reads precomputed capability data without calling the discovery adapter", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "koda-cached-route-"));
+  try {
+    const cfg = await config(undefined, { baseUrl: "http://127.0.0.1:1",
+      modelPool: { provider: "local-compatible", models: [modelSchema.parse({
+        ...cheap.model, fallback: cheap.metadata })] },
+      routing: { stateDirectory: directory } });
+    let discoveries = 0;
+    const pool = new PoolRouter(cfg, new Logger(directory, "cached-route", true), {
+      discover: async () => { discoveries++; throw Error("discovery is outside the hot route"); },
+    });
+    const s = scenario("Correct a value", ["src/state.ts"]);
+    const first = await pool.selectSpecialist(s.fingerprint, s.features, "first", 10);
+    const second = await pool.selectSpecialist(s.fingerprint, s.features, "second", 10);
+    assert.equal(discoveries, 0);
+    assert.equal(first[0]?.model.id, cheap.model.id);
+    assert.deepEqual(first.map((entry) => entry.model.id), second.map((entry) => entry.model.id));
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("non-OpenRouter discovery adapter exposes every model but keeps unknown evidence unknown", async () => {
+  const configured = modelSchema.parse({ id: "configured", tier: "fast", qualityPrior: 0.95,
+    latencyPriorMs: 1000, strengths: ["coding", "tool_use"] });
+  const cfg = await config(undefined, { baseUrl: "http://localhost:1/v1",
+    modelPool: { provider: "local-compatible", models: [configured] } });
+  const dynamic = new Map<string, any>();
+  const catalog = { directory: "/unused", get: async () => new Map(dynamic),
+    addDynamic: (rows: Iterable<[string, any]>) => {
+      for (const [id, metadata] of rows) dynamic.set(id, metadata);
+    } } as any;
+  let calls = 0;
+  const adapter = { discover: async () => {
+    calls++;
+    return { baseUrl: cfg.baseUrl, retrievedAt: Date.now(),
+      models: ["configured", "benchmarked", "unknown"].map((id) => ({ id,
+        context_length: 100000, supported_parameters: ["tools"],
+        pricing: { prompt: id === "configured" ? "0.00001" : "0.0000002",
+          completion: id === "configured" ? "0.00002" : "0.0000004" } })),
+      benchmarks: [{ model_permaslug: "benchmarked", coding_index: 90 }],
+      classifications: [] };
+  } };
+  const registry = new CapabilityRegistry(cfg, catalog, adapter);
+  const s = scenario("Correct a value", ["src/state.ts"], ["node --test tests/state.test.ts"]);
+  await registry.refresh();
+  const discovered = await registry.forTask(s.fingerprint);
+  assert.equal(calls, 1);
+  assert.deepEqual(discovered.map((item) => item.model.id).sort(),
+    ["benchmarked", "configured", "unknown"]);
+  assert.deepEqual(discovered.find((item) => item.model.id === "unknown")!.evidence, []);
+  assert.equal(route(s.fingerprint, s.features, [], discovered).cascade[0]?.model.id,
+    "benchmarked", "an adapter-discovered qualified model can beat the configured pool");
+  assert.match(route(s.fingerprint, s.features, [], discovered).considered
+    .find((candidate) => candidate.model.id === "unknown")!.rejected!, /minimum quality|quality parity/);
+});
+
+test("non-OpenRouter compatible provider receives no OpenRouter-only request fields", async () => {
+  const requests: any[] = [];
+  const server = createServer(async (request, response) => {
+    response.setHeader("content-type", "application/json");
+    if (request.url === "/models") { response.statusCode = 404; response.end("{}"); return; }
+    let raw = "";
+    for await (const chunk of request) raw += chunk;
+    const body = JSON.parse(raw);
+    requests.push(body);
+    response.end(JSON.stringify({ id: "mock", model: "local-model", choices: [
+      { index: 0, finish_reason: "stop", message: { role: "assistant", content: "ok" } }],
+      usage: { prompt_tokens: 2, completion_tokens: 1, cost: 0.000001 } }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const directory = await mkdtemp(join(tmpdir(), "koda-local-provider-"));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const cfg = await config(undefined, { baseUrl: `http://127.0.0.1:${address.port}`,
+      modelPool: { provider: "local-compatible", models: [modelSchema.parse({
+        id: "local-model", tier: "fast", qualityPrior: 0.95,
+        latencyPriorMs: 1000, strengths: ["coding", "tool_use"] })] },
+      routing: { stateDirectory: directory } });
+    const gateway = new Gateway(cfg, new Logger(directory, "local-provider", true),
+      new Budget(1, 10000, 30000), { discover: async () => ({
+        baseUrl: cfg.baseUrl, retrievedAt: Date.now(), classifications: [], benchmarks: [],
+        models: [{ id: "local-model", context_length: 100000,
+          pricing: { prompt: "0.0000001", completion: "0.0000002" },
+          supported_parameters: ["tools"] }],
+      }) });
+    await gateway.modelRouter!.capabilities.refresh();
+    await gateway.call("local-model", [{ role: "user", content: "hello" }], "task", "implement", 0);
+    assert.equal(requests.length, 1);
+    assert.equal("provider" in requests[0], false);
+    assert.equal("session_id" in requests[0], false);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("focused failing test is read-only evidence for one localized implementation repair", () => {
+  const task = "Find why the test is failing, fix the implementation, and verify that all tests pass.";
+  const repository = { ...profile, files: ["add.js", "tests/add.test.js", "package.json"],
+    verificationCommands: ["npm run test"], symbols: [] } as any;
+  const strategy = chooseExecutionStrategy(task, repository);
+  assert.equal(strategy.execution_strategy, "direct");
+  const writes = directWritePaths(strategy.likelyFiles, repository, task);
+  assert.deepEqual(writes, ["add.js"]);
+  const work = { ...subtask(task, writes), likelyReadPaths: strategy.likelyFiles };
+  const verification = { checks: [{ command: "node --test tests/add.test.js", outcome: "CHECK_FAIL" }],
+    failedChecks: 1 } as any;
+  const features = extractFeatures(work, repository, 1200, verification, "direct");
+  const fingerprint = taskFingerprint(work, repository, features, "normal", verification);
+  assert.equal(taskBucket(features), "localized_bugfix");
+  assert.equal(fingerprint.primary, "debugging");
+  assert.ok(fingerprint.secondary.includes("testing"));
+  assert.equal(fingerprint.scope, "single");
+  assert.equal(fingerprint.verificationStrength, "strong");
+  assert.equal(fingerprint.difficulty.technicalComplexity, "low");
+  assert.equal(fingerprint.difficulty.architecturalComplexity, "low");
+  assert.equal(fingerprint.difficulty.repoReasoningComplexity, "low");
+  assert.equal(fingerprint.architectureHeavy, false);
+  assert.equal(fingerprint.repoReasoningHeavy, false);
+  assert.equal(fingerprint.difficulty.changeRisk, "low");
+  assert.equal(fingerprint.difficulty.contextUncertainty, "low");
+  const economical = { ...cheap, model: { ...cheap.model, qualityPrior: 0.72 } };
+  const result = route(fingerprint, features, [], [economical, strong]);
+  assert.equal(result.cascade[0]?.model.id, cheap.model.id);
+  assert.ok(result.cascade[0]!.firstAttemptQualityFloor < settings.routing.minimumQuality);
+  assert.ok(result.cascade[0]!.expectedCompletionCost < result.reference!.cost);
+  fingerprint.verificationStrength = "weak";
+  fingerprint.difficulty.changeRisk = "high";
+  assert.equal(route(fingerprint, features, [], [economical, strong]).cascade[0]?.model.id, strong.model.id);
+});
+
+test("independent JavaScript repairs require only their own concrete capabilities", () => {
+  const repository = { ...profile, files: ["src/first.js", "src/second.js", "tests/first.test.js", "tests/second.test.js"] } as any;
+  for (const file of ["src/first.js", "src/second.js"]) {
+    const work = { ...subtask(`Repair the failing behavior in ${file}. Only this independent component is assigned.`, [file],
+      [`node --test tests/${file.split("/")[1]!.replace(".js", ".test.js")}`]),
+      id: file, likelyReadPaths: [file, "src/Dashboard.tsx", "tests/second.test.js"] };
+    const features = extractFeatures(work, repository, 1000, undefined, "planned");
+    const fp = taskFingerprint(work, repository, features, "normal");
+    assert.equal(fp.primary, "debugging");
+    assert.equal(fp.visualRelevant, false);
+    assert.equal(fp.architectureHeavy, false);
+    assert.equal(fp.repoReasoningHeavy, false);
+    assert.equal(fp.difficulty.architecturalComplexity, "low");
+    assert.equal(fp.secondary.some((kind) => ["frontend_ui", "architecture", "sql_database"].includes(kind)), false);
+    assert.equal(route(fp, features, [], [cheap, strong]).cascade[0]?.model.id, cheap.model.id,
+      "an unrelated capability must not exclude a qualified economical coder");
+  }
+});
+
+test("repeated slow interactive calls demote a cheaper qualified model without changing its quality history", () => {
+  const s = scenario("Fix backend endpoint", ["src/api.ts"], ["node --test tests/api.test.ts"]);
+  s.fingerprint.verificationStrength = "strong";
+  const call = (model: string, ms: number, outcome: "response" | "error" = "response"): OperationalCall => ({
+    type: "operational_call", timestamp: "2026-01-01", runId: "latency", subtaskId: "ui",
+    stage: "implement", taskBucket: "localized_bugfix", modelRequested: model,
+    modelServed: outcome === "response" ? model : null, provider: "mock-provider",
+    wallClockMs: ms, outcome, costUsd: outcome === "response" ? 0.001 : 0,
+  });
+  const operations = [...Array.from({ length: 8 }, () => call(cheap.model.id, 70000)),
+    ...Array.from({ length: 8 }, () => call(strong.model.id, 1200))];
+  const result = route(s.fingerprint, s.features, [], [cheap, strong], operations);
+  assert.equal(result.cascade[0]?.model.id, strong.model.id);
+  const slow = result.considered.find((candidate) => candidate.model.id === cheap.model.id)!;
+  assert.equal(slow.callCount, 8);
+  assert.ok(slow.latencyP90Ms! >= 70000);
+  assert.equal(slow.latencySlaPassed, false);
+  const fastUnqualified = { ...cheap, model: { ...cheap.model, qualityPrior: 0.1 } };
+  assert.equal(route(s.fingerprint, s.features, [], [fastUnqualified, strong],
+    Array.from({ length: 8 }, () => call(cheap.model.id, 100))).cascade[0]?.model.id,
+    strong.model.id);
+  const infra = Array.from({ length: 8 }, () => call(cheap.model.id, 30000, "error"));
+  const qualityBefore = route(s.fingerprint, s.features, [], [cheap, strong]).considered[0]!.quality;
+  const qualityAfter = route(s.fingerprint, s.features, [], [cheap, strong], infra).considered[0]!.quality;
+  assert.equal(qualityAfter, qualityBefore);
+  assert.ok(route(s.fingerprint, s.features, [], [cheap, strong], infra).considered
+    .find((candidate) => candidate.model.id === cheap.model.id)!.operationalErrorRate > 0);
 });
 
 test("difficulty is multidimensional and changes UI choice from cheaper specialist to strong reference", () => {
@@ -70,8 +308,10 @@ test("backend complexity, quality parity, unknown pricing and provider-independe
   const simple = scenario("Add backend endpoint", ["src/api.ts"]);
   const complex = scenario("Debug backend endpoint across modules and migrate database schema",
     ["src/api.ts", "src/db.ts"]);
+  const strongDb = { ...strong, model: { ...strong.model,
+    strengths: [...strong.model.strengths, "sql_database"] } };
   assert.equal(route(simple.fingerprint, simple.features).cascade[0]?.model.id, cheap.model.id);
-  assert.equal(route(complex.fingerprint, complex.features).cascade[0]?.model.id, strong.model.id);
+  assert.equal(route(complex.fingerprint, complex.features, [], [cheap, strongDb]).cascade[0]?.model.id, strong.model.id);
   const unpriced = { ...cheap, metadata: { available: true } };
   assert.equal(route(simple.fingerprint, simple.features, [], [unpriced, strong]).cascade[0]?.model.id, strong.model.id);
 });
@@ -103,6 +343,21 @@ test("task-specific verified history can overcome prior then verified failures r
   const unrelated = scenario("Fix API", ["src/api.ts"]);
   assert.notEqual(route(unrelated.fingerprint, unrelated.features, failed).considered.find((c) => c.model.id === cheap.model.id)?.quality,
     route(unrelated.fingerprint, unrelated.features, []).considered.find((c) => c.model.id === cheap.model.id)?.quality);
+});
+
+test("one localized failure does not poison another file, and HTTP 429 is operational evidence only", () => {
+  const first = scenario("Fix API lookup", ["src/api.ts"], ["node --test tests/api.test.ts"]);
+  const next = scenario("Fix user lookup", ["src/users.ts"], ["node --test tests/users.test.ts"]);
+  const baseline = route(next.fingerprint, next.features);
+  const oneFailure = observed(cheap.model.id, first.fingerprint, first.features, "FAILED", "focused assertion failed");
+  const after = route(next.fingerprint, next.features, [oneFailure]);
+  assert.equal(after.cascade[0]?.model.id, baseline.cascade[0]?.model.id);
+  const baseQuality = baseline.considered.find((c) => c.model.id === cheap.model.id)!.quality;
+  assert.ok(baseQuality - after.considered.find((c) => c.model.id === cheap.model.id)!.quality < 0.01);
+  const rateLimited = observed(cheap.model.id, first.fingerprint, first.features, "FAILED", "HTTP 429 Too Many Requests");
+  assert.equal(route(first.fingerprint, first.features, [rateLimited]).considered
+    .find((c) => c.model.id === cheap.model.id)!.quality,
+    route(first.fingerprint, first.features).considered.find((c) => c.model.id === cheap.model.id)!.quality);
 });
 
 test("high uncertainty blocks weakly verified cheap choice and execution strategies are retained", () => {
@@ -158,6 +413,7 @@ test("cached capability evidence admits a newly listed priced model without code
     const catalog = new Catalog(baseUrl, dir, 60000, [cheap.model]);
     const registry = new CapabilityRegistry(config, catalog);
     const s = scenario("Fix backend endpoint", ["src/api.ts"]);
+    await registry.refresh();
     const models = await registry.forTask(s.fingerprint);
     assert.equal(models.find((m) => m.model.id === "newly-listed")?.metadata.inputPrice, 0.3);
     assert.ok((await catalog.get()).has("newly-listed"));

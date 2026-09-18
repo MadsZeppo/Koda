@@ -1,6 +1,7 @@
 import { dirname } from "node:path";
 import type { Subtask } from "../planner/schemas.js";
 import type { Features } from "./features.js";
+import type { TaskFingerprint } from "./taskFingerprint.js";
 
 export type CodingTier = "low" | "medium" | "high" | "frontier";
 export interface CodingDemand {
@@ -8,6 +9,10 @@ export interface CodingDemand {
   minCodingScore: number;
   reason: string;
   confidence: "high" | "medium";
+  taskRisk: "low" | "medium" | "high";
+  verificationStrength: "strong" | "medium" | "weak";
+  qualityFloor: number;
+  allowEconomicalFirstAttempt: boolean;
 }
 
 export const PARETO_CODE_MODEL = "openrouter/pareto-code";
@@ -23,6 +28,8 @@ export function codingDemand(
   features: Features,
   subtask: Subtask,
   effort: "tiny" | "normal" | "complex" = "normal",
+  fingerprint?: TaskFingerprint,
+  qualityFloor = 0.9,
 ): CodingDemand | undefined {
   if (subtask.readOnly || features.taskKind === "planning") return undefined;
   const paths = subtask.likelyWritePaths;
@@ -60,6 +67,11 @@ export function codingDemand(
     minCodingScore: codingScore(tier),
     reason,
     confidence: paths.length ? "high" : "medium",
+    taskRisk: fingerprint?.difficulty.changeRisk ?? (coupled ? "high" : "low"),
+    verificationStrength: fingerprint?.verificationStrength ?? "weak",
+    qualityFloor,
+    allowEconomicalFirstAttempt: fingerprint?.verificationStrength === "strong" &&
+      fingerprint.difficulty.changeRisk === "low",
   };
 }
 
