@@ -728,6 +728,14 @@ export async function implement(
             record("NOT_FULLY_VERIFIED");
             return { verification: focusedRelative, role, evidence };
           }
+          if (focusedRelative.checks.some((check) =>
+            check.outcome === "INFRA_FAILURE" || check.outcome === "CHECK_UNAVAILABLE")) {
+            gateway.logger.log("stable_final_repair_operational_failure", {
+              subtaskId: subtask.id, model: activeModel(), checks: focusedRelative.checks,
+            });
+            record("NOT_FULLY_VERIFIED", false, "verification_infrastructure_unavailable");
+            return { verification: focusedRelative, role, evidence };
+          }
           const rejectedDiff = truncateBytes(after, gateway.config.context.maxBytes);
           const originalFailure = verificationResult(options.stableRepair.failedChecks);
           const attributable = verificationRegressed(originalFailure, focused);

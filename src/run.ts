@@ -680,7 +680,7 @@ export async function run(options: RunOptions) {
         undefined,
         finalCandidates,
       );
-      if (executable.checks.some((check) => check.outcome === "CHECK_FAIL")) {
+      if (executable.checks.some((check) => check.outcome !== "CHECK_PASS")) {
         finalBaseline ??= await verify(
           backend!.baselinePath, finalCommands,
           () => Math.min(options.config.commandTimeoutMs, budget.remainingMs()),
@@ -728,7 +728,8 @@ export async function run(options: RunOptions) {
     if (
       stableRepairContext &&
       verification.status === "FAILED" &&
-      !verification.checks.some((check) => check.outcome === "INFRA_FAILURE")
+      finalBaseline &&
+      verificationRegressions(finalBaseline, verification).length > 0
     ) {
       finalBaseline ??= await verify(
         backend!.baselinePath,
@@ -941,12 +942,15 @@ export async function run(options: RunOptions) {
             check.outcome === "INFRA_FAILURE" ||
             check.outcome === "CHECK_UNAVAILABLE",
         );
-        if (unavailableRepair)
-          await repairCheckpoint.restore(integration.path, repairScope);
-        if (unavailableRepair)
-          throw Error(
-            `Stable repair verification infrastructure unavailable: ${unavailableRepair.command}`,
-          );
+        if (unavailableRepair) {
+          verification = targeted;
+          logger.log("stable_final_repair_operational_failure", {
+            attempt,
+            command: unavailableRepair.command,
+            unavailable: unavailableRepair.unavailable,
+          });
+          break;
+        }
         if (targeted.status !== "VERIFIED_SUCCESS") {
           const previousSignature = failureSignature(failedChecks);
           const previousFailureCount = failedChecks.length;
@@ -987,6 +991,16 @@ export async function run(options: RunOptions) {
             throw Error("Verified repair state disappeared or changed during promotion");
           acceptedRepairState = verifiedRepairState;
           logger.log("stable_final_repair_success", { attempt });
+          break;
+        }
+        if (verification.status === "NOT_FULLY_VERIFIED" &&
+            verification.checks.some((check) =>
+              check.outcome === "INFRA_FAILURE" || check.outcome === "CHECK_UNAVAILABLE")) {
+          logger.log("stable_final_repair_operational_failure", {
+            attempt,
+            checks: verification.checks.filter((check) =>
+              check.outcome === "INFRA_FAILURE" || check.outcome === "CHECK_UNAVAILABLE"),
+          });
           break;
         }
         await repairCheckpoint.restore(integration!.path, repairScope);

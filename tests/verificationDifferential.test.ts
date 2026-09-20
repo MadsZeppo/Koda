@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { verify, verificationAgainstBaseline, verificationResult } from "../src/verifier/verifier.js";
+import { verify, verificationAgainstBaseline, verificationRegressions,
+  verificationResult } from "../src/verifier/verifier.js";
 
 const result = (stdout: string, exitCode = 1, command = "pytest -q") => verificationResult([{
   command, stdout, stderr: "", exitCode, wallClockMs: 1, timedOut: false, kind: "test" as const,
@@ -155,4 +156,50 @@ test("duration-looking pytest parameters remain distinct failure identities", ()
     result("FAILED tests/test_a.py::test_timeout[1s] - AssertionError"),
     result("FAILED tests/test_a.py::test_timeout[2s] - AssertionError"),
   ).status, "FAILED");
+});
+
+test("differential attribution keeps coding regressions strict and infrastructure operational", () => {
+  const pass = (command: string, kind: "build" | "typecheck" | "test" = "test") => ({
+    command, kind, outcome: "CHECK_PASS" as const, exitCode: 0, stdout: "ok", stderr: "",
+    wallClockMs: 1, timedOut: false,
+  });
+  const fail = (command: string, stdout: string, kind: "build" | "typecheck" | "test" = "test") => ({
+    ...pass(command, kind), outcome: "CHECK_FAIL" as const, exitCode: 1, stdout,
+  });
+  const infra = (command: string) => ({ ...fail(command,
+    "ENOENT: invalid .git/worktrees/candidate path"), outcome: "INFRA_FAILURE" as const,
+    unavailable: "verification_git_worktree_environment" });
+
+  const buildRegression = verificationAgainstBaseline(
+    verificationResult([pass("pnpm build", "build"), pass("pnpm typecheck", "typecheck")]),
+    verificationResult([fail("pnpm build", "src/a.ts(1,1): error TS1234: bad", "build"),
+      fail("pnpm typecheck", "src/a.ts(1,1): error TS1234: bad", "typecheck")]),
+  );
+  assert.equal(buildRegression.status, "FAILED");
+  assert.equal(verificationRegressions(
+    verificationResult([pass("pnpm build", "build"), pass("pnpm typecheck", "typecheck")]),
+    buildRegression).length, 2);
+
+  const baselineInfra = verificationResult([infra("pnpm test")]);
+  const sameInfra = verificationAgainstBaseline(baselineInfra,
+    verificationResult([infra("pnpm test")]));
+  assert.equal(sameInfra.status, "NOT_FULLY_VERIFIED");
+  assert.equal(sameInfra.checks[0]!.outcome, "INFRA_FAILURE");
+  assert.match(sameInfra.checks[0]!.source ?? "", /baseline_environment_unchanged/);
+  assert.equal(verificationRegressions(baselineInfra, sameInfra).length, 0);
+
+  const candidateTest = verificationAgainstBaseline(
+    verificationResult([pass("pnpm test")]),
+    verificationResult([fail("pnpm test", "FAILED tests/new.test.ts - AssertionError")]),
+  );
+  assert.equal(candidateTest.status, "FAILED");
+
+  const mixedBaseline = verificationResult([pass("pnpm typecheck", "typecheck"), infra("pnpm test")]);
+  const mixed = verificationAgainstBaseline(mixedBaseline, verificationResult([
+    fail("pnpm typecheck", "src/a.ts(2,1): error TS9999: candidate regression", "typecheck"),
+    infra("pnpm test"),
+  ]));
+  assert.equal(mixed.status, "FAILED");
+  assert.deepEqual(verificationRegressions(mixedBaseline, mixed).map((check) => check.command),
+    ["pnpm typecheck"]);
 });

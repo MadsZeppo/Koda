@@ -9,7 +9,7 @@ import { config } from "../src/config.js";
 import { run } from "../src/run.js";
 import { git } from "../src/repo/commands.js";
 
-type Case = "compiler" | "assertion" | "mismatch" | "progress" | "stuck" | "fallback" | "provider" | "no-progress-fallback";
+type Case = "compiler" | "assertion" | "mismatch" | "progress" | "stuck" | "fallback" | "provider" | "no-progress-fallback" | "infrastructure";
 const source = "exports.add=(a,b)=>a+b;\n";
 const baseTest =
   "const {test}=require('node:test');const assert=require('node:assert/strict');const {add}=require('../src/calc.cjs');test('positive',()=>assert.equal(add(2,3),5));";
@@ -30,7 +30,7 @@ async function fixture(mode: Case) {
       type: "commonjs",
       scripts: {
         typecheck: "node --check tests/calc.test.cjs",
-        test: "node tests/run.cjs",
+        test: mode === "infrastructure" ? "node tests/infra.cjs" : "node tests/run.cjs",
       },
     }),
   );
@@ -38,6 +38,9 @@ async function fixture(mode: Case) {
   await writeFile(join(repo, "src/unrelated.cjs"), "UNRELATED_SENTINEL\n");
   await writeFile(join(repo, "tests/calc.test.cjs"), `${baseTest}\n`);
   await writeFile(join(repo, "tests/run.cjs"), "require('./calc.test.cjs');\n");
+  if (mode === "infrastructure")
+    await writeFile(join(repo, "tests/infra.cjs"),
+      "console.error('ENOENT: invalid .git/worktrees/copied-candidate path');process.exit(1);\n");
   await git(repo, "init", "-q");
   await git(repo, "config", "user.name", "Stable Repair Test");
   await git(repo, "config", "user.email", "stable-repair@test.local");
@@ -158,7 +161,7 @@ async function fixture(mode: Case) {
           }),
           tool("write-regression", "write_file", {
             path: "tests/calc.test.cjs",
-            content: mode === "compiler" ? duplicateImport : badAssertion,
+            content: mode === "compiler" || mode === "infrastructure" ? duplicateImport : badAssertion,
           }),
         ],
       };
@@ -187,6 +190,7 @@ for (const mode of [
   "fallback",
   "provider",
   "no-progress-fallback",
+  "infrastructure",
 ] as const) {
   test(`Stable final repair is focused and bounded: ${mode}`, async () => {
     const f = await fixture(mode);
@@ -216,6 +220,7 @@ for (const mode of [
         }),
         output: f.output,
         quiet: true,
+        apply: mode === "infrastructure",
       });
       const events = (await readFile(join(f.output, "events.jsonl"), "utf8"))
         .trim()
@@ -282,7 +287,22 @@ for (const mode of [
           ),
         );
       }
-      if (mode === "stuck") {
+      if (mode === "infrastructure") {
+        assert.equal(result.status, "NOT_FULLY_VERIFIED");
+        assert.equal(f.repairCalls, 1);
+        assert.equal(result.applyResult, "not_verified");
+        assert.equal(result.candidateProduced, true);
+        assert.ok(result.candidatePatchPath);
+        assert.match(await readFile(result.candidatePatchPath!, "utf8"), /negative/);
+        assert.ok(events.some((event) =>
+          event.type === "stable_final_repair_operational_failure"));
+        assert.ok(events.some((event) =>
+          event.type === "final_verification" &&
+          event.outcome === "INFRA_FAILURE" &&
+          event.unavailable === "verification_git_worktree_environment"));
+        const history = await readFile(join(f.root, "routing", "attempts.jsonl"), "utf8");
+        assert.ok(!history.includes('"failureAttribution":"verified_patch_regression"'));
+      } else if (mode === "stuck") {
         assert.equal(result.status, "FAILED");
         assert.equal(f.repairCalls, 2);
         assert.ok(

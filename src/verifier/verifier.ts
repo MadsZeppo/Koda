@@ -36,6 +36,9 @@ export const runtimeInfrastructureFailure = (check: CommandResult) => {
     return "pnpm_dependency_environment";
   if (/sandbox-exec|\bbwrap\b|spawn .* ENOENT|command not found/i.test(output))
     return "verification_sandbox_or_tool_unavailable";
+  if (/\.git\/worktrees\//.test(output) &&
+      /ENOENT|No such file|not found|invalid|cannot|failed/i.test(output))
+    return "verification_git_worktree_environment";
   return undefined;
 };
 const normalizedFailureOutput = (check: CommandResult) =>
@@ -141,8 +144,14 @@ export function verificationAgainstBaseline(
 ) {
   const regressions = new Set(verificationRegressions(baseline, after));
   return verificationResult(after.checks.map((check) => {
-    if (check.outcome !== "CHECK_FAIL" || regressions.has(check)) return { ...check };
     const previous = baseline.checks.find((item) => item.command === check.command && item.cwd === check.cwd);
+    if ((check.outcome === "INFRA_FAILURE" || check.outcome === "CHECK_UNAVAILABLE") &&
+        (previous?.outcome === "INFRA_FAILURE" || previous?.outcome === "CHECK_UNAVAILABLE") &&
+        check.unavailable === previous.unavailable &&
+        failureSignature(check) === failureSignature(previous))
+      return { ...check,
+        source: `${check.source ?? "verification"}:baseline_environment_unchanged` };
+    if (check.outcome !== "CHECK_FAIL" || regressions.has(check)) return { ...check };
     if (previous?.unavailable || previous?.outcome === "INFRA_FAILURE" || previous?.outcome === "CHECK_UNAVAILABLE")
       return { ...check, unavailable: "baseline_verification_unavailable", outcome: "INFRA_FAILURE" as const,
         stderr: `${check.stderr}\nBaseline verification unavailable: ${previous.unavailable ?? previous.stderr}` };
