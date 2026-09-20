@@ -24,7 +24,12 @@ export interface Attempt {
   costUsd: number | null;
   escalated: boolean;
   reason?: string;
+  failureAttribution?: "verified_patch_regression";
 }
+/** Legacy FAILED rows lack proof that a candidate patch caused a regression. */
+export const attributableCodingFailure = (row: Attempt) =>
+  row.verification === "FAILED" &&
+  row.failureAttribution === "verified_patch_regression";
 export interface OperationalCall {
   type: "operational_call";
   timestamp: string;
@@ -70,6 +75,8 @@ export class History {
             Array.isArray(r.features.languages) &&
             typeof r.modelRequested === "string" &&
             Number.isFinite(r.wallClockMs) &&
+            (r.verification !== "FAILED" || r.features.taskKind === "planning" ||
+              attributableCodingFailure(r)) &&
             // A later run-level failure removes provisional positive evidence;
             // it does not prove this worker/model made a bad edit.
             !(r.verification === "VERIFIED_SUCCESS" && finals.has(r.runId) &&

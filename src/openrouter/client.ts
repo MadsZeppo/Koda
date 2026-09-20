@@ -29,7 +29,7 @@ export function isTransientProviderError(error: unknown) {
     (error instanceof OpenAI.APIError && transientStatus(error.status)) ||
     error instanceof OpenAI.APIConnectionTimeoutError ||
     (error instanceof Error &&
-      /\b(?:ETIMEDOUT|ECONNRESET|fetch failed)\b/i.test(error.message))
+      /\b(?:ETIMEDOUT|ECONNRESET|fetch failed|timeout|timed out|aborted)\b/i.test(error.message))
   );
 }
 export function isRouteEndpointIncompatibility(error: unknown) {
@@ -192,7 +192,10 @@ export class Gateway {
             ...(openrouter ? { session_id: sessionId, provider: providerPolicy } : {}),
           } as any),
         },
-        { timeout: timeoutMs },
+        {
+          timeout: timeoutMs,
+          signal: AbortSignal.timeout(timeoutMs),
+        },
       );
       const usage = parseUsage(response.usage);
       release(usage);

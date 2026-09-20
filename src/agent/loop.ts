@@ -1,3 +1,4 @@
+import { repairSourceContext } from "./repairSourceContext.js";
 import { WriteScope } from "../repo/writeScope.js";
 import { extractFeatures, taskBucket } from "../router/features.js";
 import { taskFingerprint } from "../router/taskFingerprint.js";
@@ -37,8 +38,10 @@ import type {
 import { AgentTools, toolDefinitions, currentDiff, safePath } from "./tools.js";
 import { readFile } from "node:fs/promises";
 import { coderPrompt } from "./prompts.js";
-import { verify, verificationResult } from "../verifier/verifier.js";
+import { verify, verificationAgainstBaseline, verificationResult, verificationRegressed } from "../verifier/verifier.js";
+import { justifiedSiblingWrite } from "../repo/scopeExpansion.js";
 import { verificationPlan } from "../verifier/plan.js";
+import { focusedLocalReproduction, optionalUnavailableCheck, recoverPostMutationChecks } from "../verifier/recovery.js";
 import { router } from "../router/router.js";
 import { git } from "../repo/commands.js";
 import { workspaceChangedPaths } from "../workspace/backend.js";
@@ -47,6 +50,7 @@ import type { Role } from "../router/modelRegistry.js";
 import type { StableImplementationHandoff } from "./stable.js";
 import type { RepairPacket } from "./repairPacket.js";
 import { implementStablePacket } from "./stableExecutor.js";
+import { AttemptCheckpoint } from "./attemptCheckpoint.js";
 async function applyCalls(
   message: any,
   messages: ChatCompletionMessageParam[],
@@ -124,6 +128,11 @@ export async function implement(
       attempt: number;
       failedChecks: CommandResult[];
       changedFiles: string[];
+      failedDiff?: string;
+      implicatedSymbols?: string[];
+      baselineChecks?: CommandResult[];
+      regressionDiagnostics?: string[];
+      failureContext?: { path: string; symbol?: string; content: string }[];
     };
     tinyDirect?: boolean;
     adaptiveStartTier?: CodingTier;
@@ -151,7 +160,7 @@ export async function implement(
   }
 
   const workerEventStart = gateway.logger.events.length;
-  const writeScope = new WriteScope(
+  let writeScope = new WriteScope(
     subtask.likelyWritePaths,
     gateway.logger,
     subtask.id,
@@ -239,7 +248,7 @@ export async function implement(
     subtask.likelyWritePaths.every((file) =>
       /\.(?:md|mdx|txt|rst)$/i.test(file),
     );
-  const commands = tinyDocs
+  let commands = tinyDocs
     ? subtask.likelyWritePaths.flatMap((file) =>
         tinyDocumentationChecks(profile, file),
       )
@@ -248,6 +257,22 @@ export async function implement(
           .filter((candidate) => candidate.available)
           .map((candidate) => candidate.command)
       : workerChecks(subtask, profile, context);
+  const profiledCandidates = profile.ecosystem?.projectUnits.flatMap((unit) => unit.verification) ?? [];
+  if (!subtask.verificationCommands.length)
+    commands = commands.filter((command) => {
+      const candidate = profiledCandidates.find((item) => item.command === command);
+      return !candidate || !optionalUnavailableCheck(candidate);
+    });
+  const recovery = !tinyDocs && commands.length === 0
+    ? await focusedLocalReproduction(profile, task, subtask.likelyWritePaths)
+    : undefined;
+  const recoveredCandidates = recovery ? [recovery] : [];
+  let postMutationRecoveryAttempted = false;
+  if (recovery) {
+    commands = [recovery.command];
+    gateway.logger.log("verification_recovery", { subtaskId: subtask.id,
+      command: recovery.command, source: recovery.source });
+  }
   const stableTargetedCommands =
     options.stableHandoff && options.repairPacket && subtask.verificationCommands.length
       ? subtask.verificationCommands
@@ -275,10 +300,21 @@ export async function implement(
       .flatMap((u) => u.verification)
       .filter((c) => commands.includes(c.command)),
   });
-  const checks = () =>
-    options.finalVerificationOnly
-      ? Promise.resolve(verificationResult([]))
-      : verify(
+  const checks = async (afterMutation = false) => {
+    if (afterMutation && !tinyDocs && !commands.length && !postMutationRecoveryAttempted) {
+      postMutationRecoveryAttempted = true;
+      gateway.logger.log("verification_recovery_attempt", { subtaskId: subtask.id,
+        paths: subtask.likelyWritePaths });
+      const discovered = await recoverPostMutationChecks(path, task, subtask.likelyWritePaths);
+      commands = discovered.map((candidate) => candidate.command);
+      recoveredCandidates.push(...discovered);
+      gateway.logger.log(discovered.length ? "verification_recovery" : "verification_recovery_exhausted", {
+        subtaskId: subtask.id, commands, source: discovered.map((candidate) => candidate.source),
+      });
+    }
+    if (options.finalVerificationOnly && !(afterMutation && recoveredCandidates.length))
+      return verificationResult([]);
+    return verify(
           path,
           commands,
           () =>
@@ -292,17 +328,25 @@ export async function implement(
               ...c,
             }),
           writeScope,
-          profile.ecosystem?.projectUnits.flatMap((u) => u.verification),
+          [...profiledCandidates, ...recoveredCandidates].map((candidate) =>
+            subtask.verificationCommands.includes(candidate.command)
+              ? { ...candidate, requirement: "required" as const }
+              : candidate,
+          ),
         );
+  };
   let verification = options.tinyDirect
     ? verificationResult([])
     : await checks();
+  const baselineVerification = verification;
+  let scopeExpansions = 0;
   const infrastructureError = (result: VerificationResult) => {
     const failed = result.checks.find(
       (check) =>
-        check.outcome === "INFRA_FAILURE" ||
-        (check.outcome === "CHECK_UNAVAILABLE" &&
-          check.unavailable !== "unsafe_verification_command"),
+        (check.requirement ?? "required") === "required" &&
+        (check.outcome === "INFRA_FAILURE" ||
+          (check.outcome === "CHECK_UNAVAILABLE" &&
+            check.unavailable !== "unsafe_verification_command")),
     );
     return failed
       ? `${failed.command}: ${failed.unavailable ?? "verification could not execute"}`
@@ -445,10 +489,8 @@ export async function implement(
   const record = (status: string, escalated = false, reason?: string) => {
     if (terminalAttemptRecorded) return;
     terminalAttemptRecorded = true;
-    const meaningfulFailure = status === "FAILED" && (escalated ||
-      (verification.checks.some((check) => check.outcome === "CHECK_FAIL") &&
-        gateway.logger.events.slice(attemptStart).some((event) =>
-          event.type === "write_success" && event.subtaskId === subtask.id)));
+    const meaningfulFailure = status === "FAILED" &&
+      reason === "focused_verification_failed";
     if (selected && (status === "VERIFIED_SUCCESS" || meaningfulFailure))
       pool!.record(
         selected.model,
@@ -484,9 +526,67 @@ export async function implement(
     writeScope,
   );
   if (options.stableRepair) {
-    const allowed = new Set(["write_file", "run_command"]);
+    const allowed = new Set(["write_file", "edit_file", "apply_patch"]);
     const repairStart = gateway.logger.events.length;
     let lastRepairError = "";
+    const repairCheckpoint = await AttemptCheckpoint.capture(path, writeScope);
+    const failedModels = new Set<string>();
+    const repairEvidence: unknown[] = [];
+    const moveToRepairFallback = async (
+      classification: "VERIFIED_REGRESSION" | "NO_PROGRESS" | "OPERATIONAL_FAILURE",
+      error: unknown,
+      rejectedDiff = "",
+    ) => {
+      const previous = activeModel();
+      const rolledBack = await repairCheckpoint.restore(path, writeScope);
+      gateway.logger.log("stable_final_repair_model_exhausted", {
+        subtaskId: subtask.id, model: previous, error: String(error),
+        outcome: classification,
+        changedPaths: rolledBack.map((change) => change.path),
+      });
+      if (classification === "OPERATIONAL_FAILURE")
+        gateway.logger.log("stable_final_repair_operational_failure", {
+          subtaskId: subtask.id, model: previous, error: String(error),
+          outcome: classification, changedPaths: rolledBack.map((change) => change.path),
+        });
+      repairEvidence.push({ model: previous, classification,
+        rejectedDiff: truncateBytes(rejectedDiff, gateway.config.context.maxBytes),
+        diagnostic: truncateBytes(String(error), 4000) });
+      failedModels.add(previous);
+      let next: Candidate | undefined;
+      if (adaptiveTier) {
+        const higher = nextCodingTier(adaptiveTier);
+        if (!higher) return false;
+        adaptiveTier = higher;
+        adaptiveAttempt++;
+        if (higher === "frontier") {
+          if (!pool) return false;
+          selected = await pool.selectFrontierRescue(features, subtask.id).catch(() => undefined);
+        } else selected = undefined;
+        role = higher === "frontier" ? "FRONTIER_MODEL" :
+          higher === "high" ? "STRONG_MODEL" : "CHEAP_CODER_A";
+      } else if (pool) {
+        if (universalSelection) next = specialistCascade.find((candidate) =>
+          !failedModels.has(candidate.model.id));
+        else next = await pool.select(features, subtask.id, [...failedModels],
+          selected?.model, true, options.raceGroup).catch(() => undefined);
+        if (!next || failedModels.has(next.model.id)) return false;
+        selected = next;
+        role = poolRole();
+      } else {
+        const nextRole = router.escalate(role);
+        if (!nextRole) return false;
+        const nextModel = gateway.config.registry[nextRole];
+        if (!nextModel || failedModels.has(nextModel)) return false;
+        role = nextRole;
+      }
+      terminalAttemptRecorded = false;
+      attemptStart = gateway.logger.events.length;
+      gateway.logger.log("model_fallback", { subtaskId: subtask.id,
+        previous_model: previous, selected_model: activeModel(),
+        reason: `stable_final_repair_${classification.toLowerCase()}` });
+      return true;
+    };
     gateway.logger.log("coding_worker_start", {
       subtaskId: subtask.id,
       worktree: path,
@@ -495,13 +595,16 @@ export async function implement(
       // Final repair is a separate, two-turn state, never the general coder
       // loop. Refresh locked files each turn so an exact-text mismatch can be
       // corrected without reopening repository discovery.
-      for (let turn = 1; turn <= 2; turn++) {
+      let modelTurn = 0;
+      for (let totalTurn = 1; totalTurn <= 20; totalTurn++) {
+        modelTurn++;
         const lockedFiles = await Promise.all(
           writeScope.paths.map(async (file) => ({
             path: file,
             content: await readFile(await safePath(path, file), "utf8")
               .then((value) =>
-                truncateBytes(value, gateway.config.context.fileBytes),
+                repairSourceContext(value, file, options.stableRepair!.failedDiff ?? "",
+                  options.stableRepair!.failedChecks, gateway.config.context.fileBytes),
               )
               .catch((error: NodeJS.ErrnoException) => {
                 if (error.code === "ENOENT") return "<file does not exist>";
@@ -514,7 +617,7 @@ export async function implement(
           {
             role: "system",
             content:
-              "You are repairing one failed Stable final verification in the SAME isolated workspace. Inspection is complete. Do not search or rediscover. Modify only the locked paths. Use write_file or a scoped mutation command now. Do not install dependencies, change checks, or claim success; the runtime reruns verification.",
+              "You are repairing one failed Stable final verification in the SAME isolated workspace. Inspection is complete. Do not search or rediscover. Modify only the locked paths. Use edit_file or apply_patch now with exact text from currentLockedFiles. write_file is only safe when complete file content is supplied. No shell or repository inspection is available. Do not install dependencies, change checks, or claim success; the runtime reruns verification.",
           },
           {
             role: "user",
@@ -525,31 +628,40 @@ export async function implement(
               changedFiles: options.stableRepair.changedFiles,
               currentDiff: truncateBytes(
                 before,
-                gateway.config.context.fileBytes,
+                gateway.config.context.maxBytes,
               ),
+              failedDiff: truncateBytes(options.stableRepair.failedDiff ?? before,
+                gateway.config.context.maxBytes),
+              implicatedFiles: options.stableRepair.changedFiles,
+              implicatedSymbols: options.stableRepair.implicatedSymbols ?? options.evidence?.symbols ?? [],
+              repairPacket: options.repairPacket,
               failedChecks: options.stableRepair.failedChecks.map((check) => ({
                 command: check.command,
                 exitCode: check.exitCode,
                 stdout: truncateBytes(check.stdout, 12000),
                 stderr: truncateBytes(check.stderr, 12000),
               })),
+              newRegressionDiagnostics: options.stableRepair.regressionDiagnostics ?? [],
+              focusedFailureContext: options.stableRepair.failureContext ?? [],
               repairAttempt: options.stableRepair.attempt,
-              turn,
+              turn: modelTurn,
               previousToolError: lastRepairError,
+              priorRepairAttempts: repairEvidence,
               instruction:
-                turn === 1
+                modelTurn === 1
                   ? "Fix the exact reported failure. Do not repeat inspection."
                   : "The previous action did not produce a clean mutation. Correct it using the current locked file contents and exact tool error; this is the last repair turn.",
             }),
           },
         ];
         const callStart = tools.commandEvidence.length;
-        const response = await gateway.call(
+        let response: any;
+        try { response = await gateway.call(
           activeModel(),
-          messages,
+          boundMessages(messages, gateway.config.context.maxPromptBytes),
           subtask.id,
           "implement",
-          turn - 1,
+          totalTurn - 1,
           toolDefinitions.filter((tool: any) =>
             allowed.has(tool.function.name),
           ),
@@ -566,9 +678,23 @@ export async function implement(
                   }
                 : undefined,
           },
-        );
+        ); } catch (error) {
+          if (!canFallback(error, gateway) || gateway.config.forceModel ||
+              !(await moveToRepairFallback("OPERATIONAL_FAILURE", error))) throw error;
+          modelTurn = 0;
+          continue;
+        }
         if (response.tool_calls?.length)
           await applyCalls(response, messages, tools, allowed, true);
+        const malformed = messages.some((message) => message.role === "tool" &&
+          /Tool error: SyntaxError:|Tool call limit exceeded/.test(String(message.content ?? "")));
+        if (malformed) {
+          const error = Error("Malformed Stable final-repair tool arguments");
+          if (gateway.config.forceModel ||
+              !(await moveToRepairFallback("OPERATIONAL_FAILURE", error))) throw error;
+          modelTurn = 0;
+          continue;
+        }
         const after = await currentDiff(path);
         const failedCommand = tools.commandEvidence
           .slice(callStart)
@@ -577,23 +703,57 @@ export async function implement(
           .filter((message) => message.role === "tool")
           .map((message) => String(message.content ?? ""))
           .join("\n");
-        if (
-          after !== before &&
-          !failedCommand &&
-          gateway.logger.events
-            .slice(repairStart)
-            .some(
-              (event) =>
-                event.type === "write_success" &&
-                event.subtaskId === subtask.id,
-            )
-        ) {
-          record("NOT_FULLY_VERIFIED");
-          return { verification, role, evidence };
+        if (after !== before && !failedCommand) {
+          const commands = [...new Set(options.stableRepair.failedChecks.map((check) => check.command))];
+          const focused = await verify(path, commands,
+            () => Math.min(gateway.config.commandTimeoutMs, gateway.budget.remainingMs()),
+            (check) => gateway.logger.log("stable_repair_verification", {
+              subtaskId: subtask.id, model: activeModel(), ...check,
+            }), writeScope,
+            [...(profile.ecosystem?.projectUnits.flatMap((unit) => unit.verification) ?? []),
+              ...options.stableRepair.failedChecks.filter((check) =>
+                check.source?.includes("focused-new-regression")).map((check) => ({
+                  command: check.command, kind: "test" as const, available: true,
+                  source: check.source!, cwd: ".", confidence: 1,
+                  mutatesSource: false as const, requiresInstalledDependencies: true,
+                }))]);
+          const focusedRelative = options.stableRepair.baselineChecks?.length
+            ? verificationAgainstBaseline(
+                verificationResult(options.stableRepair.baselineChecks), focused)
+            : focused;
+          if (focusedRelative.status === "VERIFIED_SUCCESS") {
+            gateway.logger.log("stable_final_repair_candidate_verified", {
+              subtaskId: subtask.id, model: activeModel(), checks: focused.checks,
+            });
+            record("NOT_FULLY_VERIFIED");
+            return { verification: focusedRelative, role, evidence };
+          }
+          const rejectedDiff = truncateBytes(after, gateway.config.context.maxBytes);
+          const originalFailure = verificationResult(options.stableRepair.failedChecks);
+          const attributable = verificationRegressed(originalFailure, focused);
+          if (attributable) record("FAILED", true, "focused_verification_failed");
+          const moved = await moveToRepairFallback(
+            attributable ? "VERIFIED_REGRESSION" : "NO_PROGRESS",
+            focused.checks.filter((check) => check.outcome === "CHECK_FAIL")
+              .map((check) => `${check.command}\n${check.stdout}\n${check.stderr}`).join("\n"),
+            rejectedDiff,
+          );
+          if (!moved) throw Error("Stable final repair fallback chain exhausted after failed verification");
+          modelTurn = 0;
+          lastRepairError = "Previous repair failed focused verification and was rolled back.";
+          continue;
+        }
+        if (failedCommand) lastRepairError = `Repair tool command failed: ${JSON.stringify(failedCommand)}`;
+        if (modelTurn >= 2) {
+          const moved = await moveToRepairFallback("NO_PROGRESS",
+            lastRepairError || "Repair model produced no mutation");
+          if (!moved) throw Error("Stable final repair fallback chain exhausted without a mutation");
+          modelTurn = 0;
+          continue;
         }
       }
       throw Error(
-        "Stable final repair worker exhausted two focused model turns",
+        "Stable final repair globally exhausted its bounded fallback chain",
       );
     } finally {
       gateway.logger.log("coding_worker_stop", {
@@ -619,6 +779,9 @@ export async function implement(
   let tinyNoMutationTurns = 0;
   let adaptiveProviderRetry = 0;
   let genericNoMutationTurns = 0;
+  let emptySearchCycles = 0;
+  let searchRecoveryUsed = false;
+  const seenSearchEvidence = new Set<string>();
   const attempted: string[] = [];
   const compactVerification = (v: VerificationResult) => ({
     ...v,
@@ -811,6 +974,8 @@ export async function implement(
   };
 
   start();
+  let attemptCheckpoint = await AttemptCheckpoint.capture(path, writeScope);
+  gateway.logger.log("attempt_checkpoint_created", { subtaskId: subtask.id, model: activeModel() });
 
   // RepairPacket Stable execution is intentionally isolated from the legacy
   // general coder state machine below. Once Stable has localized the task and
@@ -1178,7 +1343,7 @@ export async function implement(
                     tool.function.name,
                   ),
                 )
-              : genericNoMutationTurns >= 2
+              : genericNoMutationTurns >= 2 && !searchRecoveryUsed
                 ? toolDefinitions.filter((tool: any) =>
                     ["write_file", "edit_file"].includes(tool.function.name),
                   )
@@ -1286,6 +1451,8 @@ export async function implement(
                 "Continue from the CURRENT modified source. Do not overwrite it from stale context.",
             }),
           });
+        attemptCheckpoint = await AttemptCheckpoint.capture(path, writeScope);
+        gateway.logger.log("attempt_checkpoint_created", { subtaskId: subtask.id, model: activeModel() });
         continue;
       }
       stageIterations++;
@@ -1316,6 +1483,7 @@ export async function implement(
                     ],
               )
           : undefined);
+      const scopeEventStart = gateway.logger.events.length;
       if (m.tool_calls?.length)
         await applyCalls(
           m,
@@ -1328,9 +1496,67 @@ export async function implement(
         messages.push({ role: "assistant", content: m.content ?? "" });
         attempted.push((m.content ?? "").slice(0, 600));
       }
+      const violations = gateway.logger.events.slice(scopeEventStart).filter((event) =>
+        event.type === "write_scope_violation" && event.subtaskId === subtask.id);
+      if (violations.length && scopeExpansions < 1 && !options.tinyDirect && !options.stableHandoff) {
+        const attemptedPaths = [...new Set(violations.flatMap((event) => event.attempted_write_paths ?? []))];
+        const ownedElsewhere = (candidate: string) => plan.subtasks?.some((other) =>
+          other.id !== subtask.id && other.likelyWritePaths.some((owned) =>
+            candidate === owned || candidate.startsWith(owned + "/") || owned.startsWith(candidate + "/")));
+        if (attemptedPaths.length === 1 && !ownedElsewhere(attemptedPaths[0]) &&
+            await justifiedSiblingWrite(path, attemptedPaths[0], subtask, profile, task, options.evidence)) {
+          const candidate = attemptedPaths[0];
+          writeScope = new WriteScope([...writeScope.paths, candidate], gateway.logger, subtask.id);
+          tools.writeScope = writeScope;
+          subtask.likelyWritePaths.push(candidate);
+          attemptCheckpoint = await AttemptCheckpoint.capture(path, writeScope);
+          scopeExpansions++;
+          gateway.logger.log("write_scope_expanded", { subtaskId: subtask.id, path: candidate, reason: "task_named_sibling_with_source_relationship" });
+          messages.push({ role: "user", content: `Local repository evidence confirms ${candidate} is a required sibling implementation file. Its write scope is now authorized. Retry the rejected edit to that file; do not inspect or change unrelated paths.` });
+          continue;
+        }
+      }
       const diff = await currentDiff(path);
+      if (!diff.trim() && [...tools.missingReadAttempts.values()].some((count) => count >= 2))
+        throw Error("Repository navigation exhausted: repeated nonexistent read path after local recovery");
       if (diff === beforeDiff) genericNoMutationTurns++;
       else genericNoMutationTurns = 0;
+      let searchRecoveryTriggered = false;
+      if (!options.tinyDirect && !options.stableHandoff && !diff.trim()) {
+        const attemptedSearch = tools.actions.slice(actionStart).some((action) =>
+          action.startsWith("search_code:"));
+        const currentEvidence = tools.progressEvidence.slice(evidenceStart);
+        const usefulInspection = currentEvidence.some((item) => !seenSearchEvidence.has(item));
+        for (const item of currentEvidence) seenSearchEvidence.add(item);
+        emptySearchCycles = attemptedSearch && !usefulInspection
+          ? emptySearchCycles + 1 : usefulInspection ? 0 : emptySearchCycles;
+        if (emptySearchCycles >= 2 && !searchRecoveryUsed) {
+          searchRecoveryUsed = true;
+          searchRecoveryTriggered = true;
+          const tree = await tools.execute("list_files", {});
+          const alternateSearch = await tools.execute("search_code", {
+            query: "\\b(?:export|function|class|def)\\b",
+          });
+          const likelySources = [...new Set([
+            ...subtask.likelyWritePaths, ...subtask.likelyReadPaths,
+            ...profile.files,
+          ])].filter((file) => profile.files.includes(file) && isSourcePath(file)).slice(0, 2);
+          const source = await Promise.all(likelySources.map(async (file) => {
+            try { return { path: file, content: await tools.execute("read_file", { path: file }) }; }
+            catch { return { path: file, content: "unavailable" }; }
+          }));
+          messages.push({ role: "user", content: JSON.stringify({
+            instruction: "Two searches returned no useful result. The runtime inspected the file tree, tried a different code search, and read likely source files. Use this evidence to edit or inspect a specific file now; do not repeat the empty searches.",
+            tree: truncateBytes(String(tree), 2500),
+            alternateSearch: truncateBytes(String(alternateSearch), 2500),
+            source: source.map((entry) => ({ path: entry.path,
+              content: truncateBytes(String(entry.content), 4000) })),
+          }) });
+          gateway.logger.log("search_strategy_change", {
+            subtaskId: subtask.id, emptySearchCycles, inspectedFiles: likelySources,
+          });
+        }
+      }
       if (gateway.config.forceModel && !diff.trim() && genericNoMutationTurns >= 3)
         throw Error("Forced model stalled without verified completion");
       let tinyBoundedNoMutation = false;
@@ -1346,6 +1572,7 @@ export async function implement(
             stderr?: string;
           }
         | undefined;
+      let postWriteVerification: VerificationResult | undefined;
 
       if (
         options.finalVerificationOnly &&
@@ -1354,7 +1581,7 @@ export async function implement(
       ) {
         if (diff !== beforeDiff && diff.trim() && !failedInlineCheck) {
           stableNoMutationTurns = 0;
-          const targeted = await verify(
+          const targeted = stableTargetedCommands.length ? await verify(
             path,
             stableTargetedCommands,
             () =>
@@ -1369,7 +1596,7 @@ export async function implement(
               }),
             writeScope,
             profile.ecosystem?.projectUnits.flatMap((u) => u.verification),
-          );
+          ) : await checks(true);
           const targetedInfrastructureError = infrastructureError(targeted);
           if (targetedInfrastructureError) {
             infrastructureFailure = true;
@@ -1399,6 +1626,9 @@ export async function implement(
               evidence,
             };
           }
+
+          if (targeted.status === "NOT_FULLY_VERIFIED" && !targeted.checks.length)
+            return { verification: targeted, role, evidence };
 
           if (!stableCheckRepairUsed) {
             stableCheckRepairUsed = true;
@@ -1485,12 +1715,16 @@ export async function implement(
         !m.tool_calls?.length &&
         diff.trim()
       ) {
+        const recovered = postWriteVerification = await checks(true);
+        if (recovered.status === "FAILED") verification = recovered;
+        else {
         gateway.logger.log("ready_for_final_verification", {
           subtaskId: subtask.id,
           diffBytes: Buffer.byteLength(diff),
         });
         record("NOT_FULLY_VERIFIED");
         return { verification, role, evidence };
+        }
       }
       if (
         options.tinyDirect &&
@@ -1499,6 +1733,9 @@ export async function implement(
         diff.trim() &&
         !failedInlineCheck
       ) {
+        const recovered = postWriteVerification = await checks(true);
+        if (recovered.status === "FAILED") verification = recovered;
+        else {
         gateway.logger.log("ready_for_final_verification", {
           subtaskId: subtask.id,
           diffBytes: Buffer.byteLength(diff),
@@ -1506,6 +1743,7 @@ export async function implement(
         });
         record("NOT_FULLY_VERIFIED");
         return { verification, role, evidence };
+        }
       }
       if (
         options.finalVerificationOnly &&
@@ -1530,6 +1768,9 @@ export async function implement(
               iterationCommandResults,
             ))
       ) {
+        const recovered = postWriteVerification = await checks(true);
+        if (recovered.status === "FAILED") verification = recovered;
+        else {
         gateway.logger.log("ready_for_final_verification", {
           subtaskId: subtask.id,
           diffBytes: Buffer.byteLength(diff),
@@ -1539,6 +1780,7 @@ export async function implement(
         });
         record("NOT_FULLY_VERIFIED");
         return { verification, role, evidence };
+        }
       }
       // A failed run_command with no resulting diff is normally a failed
       // mutation attempt (for example an exact-text replacement that did not
@@ -1676,17 +1918,24 @@ export async function implement(
       }
       const verificationExecuted =
         diff !== beforeDiff ||
-        tools.actions
-          .slice(actionStart)
-          .some((a) => /^(?:run_command|write_file):/.test(a));
-      const after =
+        iterationCommandResults.some((result: any) => commands.includes(result.command));
+      let after =
         options.stableHandoff &&
         options.repairPacket &&
         stableTargetedFailureAfterRepair
           ? verification
           : verificationExecuted
-            ? await checks()
+            ? postWriteVerification ?? await checks(true)
             : verification;
+      if (diff.trim()) {
+        after = verificationAgainstBaseline(baselineVerification, after);
+        if (after.checks.some((check) => check.source?.endsWith(":baseline_unchanged")))
+          gateway.logger.log("verification_baseline_unchanged", {
+            subtaskId: subtask.id,
+            failingCommands: after.checks.filter((check) => check.source?.endsWith(":baseline_unchanged"))
+              .map((check) => check.command),
+          });
+      }
       const currentInfrastructureError = infrastructureError(after);
       if (currentInfrastructureError) {
         infrastructureFailure = true;
@@ -1713,6 +1962,8 @@ export async function implement(
           diffBytes: Buffer.byteLength(diff),
         });
         verification = after;
+        attemptCheckpoint = await AttemptCheckpoint.capture(path, writeScope);
+        gateway.logger.log("attempt_checkpoint_promoted", { subtaskId: subtask.id, model: activeModel() });
         record(after.status);
         return { verification: after, role, evidence };
       }
@@ -1724,6 +1975,32 @@ export async function implement(
         verification = after;
         record(after.status);
         return { verification: after, role, evidence };
+      }
+      const taskSpecificFailure = workerChecksAreTaskSpecific(subtask, profile, context) ||
+        /\b(?:tests?|checks?)\s+(?:must\s+)?pass\b/i.test(`${task} ${subtask.objective} ${subtask.integrationContract}`);
+      const baselineUnchangedFailure = after.status === "FAILED" &&
+          baselineVerification.checks.some((check) => check.outcome === "CHECK_FAIL") &&
+          !verificationRegressed(baselineVerification, after);
+      const repeatedAcceptanceCheck = iterationCommandResults.some((result: any) =>
+        after.checks.some((check) => check.command === result.command));
+      if (!diff.trim() && repeatedAcceptanceCheck && baselineUnchangedFailure) {
+        gateway.logger.log("verification_baseline_unchanged", {
+          subtaskId: subtask.id,
+          failingCommands: after.checks.filter((check) => check.outcome === "CHECK_FAIL").map((check) => check.command),
+          reason: "post_attempt_check_without_mutation",
+        });
+        verification = { ...after, status: "NOT_FULLY_VERIFIED" };
+        record(verification.status);
+        return { verification, role, evidence };
+      }
+      if (diff.trim() && baselineUnchangedFailure && !taskSpecificFailure) {
+        gateway.logger.log("verification_baseline_unchanged", {
+          subtaskId: subtask.id,
+          failingCommands: after.checks.filter((check) => check.outcome === "CHECK_FAIL").map((check) => check.command),
+        });
+        verification = { ...after, status: "NOT_FULLY_VERIFIED" };
+        record(verification.status);
+        return { verification, role, evidence };
       }
       const assessment = tracker.assess(
         verification,
@@ -1737,6 +2014,17 @@ export async function implement(
         diff !== beforeDiff,
       );
       verification = after;
+      const attemptChanges = await attemptCheckpoint.changed(path, writeScope);
+      const attemptHasMutation = attemptChanges.length > 0;
+      const attributableRegression = attemptHasMutation && after.status === "FAILED" &&
+        verificationRegressed(baselineVerification, after);
+      gateway.logger.log("attempt_evaluation", {
+        subtaskId: subtask.id,
+        model: activeModel(),
+        changedPaths: attemptChanges.map((change) => change.path),
+        verification: after.status,
+        baselineRegressed: attributableRegression,
+      });
       gateway.logger.log("progress", {
         subtaskId: subtask.id,
         iteration,
@@ -1745,16 +2033,18 @@ export async function implement(
       const verifiedQualityFailure =
         (!!adaptiveTier || specialistCascade.length > 0) &&
         (tinyBoundedNoMutation ||
-          (qualityFailure(after.checks, assessment.escalate) &&
-            (diff !== beforeDiff || assessment.escalate)));
+          (attributableRegression && qualityFailure(after.checks, assessment.escalate && !searchRecoveryTriggered) &&
+            (diff !== beforeDiff || (assessment.escalate && !searchRecoveryTriggered))));
       const frontierNoProgress =
         role === "FRONTIER_MODEL" &&
         diff === beforeDiff &&
-        stageIterations >= 2;
+        stageIterations >= 2 && !searchRecoveryTriggered;
       if (
         stableTargetedFailureAfterRepair ||
+        (attemptHasMutation && after.status === "FAILED") ||
+        attributableRegression ||
         verifiedQualityFailure ||
-        assessment.escalate ||
+        (assessment.escalate && !searchRecoveryTriggered) ||
         frontierNoProgress ||
         (!gateway.config.forceModel &&
           (stageIterations >= 6 ||
@@ -1764,6 +2054,24 @@ export async function implement(
       ) {
         if (gateway.config.forceModel && diff === beforeDiff && genericNoMutationTurns >= 2)
           throw Error("Forced model stalled without verified completion");
+        const failedAttemptDiff = attemptHasMutation
+          ? truncateBytes(diff, gateway.config.context.maxBytes)
+          : "";
+        const failedAttemptChecks = attributableRegression
+          ? compactVerification(after).checks.filter((check) => check.exitCode !== 0)
+          : [];
+        if (attemptHasMutation) {
+          const reverted = await attemptCheckpoint.restore(path, writeScope);
+          gateway.logger.log("attempt_rollback", {
+            subtaskId: subtask.id, model: activeModel(),
+            changedPaths: reverted.map((change) => change.path),
+            reason: attributableRegression ? "verification_regression" : "unaccepted_mutation",
+          });
+          verification = baselineVerification;
+        }
+        const attemptReason = attributableRegression
+          ? "focused_verification_failed"
+          : attemptHasMutation ? "unverified_mutation" : "no_mutation";
         let next = router.escalate(role);
         const previousModel = activeModel();
         if (adaptiveTier) {
@@ -1771,12 +2079,8 @@ export async function implement(
           const higher = nextCodingTier(previousTier);
           if (!higher)
             throw Error("Frontier stalled without verified completion");
-          const escalationReason = tinyBoundedNoMutation
-            ? "tiny bounded no-mutation"
-            : verifiedQualityFailure
-              ? "deterministic quality failure"
-              : "bounded implementation stalled";
-          record("FAILED", true, escalationReason);
+          record(attributableRegression ? "FAILED" : "NOT_FULLY_VERIFIED",
+            attributableRegression, attemptReason);
           adaptiveTier = higher;
           adaptiveAttempt++;
           adaptiveProviderRetry = 0;
@@ -1795,16 +2099,13 @@ export async function implement(
             subtaskId: subtask.id,
             from: previousTier,
             to: higher,
-            reason: tinyBoundedNoMutation
-              ? "tiny bounded no-mutation"
-              : verifiedQualityFailure
-                ? "CHECK_FAIL or measured no-progress"
-                : "bounded attempt exhausted",
+            reason: attemptReason,
             verification: after.status,
           });
         } else if (pool && selected) {
           const previousCandidate = selected;
-          record("FAILED", true, "stalled or stage budget");
+          record(attributableRegression ? "FAILED" : "NOT_FULLY_VERIFIED",
+            attributableRegression, attemptReason);
           excluded.push(previousCandidate.model.id);
           try {
             selected = specialistCascade.length
@@ -1828,8 +2129,7 @@ export async function implement(
               from: previousCandidate.model.id,
               to: selected!.model.id,
               to_role: selected!.model.tier === "frontier" ? "FRONTIER_MODEL" : poolRole(),
-              reason: after.checks.some((check) => check.outcome === "CHECK_FAIL")
-                ? "focused_verification_failed" : "bounded_no_progress",
+              reason: attemptReason,
             });
           } catch (error) {
             if (
@@ -1867,14 +2167,13 @@ export async function implement(
           originalObjective: subtask.objective,
           acceptanceCriteria,
           relevantFiles: evidence.relevantFiles,
-          currentDiff: truncateBytes(diff, gateway.config.context.maxBytes),
+          currentDiff: truncateBytes(await currentDiff(path), gateway.config.context.maxBytes),
           reproduction: evidence.reproduction,
-          verificationFailures: compactVerification(verification).checks.filter(
-            (c) => c.exitCode !== 0,
-          ),
+          verificationFailures: failedAttemptChecks,
           approachesAlreadyAttempted: [
             ...attempted.slice(-6),
             ...tools.actions.slice(-12),
+            ...(failedAttemptDiff ? [`REJECTED ATTEMPT DIFF (already rolled back):\n${failedAttemptDiff}`] : []),
           ],
           disprovenHypotheses: [],
           remainingProblem: `${verification.failedChecks} checks failing; ${assessment.noProgressCycles} cycles without measured improvement`,
@@ -1887,7 +2186,8 @@ export async function implement(
           selected_model: selected?.model.id ?? gateway.config.registry[next],
           previous_verification: verification,
           previous_cost: stageCost,
-          reason: assessment,
+          reason: attemptReason,
+          assessment,
           handoff,
         });
         role = next;
@@ -1914,6 +2214,8 @@ export async function implement(
                 "Continue from the CURRENT modified source. Do not overwrite it from stale context.",
             }),
           });
+        attemptCheckpoint = await AttemptCheckpoint.capture(path, writeScope);
+        gateway.logger.log("attempt_checkpoint_created", { subtaskId: subtask.id, model: activeModel() });
       } else
         messages.push({
           role: "user",
@@ -1927,14 +2229,21 @@ export async function implement(
     }
     throw Error("Subtask iteration budget exhausted");
   } finally {
-    if (!infrastructureFailure && !terminalAttemptRecorded)
-      record(
-        verification.status === "NOT_FULLY_VERIFIED"
-          ? verification.status
-          : "FAILED",
-        false,
-        "worker ended",
-      );
+    if (!infrastructureFailure && !terminalAttemptRecorded) {
+      const unaccepted = await attemptCheckpoint.changed(path, writeScope);
+      const regressed = unaccepted.length > 0 && verification.status === "FAILED" &&
+        verificationRegressed(baselineVerification, verification);
+      record(regressed ? "FAILED" : "NOT_FULLY_VERIFIED", false,
+        unaccepted.length ? "unaccepted_mutation" : "no_mutation");
+      if (unaccepted.length) {
+        await attemptCheckpoint.restore(path, writeScope);
+        gateway.logger.log("attempt_rollback", {
+          subtaskId: subtask.id, model: activeModel(),
+          changedPaths: unaccepted.map((change) => change.path),
+          reason: "worker_ended_without_acceptance",
+        });
+      }
+    }
     gateway.logger.log("coding_worker_stop", {
       subtaskId: subtask.id,
       worktree: path,

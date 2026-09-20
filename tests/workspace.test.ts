@@ -22,7 +22,7 @@ import {
 } from "../src/workspace/backend.js";
 import { listWorkspaceFiles, snapshotTree } from "../src/workspace/files.js";
 import { profileRepo } from "../src/repo/profiler.js";
-import { git } from "../src/repo/commands.js";
+import { command, git, linuxTemporaryMountArguments } from "../src/repo/commands.js";
 import { config } from "../src/config.js";
 import { run } from "../src/run.js";
 import { AgentTools, currentDiff } from "../src/agent/tools.js";
@@ -37,6 +37,88 @@ async function sandbox(prefix = "koda-workspace-") {
   await mkdir(root);
   return { parent, root, output };
 }
+
+test("Linux /tmp workspaces have mountpoints before /tmp becomes read-only", async () => {
+  for (const cwd of [
+    "/tmp/koda-verify-example/repo",
+    "/tmp/koda-workspaces/run-example/integration",
+  ]) {
+    const args = linuxTemporaryMountArguments(cwd, "/tmp/k");
+    const remount = args.indexOf("--remount-ro");
+    assert.ok(remount > 0);
+    assert.ok(args.indexOf(cwd) < remount, "cwd mountpoint must exist before remount");
+    assert.ok(args.indexOf("/tmp/k") < remount, "scratch mountpoint must exist before remount");
+    assert.deepEqual(args.slice(remount, remount + 4),
+      ["--remount-ro", "/tmp", "--tmpfs", "/tmp/k"]);
+    assert.ok(!args.includes("--bind"), "all of /tmp must not become writable");
+  }
+  if (process.platform !== "linux") return;
+  for (const prefix of ["koda-verify-", "koda-workspaces-"]) {
+    const parent = await mkdtemp(join("/tmp", prefix));
+    const repo = join(parent, "nested", "repo");
+    try {
+      await mkdir(repo, { recursive: true });
+      await git(repo, "init", "-q");
+      const result = await command(repo, "printf sandbox-ok", 10000, true);
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.equal(result.stdout, "sandbox-ok");
+    } finally { await rm(parent, { recursive: true, force: true }); }
+  }
+});
+
+test("Linux verification snapshots without Git metadata remain sandboxable", async () => {
+  if (process.platform !== "linux") return;
+  const parent = await mkdtemp(join("/tmp", "koda-verify-no-git-"));
+  const repo = join(parent, "repo");
+  try {
+    await mkdir(repo, { recursive: true });
+    await writeFile(join(repo, "check.py"), "print('baseline-ok')\n");
+    const result = await command(repo, "python3 -B check.py", 10000, true);
+    assert.equal(result.exitCode, 0, result.stderr || result.stdout);
+    assert.equal(result.stdout, "baseline-ok");
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("clean Git integration and untouched worker begin with zero snapshot changes", async () => {
+  const f = await sandbox("koda-clean-git-baseline-");
+  await mkdir(join(f.root, "package.egg-info"), { recursive: true });
+  await mkdir(join(f.root, "src", "nested"), { recursive: true });
+  await writeFile(join(f.root, ".gitignore"), "scratch.egg-info/\n");
+  await writeFile(join(f.root, "package.egg-info", "PKG-INFO"), "tracked metadata\n");
+  await writeFile(join(f.root, "src", "nested", "plain.py"), "value = 1\n");
+  await writeFile(join(f.root, "src", "tool.sh"), "#!/bin/sh\nexit 0\n");
+  await chmod(join(f.root, "src", "tool.sh"), 0o755);
+  await git(f.root, "init", "-q");
+  await git(f.root, "config", "user.email", "test@koda.local");
+  await git(f.root, "config", "user.name", "Koda Test");
+  await git(f.root, "add", ".");
+  await git(f.root, "commit", "-qm", "baseline");
+  await chmod(join(f.root, "src", "nested", "plain.py"), 0o600);
+  await mkdir(join(f.root, "scratch.egg-info"));
+  await writeFile(join(f.root, "scratch.egg-info", "ignored.txt"), "ignored\n");
+  let integration: { path: string } | undefined;
+  try {
+    assert.equal(await git(f.root, "status", "--porcelain"), "");
+    const backend = await createWorkspaceBackend(f.root, join(f.parent, "workspaces"),
+      new Logger(f.output, "clean-git", true), false);
+    assert.equal(backend.mode, "git");
+    integration = await backend.initialize();
+    assert.deepEqual(await backend.changes(integration.path), []);
+    const worker = await backend.createWorker("untouched");
+    try {
+      assert.deepEqual(await backend.changes(worker.path), []);
+      await writeFile(join(worker.path, "src", "nested", "plain.py"), "value = 2\n");
+      assert.deepEqual((await backend.changes(worker.path)).map((change) => change.path),
+        ["src/nested/plain.py"]);
+    } finally { await backend.cleanupWorker(worker); }
+    assert.deepEqual(await backend.changes(integration.path), []);
+  } finally {
+    if (integration) await git(f.root, "worktree", "remove", "--force", integration.path);
+    await rm(f.parent, { recursive: true, force: true });
+  }
+});
 
 test("edit_file replaces one exact text span and rejects missing, ambiguous, or unsafe targets", async () => {
   const f = await sandbox("koda-edit-file-");
@@ -705,7 +787,7 @@ test("non-Git DIRECT run edits, verifies and leaves the original unchanged in pr
     const failed = await run({
       repo: f.root,
       task: "Change calc.js addition from subtraction to addition.",
-      verify: ['node -e "process.exit(1)"'],
+      verify: ["node -e \"import('./calc.js').then(({add})=>process.exit(Number(add(2,3)===5)))\""],
       config: cfg,
       output: join(f.parent, "failed-output"),
       apply: true,
@@ -713,6 +795,15 @@ test("non-Git DIRECT run edits, verifies and leaves the original unchanged in pr
     });
     assert.equal(failed.status, "FAILED");
     assert.equal(failed.applyResult, "not_verified");
+    assert.equal(failed.candidateProduced, true);
+    assert.deepEqual(failed.candidateChangedFiles, ["calc.js"]);
+    assert.equal(failed.candidatePatchPath, join(f.parent, "failed-output", "candidate.patch"));
+    const candidatePatch = await readFile(failed.candidatePatchPath, "utf8");
+    assert.match(
+      candidatePatch,
+      /-export const add=\(a,b\)=>a-b;[\s\S]*\+export const add=\(a,b\)=>a\+b;/,
+    );
+    assert.doesNotMatch(candidatePatch, /koda-workspaces|koda-nongit/);
     assert.equal(
       await readFile(join(f.root, "calc.js"), "utf8"),
       "export const add=(a,b)=>a-b;\n",

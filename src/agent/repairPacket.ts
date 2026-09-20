@@ -48,7 +48,13 @@ export async function buildRepairPacket(
     let startLine = 1;
     if (!complete) {
       const lines = text.split(/(?<=\n)/);
-      const hit = lines.findIndex((line) => terms.some((term) => line.toLowerCase().includes(term)));
+      const identifiers = objective.match(/\b[a-zA-Z][a-zA-Z0-9]*_[a-zA-Z0-9_]+\b/g) ?? [];
+      const scores = lines.map((line) => {
+        const relevant = identifiers.reduce((score, symbol) => score + (line.includes(symbol) ? 10 : 0), 0) +
+          terms.reduce((score, term) => score + (line.toLowerCase().includes(term) ? 1 : 0), 0);
+        return /^(?:from |import |\s*#|\s*\*)/.test(line) ? 0 : relevant;
+      });
+      const hit = scores.indexOf(Math.max(...scores));
       const center = hit < 0 ? 0 : hit;
       let start = Math.max(0, center - 8);
       let end = Math.min(lines.length, center + 12);

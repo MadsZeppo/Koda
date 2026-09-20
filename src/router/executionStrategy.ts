@@ -120,11 +120,28 @@ export function chooseExecutionStrategy(
     likelyFiles: matched,
   });
 
-  if (
-    /\b(?:independent(?:ly)?|separately|parallel|workstreams?)\b/i.test(
-      requestedWork,
-    )
-  ) {
+  const explicitParallelWork = implementationWork
+    .split(/[.!?;\n]+/)
+    .some(
+      (clause) =>
+        /\b(?:independent(?:ly)?|separately|parallel|workstreams?)\b/i.test(
+          clause,
+        ) &&
+        /\b(?:fix|repair|add|implement|update|change|modify|refactor|migrat\w*|build|create|remove|delete|rename|redesign|correct)\b/i.test(
+          clause,
+        ) &&
+        (
+          concreteMentions.filter((file) => mentionedPath(clause, file)).length >= 2 ||
+          /\band\s+(?:independently\s+|separately\s+)?(?:fix|repair|add|implement|update|change|modify|refactor|build|create|remove|delete|rename|correct)\b/i.test(
+            clause,
+          ) ||
+          /\b(?:two|three|four|multiple)\s+(?:changes?|fixes?|tasks?|components?|files?|modules?|workstreams?)\b/i.test(
+            clause,
+          )
+        ),
+    );
+
+  if (explicitParallelWork) {
     return planned("Explicit independent workstreams");
   }
 
@@ -135,6 +152,12 @@ export function chooseExecutionStrategy(
   ) {
     return planned("Cross-component work requires decomposition");
   }
+
+  const actionVerbs = implementationWork.match(/(?:^|[.;]\s*|\band\s+)(?:fix|repair|implement|compose|regenerate|correct|create|build|update)\b/gi) ?? [];
+  if (actionVerbs.length >= 2 &&
+      /\b(?:and|independently)\b|[.;]\s*(?:fix|repair|implement|compose|regenerate|correct|create|build|update)\b/i.test(implementationWork) &&
+      !/\b(?:one|single|same)\s+(?:bug|issue|fix|change)\b/i.test(implementationWork))
+    return planned("Separate implementation actions");
 
   // A bounded inspect -> fix -> verify workflow is one sequential workstream,
   // even when the user scopes it to a directory rather than one exact file.
@@ -169,13 +192,12 @@ export function chooseExecutionStrategy(
     };
   }
 
+  // Sentences, reproduction steps and code snippets are not independent
+  // mutation targets. Decompose only when the task establishes separable work.
   if (
-    /\b(?:and|then|also)\s+(?:(?:then|also)\s+)?(?:fix|add|update|change|rename|remove|delete|implement|create|build|compose|deploy|regenerate)\b|[;\n]|[.!?]\s+(?:fix|add|update|change|rename|remove|delete|implement|create|build)/i.test(
-      implementationWork,
-    )
-  ) {
-    return planned("Multiple requested actions");
-  }
+    /\b(?:independent|separate|parallel)\b/i.test(implementationWork) &&
+    concreteMentions.filter(isSourcePath).length > 1
+  ) return planned("Multiple independent implementation targets");
 
   if (
     /\bclient\b/i.test(requestedWork) &&
@@ -216,8 +238,9 @@ export function chooseExecutionStrategy(
   // as "verification", "routing", or "planner") are localization hints, not
   // independent workstreams and must not summon the planner by themselves.
   if (
-    concreteMentions.length >= 2 &&
-    new Set(concreteMentions.map(component)).size > 1
+    concreteMentions.filter(isSourcePath).length >= 2 &&
+    new Set(concreteMentions.filter(isSourcePath).map(component)).size > 1 &&
+    /\b(?:independent|separate|parallel|and)\b/i.test(implementationWork)
   ) {
     return planned("Explicit distinct requested components");
   }

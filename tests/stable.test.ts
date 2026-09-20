@@ -372,10 +372,10 @@ test("reading an unrelated file does not authorize it as a Stable write path", a
     const subtask: Subtask = { id: "stable", title: "Add CLI flag", objective: "Add a CLI flag in src/cli.ts",
       dependsOn: [], likelyReadPaths: ["src/cli.ts"], likelyWritePaths: [], readOnly: true,
       integrationContract: "focused tests", verificationCommands: [], estimatedDifficulty: "normal", parallelSafe: false };
-    await assert.rejects(prepareStableWorker(gateway, repo, subtask.objective, subtask,
-      await profileRepo(repo), { files: [], repoMap: [], localDependencies: [] }),
-      /bounded budget without locking a write scope/);
-    assert.equal(calls, 3);
+    const prepared = await prepareStableWorker(gateway, repo, subtask.objective, subtask,
+      await profileRepo(repo), { files: [], repoMap: [], localDependencies: [] });
+    assert.deepEqual(prepared.writePaths, ["src/cli.ts"]);
+    assert.equal(calls, 1);
     assert.equal(await readFile(join(repo, "src/unrelated.ts"), "utf8"), "export const unrelated = 1;\n");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
@@ -430,7 +430,10 @@ test("inspected CLI routing plumbing and its focused test are authorized, but ar
         assert.deepEqual((await prepared).writePaths, [...sourcePaths, testPath]);
         assert.equal(calls, 2, "ambiguous coupled feature uses one scope finalization call");
       } else {
-        await assert.rejects(prepared, /bounded budget without locking a write scope/);
+        const fallback = await prepared;
+        assert.ok(!fallback.writePaths.includes("tests/unrelated.test.ts"));
+        assert.ok(fallback.writePaths.every((file) => sourcePaths.includes(file) ||
+          file === "tests/modelRouter.test.ts"));
         assert.equal(calls, 3, "invalid scope gets only one correction");
       }
     }
@@ -1064,7 +1067,7 @@ test("stable mode locks scope, preserves work across transient fallback, and ver
     assert.match(firstCoderRequest.messages[0].content, /The RepairPacket contains the locked file contents/);
     assert.match(firstCoderRequest.messages[0].content, /Do not read, search, inspect, or run commands/);
     const coderInput = JSON.parse(firstCoderRequest.messages[1].content);
-    assert.match(coderInput.inspectionHandoff.issue, /Fix addition/);
+    assert.match(coderInput.inspectionHandoff.issue, /Inspect src\/calculator\.cjs/);
     assert.match(coderInput.inspectionHandoff.requiredChange, /Inspect src\/calculator\.cjs/);
     assert.deepEqual(coderInput.inspectionHandoff.evidence.relevantFiles,
       ["src/calculator.cjs", "tests/calculator.test.cjs"]);
@@ -1109,7 +1112,7 @@ test("stable mode locks scope, preserves work across transient fallback, and ver
     assert.equal(
       events.find((event) => event.type === "ready_for_final_verification")
         .reason,
-      "task_diff_verified",
+      "focused_check_passed_final_verification_pending",
     );
     assert.equal(events.filter((event) => event.type === "stable_action_repair").length, 0);
     assert.equal(events.filter((event) => event.type === "stable_mutation_repair").length, 0);

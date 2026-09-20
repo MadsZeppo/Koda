@@ -7,6 +7,15 @@ import { AgentTools } from "../src/agent/tools.js";
 import { Logger } from "../src/telemetry/logger.js";
 import { boundMessages, truncateBytes } from "../src/context/bounds.js";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
+test("search_code locates a literal symbol with path, line and source snippet", async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-symbol-search-"));
+  try {
+    await writeFile(join(root, "codec.py"), "def to_native_string(value):\n    return value\n");
+    const tools = new AgentTools(root, true, 1000, new Logger(join(root, "logs"), "search", true), "worker");
+    const result = String(await tools.execute("search_code", { query: "to_native_string" }));
+    assert.match(result, /codec\.py:1: def to_native_string\(value\)/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 test("tool results enforce a byte cap and history trimming preserves paired tool exchanges", async () => {
   const root = await mkdtemp(join(tmpdir(), "koda-tool-bound-"));
   try {

@@ -58,6 +58,7 @@ async function mock(
     solutions: Record<string, string>;
     inspectOnly?: string[];
     directFile?: string;
+    searchFirst?: boolean;
     extraWritePath?: string;
   } = { plan, solutions },
 ) {
@@ -125,13 +126,22 @@ async function mock(
           });
       } else {
         await new Promise((r) => setTimeout(r, 30));
-        const id = scenario.directFile
+        let id = scenario.directFile
           ? "direct"
           : (
               input.subtask?.id ??
               input.handoff.originalObjective.replace(/^Implement /, "")
             ).replace(/-[ab]$/, "");
-        if (scenario.inspectOnly?.includes(id))
+        const sourceId = input.subtask?.likelyWritePaths?.[0]?.replace(/\.cjs$/, "");
+        if (!scenario.solutions[id] && sourceId && scenario.solutions[sourceId]) id = sourceId;
+        if (scenario.searchFirst && !body.messages.some((entry: any) =>
+          entry.role === "tool" && typeof entry.content === "string" &&
+          entry.content.includes("add.cjs:1:")))
+          message = { role: "assistant", content: null, tool_calls: [{
+            id: "search", type: "function", function: { name: "search_code",
+              arguments: JSON.stringify({ query: "module.exports" }) },
+          }] };
+        else if (scenario.inspectOnly?.includes(id))
           message = {
             role: "assistant",
             content: null,
@@ -342,7 +352,7 @@ test("benchmark hidden failure cannot be overridden by model success and base ch
           repo,
           baseCommit: base,
           task: plan.taskSummary,
-          verify: ['node -e "process.exit(1)"'],
+          verify: ["node -e \"process.exit(Number(require('./add.cjs')(2,3)===5))\""],
         },
       ]),
     );
@@ -629,7 +639,7 @@ for (const mode of [
         output,
         quiet: true,
         verify:
-          mode === "final-failure" ? ['node -e "process.exit(1)"'] : undefined,
+          mode === "final-failure" ? ["node -e \"process.exit(Number(require('./add.cjs')(2,3)===5))\""] : undefined,
       });
       assert.equal(result.execution_strategy, "direct");
       assert.equal(result.plannerModelCalls, 0);
@@ -759,7 +769,7 @@ test("same-layer writes to one file coalesce into one verified coding execution"
   try {
     const result = await run({
       repo,
-      task: "Fix the independent addition and multiplication bugs.",
+      task: "Fix the independent addition and multiplication bugs in add.cjs and multiply.cjs.",
       config: await config(undefined, {
         models: {},
         baseUrl: api.url,
@@ -805,7 +815,7 @@ test("three independent repairs genuinely overlap in isolated worktrees even wit
     const base = await git(repo, "rev-parse", "HEAD");
     const result = await run({
       repo,
-      task: "Fix three independent helpers.",
+      task: "Fix the three independent helpers in add.cjs, multiply.cjs and report.cjs.",
       config: await config(undefined, {
         models: {},
         baseUrl: api.url,
@@ -929,4 +939,27 @@ test("worker context excludes unrelated large content and respects configured bo
     await cleanup(repo);
     await rm(output, { recursive: true, force: true });
   }
+});
+test("localized bug uses one worker to search, mutate and verify without planner or scout", async () => {
+  const repo = await setup();
+  await writeFile(join(repo, "multiply.cjs"), solutions.multiply!);
+  await writeFile(join(repo, "report.cjs"), solutions.report!);
+  await git(repo, "add", ".");
+  await git(repo, "commit", "-m", "isolate addition bug");
+  const api = await mock(false, false, false, {
+    plan, solutions: { direct: solutions.add! }, directFile: "add.cjs", searchFirst: true,
+  });
+  const output = await mkdtemp(join(tmpdir(), "koda-search-direct-"));
+  try {
+    const result = await run({ repo, output, quiet: true,
+      task: "Bug: add returns a subtraction. Reproduce by calling add(2, 3). Fix add.cjs so it returns the sum.",
+      config: await config(undefined, { baseUrl: api.url, models: { CHEAP_CODER_A: "cheap-a" } }),
+    });
+    assert.equal(result.execution_strategy, "direct");
+    assert.equal(result.status, "VERIFIED_SUCCESS", JSON.stringify(result));
+    assert.equal(result.plannerModelCalls, 0);
+    assert.ok(api.requests.some((request: any) => request.messages.some((entry: any) =>
+      entry.role === "tool" && typeof entry.content === "string" &&
+      entry.content.includes("add.cjs:1:"))));
+  } finally { await api.close(); await cleanup(repo); await rm(output, { recursive: true, force: true }); }
 });

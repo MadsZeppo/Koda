@@ -1,6 +1,7 @@
+import { prepareRepairChecks, newFailureIds } from "./verifier/repairFocus.js";
 import { verificationPlan } from "./verifier/plan.js";
 import type { PoolRouter } from "./router/modelRouter.js";
-import { mkdir, writeFile, realpath } from "node:fs/promises";
+import { mkdir, writeFile, readFile, realpath } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { tmpdir, homedir } from "node:os";
@@ -27,16 +28,21 @@ import { normalizePlan } from "./orchestrator/coalesce.js";
 import { compileTask } from "./planner/taskCompiler.js";
 import { schedule } from "./orchestrator/scheduler.js";
 import { implement } from "./agent/loop.js";
+import { currentDiff, safePath } from "./agent/tools.js";
+import { truncateBytes } from "./context/bounds.js";
+import { AttemptCheckpoint } from "./agent/attemptCheckpoint.js";
+import { WriteScope } from "./repo/writeScope.js";
 import { discover } from "./agent/discovery.js";
 import { prepareStableWorker } from "./agent/stable.js";
 import { buildRepairPacket } from "./agent/repairPacket.js";
-import { verify, verificationResult } from "./verifier/verifier.js";
+import { advisoryInfrastructureOnly, verify, verificationAgainstBaseline, verificationResult, verificationRegressions } from "./verifier/verifier.js";
+import { focusedLocalReproduction, optionalUnavailableCheck } from "./verifier/recovery.js";
 import {
   repoBackedVerificationCommands,
   tinyDocumentationChecks,
   targetedProjectUnitNativeCheck,
 } from "./verifier/selection.js";
-import type { Status, CommandResult } from "./types.js";
+import type { Status, CommandResult, VerificationResult } from "./types.js";
 import type { EvidencePacket, Subtask } from "./planner/schemas.js";
 import {
   createWorkspaceBackend,
@@ -109,6 +115,7 @@ export async function run(options: RunOptions) {
   if (output === repo || output.startsWith(repo + "/"))
     throw Error("Report output must be outside the target repository");
   const logger = new Logger(output, runId, options.quiet);
+  let acceptedRepairState: string | undefined;
   let status: Status = "FAILED",
     verification = verificationResult([]),
     error: string | undefined;
@@ -414,15 +421,33 @@ export async function run(options: RunOptions) {
           });
           try {
             await bridgeDependencies(repo, wt.path, profile.ecosystem);
-            const evidence = await discover(
-              gateway,
-              wt.path,
-              options.task,
-              subtask,
-              plan,
-              profile,
-              inheritedEvidence,
-            );
+            let evidence: EvidencePacket;
+            try {
+              evidence = await discover(
+                gateway,
+                wt.path,
+                options.task,
+                subtask,
+                plan,
+                profile,
+                inheritedEvidence,
+              );
+            } catch (failure) {
+              // Discovery is advisory. A failed scout cannot grant writes or
+              // prevent a dependent coder from inspecting its own workspace.
+              await assertWriteResponsibility(wt.path, subtask);
+              evidence = {
+                relevantFiles: subtask.likelyReadPaths.filter((file) => profile.files.includes(file)),
+                symbols: [], reproduction: "", failingTests: [], likelyRootCause: "",
+                dependencies: [], uncertainty: "high",
+                suggestedApproach: "Inspect the relevant source before editing; discovery did not establish a finding.",
+                evidence: [],
+              };
+              logger.log("discovery_fallback", {
+                subtaskId: subtask.id, reason: String(failure),
+                relevantFiles: evidence.relevantFiles,
+              });
+            }
             await assertWriteResponsibility(wt.path, subtask);
             discoveryEvidence.set(subtask.id, evidence);
             logger.log("task_complete", {
@@ -466,11 +491,17 @@ export async function run(options: RunOptions) {
                 evidence: combineEvidence(inheritedEvidence),
               },
             );
-            if (result.verification.status !== "VERIFIED_SUCCESS") {
+            if (result.verification.status !== "VERIFIED_SUCCESS" &&
+                !advisoryInfrastructureOnly(result.verification)) {
               if (result.verification.status === "NOT_FULLY_VERIFIED")
                 status = "NOT_FULLY_VERIFIED";
               throw Error(`${subtask.id}: ${result.verification.status}`);
             }
+            if (advisoryInfrastructureOnly(result.verification))
+              logger.log("verification_advisory_unavailable", {
+                subtaskId: subtask.id,
+                checks: result.verification.checks.filter((check) => check.unavailable),
+              });
             await assertWriteResponsibility(wt.path, subtask);
             const revision = await backend!.finalizeWorker(
               wt,
@@ -582,6 +613,17 @@ export async function run(options: RunOptions) {
         (c) => !currentPlan.some((r) => r.command === c.command),
       ),
     ];
+    if (!allFinalCandidates.some((candidate) => candidate.available)) {
+      const recovered = await focusedLocalReproduction(finalProfile, options.task, verificationPaths);
+      if (recovered) {
+        for (let i = allFinalCandidates.length - 1; i >= 0; i--)
+          if (optionalUnavailableCheck(allFinalCandidates[i]!))
+            allFinalCandidates.splice(i, 1);
+        allFinalCandidates.push(recovered);
+        logger.log("verification_recovery", { phase: "final", command: recovered.command,
+          source: recovered.source });
+      }
+    }
     const tinyDocs =
       strategy.execution_strategy === "direct" &&
       strategy.execution_effort === "tiny" &&
@@ -619,15 +661,34 @@ export async function run(options: RunOptions) {
       ...(tinyDocs ? [] : taskVerificationCommands),
       ...(options.verify ?? []),
     ];
+    const explicitlyRequiredCommands = new Set([
+      ...(tinyDocs ? [] : taskVerificationCommands),
+      ...(options.verify ?? []),
+    ]);
+    const finalCandidates = finalPlan.map((candidate) =>
+      explicitlyRequiredCommands.has(candidate.command)
+        ? { ...candidate, requirement: "required" as const }
+        : candidate,
+    );
+    let finalBaseline: VerificationResult | undefined;
     const runFinalVerification = async () => {
-      const executable = await verify(
+      let executable = await verify(
         integration!.path,
         finalCommands,
         () => Math.min(options.config.commandTimeoutMs, budget.remainingMs()),
         (c) => logger.log("final_verification", c as any),
         undefined,
-        finalPlan,
+        finalCandidates,
       );
+      if (executable.checks.some((check) => check.outcome === "CHECK_FAIL")) {
+        finalBaseline ??= await verify(
+          backend!.baselinePath, finalCommands,
+          () => Math.min(options.config.commandTimeoutMs, budget.remainingMs()),
+          (check) => logger.log("final_baseline_verification", check as any),
+          undefined, finalCandidates,
+        );
+        executable = verificationAgainstBaseline(finalBaseline, executable);
+      }
       if (!tinyDocs) return executable;
       const changedPaths = (await backend!.changes(integration!.path)).map(
         (change) => change.path,
@@ -669,9 +730,65 @@ export async function run(options: RunOptions) {
       verification.status === "FAILED" &&
       !verification.checks.some((check) => check.outcome === "INFRA_FAILURE")
     ) {
-      let failedChecks = verification.checks.filter(
-        (check) => check.outcome === "CHECK_FAIL",
+      finalBaseline ??= await verify(
+        backend!.baselinePath,
+        finalCommands,
+        () => Math.min(options.config.commandTimeoutMs, budget.remainingMs()),
+        (check) => logger.log("stable_final_baseline", check as any),
+        undefined,
+        finalCandidates,
       );
+      const failedPatchContext = async () => {
+        const uncommitted = await currentDiff(integration!.path);
+        if (uncommitted.trim()) return uncommitted;
+        const changes = await backend!.changes(integration!.path);
+        const entries = await Promise.all(changes.slice(0, 8).map(async (change) => {
+          const before = await readFile(join(backend!.baselinePath, change.path), "utf8").catch(() => "<new file>");
+          const after = await readFile(join(integration!.path, change.path), "utf8").catch(() => "<deleted file>");
+          const beforeLines = before.split("\n"), afterLines = after.split("\n");
+          let first = 0;
+          while (first < beforeLines.length && first < afterLines.length &&
+            beforeLines[first] === afterLines[first]) first++;
+          const start = Math.max(0, first - 10);
+          return `--- baseline/${change.path}\n+++ candidate/${change.path}\n@@ -${start + 1} +${start + 1} @@\n` +
+            truncateBytes(beforeLines.slice(start, first + 30).map((line) => `-${line}`).join("\n"), 3000) + "\n" +
+            truncateBytes(afterLines.slice(start, first + 30).map((line) => `+${line}`).join("\n"), 3000);
+        }));
+        return entries.join("\n");
+      };
+      let failedChecks = verificationRegressions(finalBaseline, verification);
+      const failureContext = async (checks: CommandResult[]) => {
+        const identities = checks.flatMap((check) => newFailureIds(check, finalBaseline!.checks));
+        const contexts = await Promise.all(identities.slice(0, 4).map(async (identity) => {
+          const [relativePath, ...parts] = identity.split("::");
+          if (!relativePath || !/^[\w./-]+\.py$/.test(relativePath) || relativePath.includes("..")) return undefined;
+          const content = await readFile(await safePath(integration!.path, relativePath), "utf8").catch(() => "");
+          if (!content) return undefined;
+          const symbol = parts.at(-1);
+          const lines = content.split("\n");
+          const index = symbol ? lines.findIndex((line) => new RegExp(`\\b(?:def|class)\\s+${symbol.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\b`).test(line)) : -1;
+          const start = Math.max(0, index < 0 ? 0 : index - 8);
+          return { path: relativePath, symbol,
+            content: truncateBytes(lines.slice(start, start + 60).join("\n"), 6000) };
+        }));
+        return contexts.filter((item): item is NonNullable<typeof item> => !!item);
+      };
+      const regressionDiagnostics = (baseline: VerificationResult, checks: CommandResult[]) =>
+        checks.map((check) => {
+          const previous = baseline.checks.find((item) => item.command === check.command);
+          const priorLines = new Set(`${previous?.stdout ?? ""}\n${previous?.stderr ?? ""}`
+            .split("\n").map((line) => line.trim()).filter(Boolean));
+          const novel = `${check.stdout}\n${check.stderr}`.split("\n")
+            .filter((line) => line.trim() && !priorLines.has(line.trim()))
+            .filter((line) => /FAIL|Error|Assertion|expected|actual|\bE\s+|✖/i.test(line))
+            .slice(0, 30);
+          return `${check.command}\n${novel.join("\n")}`;
+        });
+      if (!failedChecks.length) {
+        logger.log("stable_final_baseline_unchanged", {
+          checks: verification.checks.filter((check) => check.outcome === "CHECK_FAIL"),
+        });
+      }
       const failureSignature = (checks: CommandResult[]) =>
         checks
           .map((check) =>
@@ -686,9 +803,24 @@ export async function run(options: RunOptions) {
           attempt,
           failedChecks,
         });
+        // Execute the focused regression before repair. Never label broad-suite
+        // stdout as if it came from a focused command.
+        const repairChecks = await prepareRepairChecks(failedChecks, finalBaseline.checks,
+          async (focusedCommand) => {
+            const focused = await verify(integration!.path, [focusedCommand],
+              () => Math.min(options.config.commandTimeoutMs, gateway.budget.remainingMs()),
+              (result) => logger.log("stable_repair_diagnostic", result), undefined,
+              [{ command: focusedCommand, kind: "test", available: true,
+                source: "repo-check:focused-new-regression", cwd: ".", confidence: 1,
+                mutatesSource: false, requiresInstalledDependencies: true }]);
+            return focused.checks[0];
+          });
         const beforeRepair = JSON.stringify(
           await backend.changes(integration.path),
         );
+        const repairScope = new WriteScope(stableRepairContext.subtask.likelyWritePaths,
+          logger, stableRepairContext.subtask.id);
+        const repairCheckpoint = await AttemptCheckpoint.capture(integration.path, repairScope);
         const modelEventStart = logger.events.length;
         let repair;
         try {
@@ -712,10 +844,15 @@ export async function run(options: RunOptions) {
               stableHandoff: stableRepairContext.prepared.handoff,
               stableRepair: {
                 attempt,
-                failedChecks,
+                failedChecks: repairChecks,
                 changedFiles: (await backend.changes(integration.path)).map(
                   (change) => change.path,
                 ),
+                failedDiff: await failedPatchContext(),
+                implicatedSymbols: stableRepairContext.prepared.evidence.symbols,
+                baselineChecks: finalBaseline.checks,
+                regressionDiagnostics: regressionDiagnostics(finalBaseline, failedChecks),
+                failureContext: await failureContext(failedChecks),
               },
               extra: {
                 instruction:
@@ -725,6 +862,7 @@ export async function run(options: RunOptions) {
             },
           );
         } catch (repairError) {
+          await repairCheckpoint.restore(integration!.path, repairScope);
           const repairCalls = logger.events
             .slice(modelEventStart)
             .filter(
@@ -774,34 +912,25 @@ export async function run(options: RunOptions) {
             0,
           ),
         });
-        if (repair.verification.status === "FAILED")
+        if (repair.verification.status === "FAILED") {
+          await repairCheckpoint.restore(integration.path, repairScope);
           throw Error(`Stable final repair ${attempt} failed`);
-        await assertWriteResponsibility(
-          integration.path,
-          stableRepairContext.subtask,
-        );
+        }
+        try {
+          await assertWriteResponsibility(integration.path,
+            stableRepairContext.subtask);
+        } catch (error) {
+          await repairCheckpoint.restore(integration.path, repairScope);
+          throw error;
+        }
         if (
           JSON.stringify(await backend.changes(integration.path)) ===
           beforeRepair
-        )
+        ) {
+          await repairCheckpoint.restore(integration.path, repairScope);
           throw Error(`Stable final repair ${attempt} produced no changes`);
-        await backend.finalizeWorker(
-          integration,
-          `agent: stable final repair ${attempt}`,
-        );
-        const failedCommands = [...new Set(failedChecks.map((c) => c.command))];
-        const targeted = await verify(
-          integration.path,
-          failedCommands,
-          () => Math.min(options.config.commandTimeoutMs, budget.remainingMs()),
-          (c) =>
-            logger.log("stable_repair_verification", {
-              attempt,
-              ...c,
-            }),
-          undefined,
-          finalPlan,
-        );
+        }
+        const targeted = repair.verification;
         logger.log("stable_final_repair_check", {
           attempt,
           status: targeted.status,
@@ -812,6 +941,8 @@ export async function run(options: RunOptions) {
             check.outcome === "INFRA_FAILURE" ||
             check.outcome === "CHECK_UNAVAILABLE",
         );
+        if (unavailableRepair)
+          await repairCheckpoint.restore(integration.path, repairScope);
         if (unavailableRepair)
           throw Error(
             `Stable repair verification infrastructure unavailable: ${unavailableRepair.command}`,
@@ -827,6 +958,7 @@ export async function run(options: RunOptions) {
             attempt,
             failedChecks,
           });
+          await repairCheckpoint.restore(integration.path, repairScope);
           if (
             failedChecks.length >= previousFailureCount &&
             failureSignature(failedChecks) === previousSignature
@@ -834,11 +966,30 @@ export async function run(options: RunOptions) {
             break;
           continue;
         }
-        verification = await runFinalVerification();
+        const verifiedRepairState = JSON.stringify(await backend.changes(integration.path));
+        if (verifiedRepairState === "[]")
+          throw Error("Stable repair removed all task changes; baseline restoration is not verified completion");
+        const rawFinalVerification = await runFinalVerification().catch(async (error) => {
+          await repairCheckpoint.restore(integration!.path, repairScope);
+          throw error;
+        });
+        verification = verificationAgainstBaseline(finalBaseline, rawFinalVerification);
+        logger.log("stable_final_verification_relative_to_baseline", {
+          status: verification.status,
+          regressions: verificationRegressions(finalBaseline, rawFinalVerification),
+        });
         if (verification.status === "VERIFIED_SUCCESS") {
+          if (JSON.stringify(await backend.changes(integration.path)) !== verifiedRepairState)
+            throw Error("Verified repair state changed during final verification");
+          await backend.finalizeWorker(integration,
+            `agent: stable final repair ${attempt}`);
+          if (JSON.stringify(await backend.changes(integration.path)) !== verifiedRepairState)
+            throw Error("Verified repair state disappeared or changed during promotion");
+          acceptedRepairState = verifiedRepairState;
           logger.log("stable_final_repair_success", { attempt });
           break;
         }
+        await repairCheckpoint.restore(integration!.path, repairScope);
         failedChecks = verification.checks.filter(
           (check) => check.outcome === "CHECK_FAIL",
         );
@@ -934,31 +1085,45 @@ export async function run(options: RunOptions) {
     status = verification.status;
     const unavailable = verification.checks.find(
       (check) =>
-        check.outcome === "INFRA_FAILURE" ||
-        check.outcome === "CHECK_UNAVAILABLE",
+        (check.requirement ?? "required") === "required" &&
+        (check.outcome === "INFRA_FAILURE" ||
+          check.outcome === "CHECK_UNAVAILABLE"),
     );
     if (unavailable)
       throw Error(
         `Final verification infrastructure unavailable: ${unavailable.command}: ${unavailable.unavailable ?? "verification could not execute"}`,
       );
   } catch (e) {
+    if (status === "VERIFIED_SUCCESS") status = "FAILED";
     error = String(e);
     logger.log("run_error", { error });
   }
   if (backend && integration) {
     try {
+      applyResult = {
+        ...applyResult,
+        changes: await backend.persistCandidate(output, integration),
+      };
+      if (acceptedRepairState !== undefined &&
+          JSON.stringify(applyResult.changes) !== acceptedRepairState) {
+        await backend.apply(output, integration, false);
+        throw Error("Accepted verified repair state changed before apply");
+      }
       applyResult = await backend.apply(
         output,
         integration,
         status === "VERIFIED_SUCCESS",
       );
+      if (options.apply && status === "VERIFIED_SUCCESS" && applyResult.status !== "applied")
+        throw Error("Verified state was not applied to the target repository");
     } catch (e) {
+      status = "FAILED";
       error = `${error ? error + "; " : ""}Apply preparation failed: ${String(e)}`;
       applyResult = {
         requested: !!options.apply,
         status: "not_verified",
         conflicts: [],
-        changes: [],
+        changes: applyResult.changes,
       };
       logger.log("apply", { status: "not_verified", error: String(e) });
     }
@@ -978,6 +1143,10 @@ export async function run(options: RunOptions) {
   }
   poolRouter?.history.finalize(runId, status);
   const changedFiles = applyResult.changes.map((c) => c.path);
+  const candidateProduced = changedFiles.length > 0;
+  const candidatePatchPath = candidateProduced
+    ? join(output, "candidate.patch")
+    : null;
   const summary = {
     ...summarize(
       logger,
@@ -1000,6 +1169,9 @@ export async function run(options: RunOptions) {
         }
       : null,
     changeset: applyResult.changes,
+    candidateProduced,
+    candidatePatchPath,
+    candidateChangedFiles: changedFiles,
     applyRequested: applyResult.requested,
     applyResult: applyResult.status,
     applyConflicts: applyResult.conflicts,

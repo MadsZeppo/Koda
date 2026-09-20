@@ -104,6 +104,7 @@ test("durable smoothed history changes routing for matching task features", asyn
           modelServed: model.id,
           features,
           verification: model.id === "cheap" ? "FAILED" : "VERIFIED_SUCCESS",
+          failureAttribution: model.id === "cheap" ? "verified_patch_regression" : undefined,
           wallClockMs: 1000,
           inputTokens: 100,
           outputTokens: 20,
@@ -120,6 +121,33 @@ test("durable smoothed history changes routing for matching task features", asyn
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+test("legacy operational failures are ignored while attributed patch regressions lower coding quality", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "koda-history-attribution-"));
+  try {
+    const ledger = new History(dir);
+    const row = (reason: string, failureAttribution?: "verified_patch_regression") => ({
+      timestamp: new Date().toISOString(), runId: reason, subtaskId: "fix",
+      modelRequested: cheap.id, modelServed: cheap.id, features,
+      verification: "FAILED", wallClockMs: 1000, inputTokens: 100,
+      outputTokens: 20, costUsd: 0.001, escalated: true, reason,
+      failureAttribution,
+    });
+    for (let i = 0; i < 20; i++) ledger.record(row(`legacy no_mutation ${i}`));
+    ledger.recordOperation({
+      type: "operational_call", timestamp: new Date().toISOString(),
+      runId: "provider-429", subtaskId: "fix", stage: "implement",
+      taskBucket: "localized_bugfix", modelRequested: cheap.id,
+      modelServed: null, provider: "test-provider", wallClockMs: 10,
+      outcome: "error", costUsd: null,
+    });
+    assert.equal(ledger.read().length, 0);
+    assert.equal(ledger.readOperations().length, 1);
+    assert.equal(rank([cheap, frontier], ledger.read())?.model.id, cheap.id);
+    for (let i = 0; i < 20; i++) ledger.record(row(`focused_verification_failed ${i}`, "verified_patch_regression"));
+    assert.equal(ledger.read().length, 20);
+    assert.equal(rank([cheap, frontier], ledger.read())?.model.id, frontier.id);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 test("failed final integration does not turn a worker success into model-quality failure", async () => {
   const dir = await mkdtemp(join(tmpdir(), "koda-history-final-"));
@@ -340,6 +368,7 @@ test("verified history moves inspect-fix-test from cheap to strong without conta
     modelServed: "cheap",
     features: stable,
     verification: "FAILED",
+    failureAttribution: "verified_patch_regression" as const,
     wallClockMs: 1000,
     inputTokens: 100,
     outputTokens: 20,

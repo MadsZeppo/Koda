@@ -1,4 +1,4 @@
-import type { EcosystemProfile, CheckKind } from "./repo/ecosystem.js";
+import type { EcosystemProfile, CheckKind, VerificationRequirement } from "./repo/ecosystem.js";
 export type Status = "VERIFIED_SUCCESS" | "FAILED" | "NOT_FULLY_VERIFIED";
 export interface CommandResult {
   command: string;
@@ -10,12 +10,14 @@ export interface CommandResult {
   kind?: CheckKind;
   cwd?: string;
   source?: string;
+  requirement?: VerificationRequirement;
   unavailable?: string;
   exitCode: number;
   stdout: string;
   stderr: string;
   wallClockMs: number;
   timedOut: boolean;
+  infrastructureRecoveryAttempts?: number;
 }
 export interface VerificationResult {
   dimensions?: Partial<

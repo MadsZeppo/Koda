@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import type { Config } from "../config.js";
 import type { Logger } from "../telemetry/logger.js";
 import { Catalog } from "../openrouter/catalog.js";
-import { History } from "./history.js";
+import { History, attributableCodingFailure } from "./history.js";
 import { historyMatches, taskBucket, type Features } from "./features.js";
 import { type PoolModel, type Metadata } from "./pool.js";
 import { CapabilityRegistry, type ModelDiscoveryAdapter } from "./capabilityRegistry.js";
@@ -33,6 +33,7 @@ export function rankCandidates(
     const rows = history.filter(
       (r) =>
         r.modelRequested === model.id &&
+        (r.verification !== "FAILED" || features.taskKind === "planning" || attributableCodingFailure(r)) &&
         historyMatches(r.features, features) &&
         !/provider|infra|timeout|rate.limit|transport|\b429\b|HTTP 5\d\d|unavailable|unknown pricing/i.test(
           r.verification === "FAILED" ? r.reason ?? "" : "",
@@ -216,6 +217,8 @@ export class PoolRouter {
         features, fingerprint, verification, wallClockMs: call.wallClockMs,
         inputTokens: call.promptTokens, outputTokens: call.completionTokens,
         costUsd: call.costUsd, escalated, reason,
+        failureAttribution: verification === "FAILED" && reason === "focused_verification_failed"
+          ? "verified_patch_regression" as const : undefined,
       });
     }
   }
@@ -371,6 +374,8 @@ export class PoolRouter {
         : calls.reduce((n, c) => n + c.costUsd, 0),
       escalated,
       reason,
+      failureAttribution: verification === "FAILED" && reason === "focused_verification_failed"
+        ? "verified_patch_regression" as const : undefined,
     };
     this.history.record(record);
     this.logger.log("model_attempt", record);

@@ -18,6 +18,8 @@ import { git } from "../src/repo/commands.js";
 import { config } from "../src/config.js";
 import { profileRepo } from "../src/repo/profiler.js";
 import { compileContext } from "../src/context/compiler.js";
+import { justifiedSiblingWrite } from "../src/repo/scopeExpansion.js";
+import type { Subtask } from "../src/planner/schemas.js";
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "koda-scope-")),
     repo = join(root, "repo");
@@ -74,6 +76,27 @@ test("write_file enforces immutable ownership before modification and permits re
   } finally {
     await rm(f.root, { recursive: true, force: true });
   }
+});
+test("scope expansion requires a task-named imported sibling and rejects unrelated files", async () => {
+  const f = await fixture();
+  try {
+    await writeFile(join(f.repo, "src/a.ts"), 'import { fix } from "./b.js";\nexport const run = fix;\n');
+    await writeFile(join(f.repo, "src/b.ts"), "export const fix = () => 1;\n");
+    await writeFile(join(f.repo, "src/unrelated.ts"), "export const unrelated = 1;\n");
+    const profile = await profileRepo(f.repo);
+    profile.files.push("src/unrelated.ts");
+    const subtask: Subtask = {
+      id: "a", title: "fix", objective: "Fix src/b.ts used by src/a.ts",
+      dependsOn: [], likelyReadPaths: [], likelyWritePaths: ["src/a.ts"],
+      integrationContract: "", verificationCommands: [], estimatedDifficulty: "low", parallelSafe: false,
+    };
+    assert.equal(await justifiedSiblingWrite(f.repo, "src/b.ts", subtask, profile, subtask.objective), true);
+    assert.equal(await justifiedSiblingWrite(f.repo, "src/unrelated.ts", subtask, profile, subtask.objective), false);
+    assert.equal(await justifiedSiblingWrite(f.repo, "../src/b.ts", subtask, profile, subtask.objective), false);
+    assert.equal(await justifiedSiblingWrite(f.repo, "src/b.ts", subtask, profile, "Fix src/a.ts"), true);
+    subtask.objective = "Fix src/a.ts";
+    assert.equal(await justifiedSiblingWrite(f.repo, "src/b.ts", subtask, profile, subtask.objective), false);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 test("write_file rejects traversal, symlink and hardlink aliases of sibling files", async () => {
   const f = await fixture();

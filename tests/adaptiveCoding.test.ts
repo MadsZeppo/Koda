@@ -286,7 +286,7 @@ for (const rescueToFrontier of [false, true])
         const score = body.plugins?.[0]?.min_coding_score;
         const content =
           score === 0
-            ? "export function add(a,b){return a-b}"
+            ? "export function add(a,b){return a-b-1}"
             : rescueToFrontier && score === 0.33
               ? "export function add(a,b){return a*b}"
               : rescueToFrontier && score === 0.66
@@ -417,7 +417,7 @@ for (const cheapFails of [false, true])
           role: "assistant", content: null, tool_calls: [{ id: `write-${requests.length}`,
             type: "function", function: { name: "write_file", arguments: JSON.stringify({
               path: "src/calculator.js",
-              content: bad ? "export function add(a,b){return a-b}" : "export function add(a,b){return a+b}",
+              content: bad ? "export function add(a,b){return a-b-1}" : "export function add(a,b){return a+b}",
             }) } }],
         } }], usage: { prompt_tokens: 20, completion_tokens: 10, cost: 0.0001 } }));
     });
@@ -455,6 +455,8 @@ for (const cheapFails of [false, true])
       const attempts = events.filter((event) => event.type === "model_attempt");
       assert.deepEqual(attempts.map((event) => event.verification),
         cheapFails ? ["FAILED", "VERIFIED_SUCCESS"] : ["VERIFIED_SUCCESS"]);
+      if (cheapFails) assert.equal(events.find((event) =>
+        event.type === "coding_route_escalation")?.reason, "focused_verification_failed");
       assert.equal(attempts.some((event) => event.reason === "worker ended"), false);
       assert.equal(events.find((event) => event.type === "coding_route_decision")?.candidate, "cheap");
       if (cheapFails) assert.equal(events.find((event) =>

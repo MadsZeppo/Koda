@@ -118,6 +118,94 @@ test("exact Stable CLI task mutates from a bounded RepairPacket before targeted 
   }
 });
 
+for (const failure of ["timeout", "429", "no-scope"] as const) {
+test(`Stable scope ${failure} falls back to concrete evidence and reaches verified coding`, async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-stable-scope-fallback-"));
+  const repo = join(root, "repo"), output = join(root, "output");
+  const requests: any[] = [];
+  const server = createServer(async (request, response) => {
+    response.setHeader("content-type", "application/json");
+    if (request.url?.endsWith("/models")) {
+      response.end(JSON.stringify({ data: ["coder", "fallback"].map((id) => ({ id, context_length: 100000,
+        pricing: { prompt: "0.0000001", completion: "0.0000002" },
+        supported_parameters: ["tools", "tool_choice", "structured_outputs"] })) }));
+      return;
+    }
+    let raw = ""; for await (const chunk of request) raw += chunk;
+    const body = JSON.parse(raw); requests.push(body);
+    const names = body.tools?.map((tool: any) => tool.function.name) ?? [];
+    const tool = (id: string, name: string, args: object) => ({ id, type: "function",
+      function: { name, arguments: JSON.stringify(args) } });
+    if (names.includes("search_code")) {
+      response.end(JSON.stringify({ id: "inspect", model: body.model, choices: [{ index: 0,
+        message: { role: "assistant", content: null, tool_calls: [
+          tool("search", "search_code", { query: "scope_target" }),
+        ] } }], usage: { prompt_tokens: 20, completion_tokens: 20, cost: 0 } }));
+      return;
+    }
+    if (names.includes("lock_write_scope")) {
+      if (failure === "429") {
+        response.statusCode = 429;
+        response.end(JSON.stringify({ error: { message: "Provider returned error" } }));
+        return;
+      }
+      if (failure === "no-scope") {
+        response.end(JSON.stringify({ id: "no-scope", model: body.model, choices: [{ index: 0,
+          message: { role: "assistant", content: null, tool_calls: [
+            tool("none", "report_no_scope", { reason: "No safe scope could be identified by this model." }),
+          ] } }], usage: { prompt_tokens: 20, completion_tokens: 20, cost: 0 } }));
+        return;
+      }
+      // Simulate a provider that returns after Koda's hard scope deadline.
+      await new Promise((resolve) => setTimeout(resolve, 3500));
+      if (!response.destroyed) response.end(JSON.stringify({ id: "late", model: body.model,
+        choices: [{ index: 0, message: { role: "assistant", content: "late" } }],
+        usage: { prompt_tokens: 20, completion_tokens: 20, cost: 0 } }));
+      return;
+    }
+    response.end(JSON.stringify({ id: "code", model: body.model, choices: [{ index: 0,
+      message: { role: "assistant", content: null, tool_calls: [tool("fix", "write_file", {
+        path: "src/a.js", content: "// scope_target\nexport function a(){ return true; }\n",
+      })] } }], usage: { prompt_tokens: 20, completion_tokens: 20, cost: 0 } }));
+  });
+  try {
+    await mkdir(join(repo, "src"), { recursive: true });
+    await mkdir(join(repo, "tests"));
+    await writeFile(join(repo, "src/a.js"), "// scope_target\nexport function a(){ return false; }\n");
+    await writeFile(join(repo, "src/b.js"), "// scope_target\nexport const b = 1;\n");
+    await writeFile(join(repo, "src/c.js"), "// scope_target\nexport const c = 1;\n");
+    await writeFile(join(repo, "tests/a.test.js"), "import test from 'node:test'; import assert from 'node:assert/strict'; import {a} from '../src/a.js'; test('a',()=>assert.equal(a(),true));\n");
+    await writeFile(join(repo, "package.json"), JSON.stringify({ type: "module", scripts: { test: "node --test" } }));
+    await git(repo, "init", "-q"); await git(repo, "config", "user.name", "Scope Fallback");
+    await git(repo, "config", "user.email", "scope@test.local"); await git(repo, "add", ".");
+    await git(repo, "commit", "-qm", "baseline");
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const task = "Inspect src/a.js, src/b.js, and src/c.js for scope_target, fix the localized behavior, and add a focused regression test.";
+    const result = await run({ repo, task, output, quiet: true, config: await config(undefined, {
+      modelPool: { provider: "openrouter", models: ["coder", "fallback"].map((id) => ({ id, tier: "fast" as const,
+        qualityPrior: 0.95, latencyPriorMs: 100,
+        strengths: ["coding", "tool_use", "structured_output"] })) },
+      baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`,
+      commandTimeoutMs: 3000, routing: { stateDirectory: join(root, "routing") }, budgetUsd: 0.1,
+    }) });
+    assert.equal(result.execution_strategy, "stable");
+    assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
+    const events = (await readFile(join(output, "events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.ok(events.some((event) => event.type === "stable_scope_finalization_fallback"));
+    assert.equal(requests.filter((request) => request.tools?.some((tool: any) =>
+      tool.function.name === "lock_write_scope") && !request.tools?.some((tool: any) =>
+      tool.function.name === "search_code")).length, 1, "no second finalizer model request");
+    assert.ok(events.some((event) => event.type === "coding_worker_start"));
+    assert.ok(events.some((event) => event.type === "write_success" && event.path === "src/a.js"));
+    assert.ok(events.some((event) => event.type === "final_verification" && event.outcome === "CHECK_PASS"));
+  } finally {
+    if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+}
+
 test("RepairPacket includes every locked path and bounds a large implementation file", async () => {
   const root = await mkdtemp(join(tmpdir(), "koda-repair-packet-"));
   try {
@@ -219,10 +307,11 @@ test("Stable retries a mechanical patch error with the same model, then requires
         assert.ok(offered.some((item) => item.function.name === "request_context"),
           JSON.stringify(offered.map((item) => item.function.name)));
         return { role: "assistant", content: null, tool_calls: [
-          tool("context", "request_context", { path: "src/b.ts" }),
+          tool("context", "request_context", { path: "src/a.ts", symbol: "export const a" }),
         ] };
       }
       assert.equal(calls.length, 3);
+      assert.ok(!JSON.stringify(messages).includes("request_context is limited"), "locked source context must be authorized");
       assert.ok(JSON.stringify(messages).includes("next response MUST call apply_patch"));
       assert.ok(!offered.some((item) => item.function.name === "request_context"));
       return { role: "assistant", content: null, tool_calls: [
@@ -322,7 +411,7 @@ for (const firstValue of [2, 9]) test(`Stable verifies a partial allowed scope i
   }
 });
 
-test("Stable fallback after a failed focused check sees the current diff and source", async () => {
+test("Stable fallback after a failed focused check sees clean source and rejected diff", async () => {
   const root = await mkdtemp(join(tmpdir(), "koda-stable-diff-fallback-"));
   const logRoot = await mkdtemp(join(tmpdir(), "koda-stable-diff-log-"));
   try {
@@ -353,12 +442,13 @@ test("Stable fallback after a failed focused check sees the current diff and sou
       served.push(model);
       if (served.length === 2) throw Error("Tool protocol: transient provider failure");
       if (model === "B") {
-        assert.ok(JSON.stringify(messages).includes("module.exports = 9"), "fallback gets current source");
+        assert.equal(await readFile(join(root, "src/a.cjs"), "utf8"), "module.exports = 1;\n");
+        assert.ok(JSON.stringify(messages).includes("module.exports = 9"), "fallback gets rejected diff");
         assert.ok(JSON.stringify(messages).includes("currentLockedFiles"));
       }
       return { role: "assistant", content: null, tool_calls: [{ id: `patch-${served.length}`, type: "function",
         function: { name: "apply_patch", arguments: JSON.stringify({ edits: [{
-          path: "src/a.cjs", oldText: model === "A" ? "= 1" : "= 9", newText: model === "A" ? "= 9" : "= 2",
+          path: "src/a.cjs", oldText: "= 1", newText: model === "A" ? "= 9" : "= 2",
         }] }) } }] };
     };
     const profile = await profileRepo(root);
@@ -502,4 +592,28 @@ test("Stable no-mutation budget survives provider fallback and protocol failures
     await rm(root, { recursive: true, force: true });
     await rm(logRoot, { recursive: true, force: true });
   }
+});
+
+test("Stable large source context selects task symbol beyond imports and allows one bounded locked excerpt", async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-context-region-"));
+  try {
+    const content = "from helpers import normalize_value\n" + "# unrelated padding\n".repeat(400) +
+      "def normalize_value(data):\n    return data\n";
+    await writeFile(join(root, "logic.py"), content);
+    await writeFile(join(root, "unrelated.py"), "secret = 1\n");
+    const profile = await profileRepo(root);
+    const { packet } = await buildRepairPacket(root, "Fix normalize_value for binary data", ["logic.py"], profile, [], 16000);
+    assert.match(packet.files[0]!.content, /def normalize_value/);
+    assert.ok(packet.files[0]!.startLine > 350);
+    const logger = new Logger(join(root, "log"), "context", true);
+    const tools = new AgentTools(root, false, 1000, logger, "stable", 4000,
+      new WriteScope(["logic.py"], logger, "stable"), ["logic.py"]);
+    const result = await tools.execute("request_context", { path: "logic.py", symbol: "def normalize_value" });
+    assert.match(String(result), /return data/);
+    assert.ok(Buffer.byteLength(String(result)) <= 3200);
+    await assert.rejects(tools.execute("request_context", { path: "logic.py" }), /limited to one/);
+    const denied = new AgentTools(root, false, 1000, logger, "stable", 4000, undefined, ["logic.py"]);
+    await assert.rejects(denied.execute("request_context", { path: "unrelated.py" }), /trusted/);
+    assert.equal(await readFile(join(root, "logic.py"), "utf8"), content);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });

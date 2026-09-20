@@ -62,6 +62,8 @@ export async function discover(
   const inspectionTools = toolDefinitions.filter((tool) =>
     tool.type === "function" && ["read_file", "search_code", "list_files", "run_command", "git_diff", "git_status"].includes(tool.function.name));
   const seenActions = new Set<string>();
+  const observedFiles = new Set<string>();
+  const observedEvidence: string[] = [];
   const selected = gateway.modelRouter
     ? await gateway.modelRouter.select(
         extractFeatures(
@@ -106,23 +108,34 @@ export async function discover(
     message: ChatCompletionMessageParam & { content?: unknown },
     finalization = false,
   ) => {
-    if (!tools.progressEvidence.length && !context.files.some((file) => file.snippet.trim()))
-      throw Error(
-        finalization
-          ? "Discovery iteration budget exhausted: no repository inspection evidence"
-          : "Discovery completed without repository inspection evidence",
-      );
+    const fallback = async (reason: string): Promise<EvidencePacket> => {
+      if ((await currentDiff(path)) !== before)
+        throw Error("Read-only discovery mutated the workspace");
+      const relevantFiles = [...new Set([
+        ...observedFiles,
+        ...tools.progressEvidence.filter((item) => item.startsWith("read_file:"))
+          .map((item) => item.slice("read_file:".length).replace(/:\d+:\d+$/, "")),
+      ])].filter((file) => profile.files.includes(file));
+      const evidence = evidenceSchema.parse({
+        relevantFiles, symbols: [], reproduction: "", failingTests: [],
+        likelyRootCause: "", dependencies: [], uncertainty: "high",
+        suggestedApproach: "Inspect the relevant source and verify the requested change before editing.",
+        evidence: observedEvidence.slice(0, 8),
+      });
+      gateway.logger.log("discovery_fallback", {
+        subtaskId: subtask.id, reason, relevantFiles,
+      });
+      return evidence;
+    };
+    if (!tools.progressEvidence.length && !observedFiles.size)
+      return fallback("no repository inspection evidence");
     let evidence: EvidencePacket;
     try {
       evidence = evidenceSchema.parse(
         responseJson(typeof message.content === "string" ? message.content : ""),
       );
     } catch (error) {
-      if (finalization)
-        throw Error(
-          `Discovery iteration budget exhausted: finalization produced no usable result (${String(error)})`,
-        );
-      throw error;
+      return fallback(`unusable ${finalization ? "finalization" : "response"}: ${String(error)}`);
     }
     if ((await currentDiff(path)) !== before)
       throw Error("Read-only discovery mutated the workspace");
@@ -159,6 +172,17 @@ export async function discover(
             else {
               seenActions.add(key);
               content = await tools.execute(toolCall.function.name, arguments_);
+              if (toolCall.function.name === "read_file" && profile.files.includes(arguments_.path))
+                observedFiles.add(arguments_.path);
+              if (["search_code", "run_command"].includes(toolCall.function.name) && content.trim()) {
+                const known = new Set(profile.files);
+                for (const line of content.split("\n").slice(0, 100)) {
+                  const file = line.match(/^([^:\s]+)(?::\d+:|$)/)?.[1];
+                  if (file && known.has(file)) observedFiles.add(file);
+                }
+              }
+              if (["read_file", "search_code", "run_command"].includes(toolCall.function.name) && content.trim())
+                observedEvidence.push(`${toolCall.function.name}: ${content.slice(0, 600)}`);
             }
           } catch (error) {
             content = `Tool error: ${String(error)}`;

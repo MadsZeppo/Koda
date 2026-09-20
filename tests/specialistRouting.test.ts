@@ -54,6 +54,8 @@ const observed = (model: string, fp: TaskFingerprint, features: ReturnType<typeo
   timestamp: "2026-01-01", runId: "r", subtaskId: "ui", modelRequested: model,
   modelServed: model, features, fingerprint: fp, verification, wallClockMs: 1000,
   inputTokens: 100, outputTokens: 100, costUsd: 0.01, escalated: verification !== "VERIFIED_SUCCESS", reason,
+  failureAttribution: verification === "FAILED" && !/provider|HTTP 429/i.test(reason ?? "")
+    ? "verified_patch_regression" : undefined,
 });
 
 test("universal selector considers every discovered model and chooses the cheapest qualified specialty", () => {
@@ -435,7 +437,7 @@ test("parallel PLANNED coding subtasks choose independently and report reference
     const hard = scenario("Redesign React dashboard and migrate state architecture across modules and components",
       ["src/Dashboard.tsx", "src/state.ts", "api/state.ts"], [], "planned");
     for (let i = 0; i < 12; i++)
-      pool.history.record(observed(cheap.model.id, hard.fingerprint, hard.features, "FAILED", "focused test assertion"));
+      pool.history.record({ ...observed(cheap.model.id, hard.fingerprint, hard.features, "FAILED", "focused test assertion"), failureAttribution: "verified_patch_regression" });
     const [easyChoice, hardChoice] = await Promise.all([
       pool.selectSpecialist(easy.fingerprint, easy.features, "easy", 10),
       pool.selectSpecialist(hard.fingerprint, hard.features, "hard", 10),

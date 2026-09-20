@@ -4,11 +4,13 @@ import { mkdtemp, mkdir, writeFile, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
+import { readFileSync } from "node:fs";
 import { config } from "../src/config.js";
 import { git } from "../src/repo/commands.js";
 import { profileRepo } from "../src/repo/profiler.js";
 import {
   planningPolicy,
+  reconcilePlannedPaths,
   validatePlanningCandidate,
 } from "../src/planner/policy.js";
 import { compileTask } from "../src/planner/taskCompiler.js";
@@ -24,6 +26,8 @@ import { rankCandidates } from "../src/router/modelRouter.js";
 import type { Attempt } from "../src/router/history.js";
 import { planSchema } from "../src/planner/schemas.js";
 import { discover } from "../src/agent/discovery.js";
+import { AgentTools } from "../src/agent/tools.js";
+import { implement } from "../src/agent/loop.js";
 
 const task =
   "Fix src/a.ts, src/b.ts and src/c.ts so all tests pass. These are independent bugs.";
@@ -92,6 +96,273 @@ async function fixture() {
     },
   };
 }
+
+test("model-planned missing paths reconcile to unique real files and optional test edits disappear", async () => {
+  const f = await fixture();
+  try {
+    const profile = await profileRepo(f.repo);
+    const candidate = validatePlanningCandidate({ taskSummary: "repair", acceptanceCriteria: ["tests pass"],
+      subtasks: [
+        { id: "fix", title: "Fix imagined/a.ts", objective: "Fix imagined/a.ts",
+          dependsOn: [], likelyReadPaths: ["imagined/a.ts", "imagined/a.test.ts"],
+          likelyWritePaths: ["imagined/a.ts"], integrationContract: "Preserve exports",
+          verificationCommands: [], estimatedDifficulty: "normal", parallelSafe: false },
+        { id: "test", title: "Add a test", objective: "Add a test for the fix",
+          dependsOn: ["fix"], likelyReadPaths: ["test/nonexistent.test.ts"],
+          likelyWritePaths: ["test/nonexistent.test.ts"], integrationContract: "Check behavior",
+          verificationCommands: [], estimatedDifficulty: "low", parallelSafe: false },
+      ] });
+    const reconciled = await reconcilePlannedPaths(candidate, "Fix the bug in src/a.ts so tests pass", profile);
+    assert.equal(reconciled.subtasks.length, 1);
+    assert.deepEqual(reconciled.subtasks[0]!.likelyWritePaths, ["src/a.ts"]);
+    assert.ok(reconciled.subtasks[0]!.likelyReadPaths.includes("test/a.test.ts"));
+    assert.ok(!reconciled.subtasks[0]!.objective.includes("imagined/a.ts"));
+  } finally { await f.cleanup(); }
+});
+
+test("explicit test creation keeps its scoped new path; unresolved source ownership fails boundedly", async () => {
+  const f = await fixture();
+  try {
+    const profile = await profileRepo(f.repo);
+    const planned = (path: string) => validatePlanningCandidate({ taskSummary: "task",
+      acceptanceCriteria: ["repo checks pass"], subtasks: [{ id: "work", title: "Work", objective: "Work",
+        dependsOn: [], likelyReadPaths: [], likelyWritePaths: [path],
+        integrationContract: "Preserve behavior", verificationCommands: [],
+        estimatedDifficulty: "normal", parallelSafe: false }] });
+    const tests = await reconcilePlannedPaths(planned("test/new.test.ts"),
+      "Add a regression test for the source behavior", profile);
+    assert.deepEqual(tests.subtasks[0]!.likelyWritePaths, ["test/new.test.ts"]);
+    await assert.rejects(reconcilePlannedPaths(planned("src/nonexistent.ts"),
+      "Fix the source bug", profile), /does not exist/);
+  } finally { await f.cleanup(); }
+});
+
+test("missing read tool navigates to actual source once and bounds repeated misses", async () => {
+  const f = await fixture();
+  try {
+    const logger = new Logger(join(f.root, "navigation-log"), "navigation", true);
+    const tools = new AgentTools(f.repo, false, 1000, logger, "navigation");
+    const result = await tools.execute("read_file", { path: "imagined/a.ts" });
+    assert.match(String(result), /src\/a\.ts/);
+    assert.match(String(result), /export function a/);
+    assert.equal(logger.events.filter((event) => event.type === "missing_path_navigation").length, 1);
+    await tools.execute("read_file", { path: "imagined/a.ts" });
+    assert.equal(tools.missingReadAttempts.get("imagined/a.ts"), 2);
+    const before = tools.progressEvidence.length;
+    const unknown = JSON.parse(String(await tools.execute("read_file", {
+      path: "imagined/definitely_absent_zzz.ts",
+    })));
+    assert.equal(unknown.source, undefined);
+    assert.equal(tools.progressEvidence.length, before,
+      "an unresolved path must not count as inspection progress");
+    assert.equal(await git(f.repo, "status", "--porcelain"), "");
+  } finally { await f.cleanup(); }
+});
+
+for (const outcome of ["passing", "failing", "infrastructure", "unrecoverable"] as const)
+test(`PLANNED worker recovers verification after write: ${outcome}`, async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-post-write-"));
+  const repo = join(root, "repo");
+  await mkdir(repo);
+  await writeFile(join(repo, "module.py"), "# implementation pending\n");
+  await git(repo, "init", "-q");
+  await git(repo, "config", "user.email", "test@koda.local");
+  await git(repo, "config", "user.name", "Koda Test");
+  await git(repo, "add", ".");
+  await git(repo, "commit", "-qm", "baseline");
+  const mockServer = await mock(() => ({ role: "assistant", content: null,
+    tool_calls: [{ id: "write", type: "function", function: { name: "write_file",
+      arguments: JSON.stringify({ path: "module.py", content: outcome === "passing"
+        ? "def add(a, b):\n    return a + b\n"
+        : outcome === "infrastructure"
+          ? "def add(a, b):\n    raise PermissionError('/outside/environment/pyvenv.cfg: Operation not permitted')\n"
+          : "def add(a, b):\n    return a - b\n" }) } }] }));
+  try {
+    const task = outcome === "unrecoverable" ? "Repair module.py" : "Repair module.py: add(2, 3) == 5";
+    const subtask = { id: "planned-fix", title: task, objective: task,
+      dependsOn: [], likelyReadPaths: ["module.py"], likelyWritePaths: ["module.py"],
+      integrationContract: "Preserve behavior", verificationCommands: [],
+      estimatedDifficulty: "normal" as const, parallelSafe: false };
+    const logger = new Logger(join(root, "report"), "planned-recovery", true);
+    const gateway = new Gateway(await config(undefined, { modelPool: pool,
+      baseUrl: mockServer.url, maxIterations: 3 }), logger,
+      new Budget(0.1, 200000, 60000));
+    const execute = () => implement(gateway, repo, task, subtask,
+      { acceptanceCriteria: [task], subtasks: [subtask] }, awaitProfile, {});
+    const awaitProfile = await profileRepo(repo);
+    if (outcome === "failing" || outcome === "infrastructure") {
+      await assert.rejects(execute());
+      assert.ok(!logger.events.some((event) => event.type === "verified_completion"));
+      assert.ok(logger.events.some((event) => event.type === "verification" &&
+        event.outcome === (outcome === "failing" ? "CHECK_FAIL" : "INFRA_FAILURE")));
+      if (outcome === "infrastructure") {
+        assert.equal(logger.events.filter((event) => event.type === "escalation").length, 0);
+        assert.equal(logger.events.find((event) => event.type === "verification")?.infrastructureRecoveryAttempts, 1);
+      }
+    } else {
+      const result = await execute();
+      assert.equal(result.verification.status,
+        outcome === "passing" ? "VERIFIED_SUCCESS" : "NOT_FULLY_VERIFIED");
+    }
+    assert.equal(logger.events.filter((event) => event.type === "verification_recovery_attempt").length, 1);
+    assert.ok(logger.events.some((event) => event.type ===
+      (outcome === "unrecoverable" ? "verification_recovery_exhausted" : "verification_recovery")));
+    assert.equal(await git(repo, "status", "--porcelain"),
+      outcome === "failing" ? "" : " M module.py");
+  } finally { await mockServer.close(); await rm(root, { recursive: true, force: true }); }
+});
+for (const mutate of [false, true]) test(`a pre-existing failing check does not escalate after ${mutate ? "an unrelated edit" : "a zero-diff final response"}`, async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-baseline-fail-"));
+  const repo = join(root, "repo");
+  await mkdir(join(repo, "tests"), { recursive: true });
+  await writeFile(join(repo, "package.json"), JSON.stringify({ type: "module", scripts: { test: "node --test tests/*.test.mjs" } }));
+  await writeFile(join(repo, "src.mjs"), "export const value = 0;\n");
+  await writeFile(join(repo, "tests/preexisting.test.mjs"), "import {test} from 'node:test'; import assert from 'node:assert/strict'; test('preexisting',()=>assert.equal(0,1));\n");
+  await git(repo, "init", "-q");
+  await git(repo, "config", "user.email", "test@koda.local");
+  await git(repo, "config", "user.name", "Koda Test");
+  await git(repo, "add", ".");
+  await git(repo, "commit", "-qm", "baseline");
+  const mockServer = await mock(() => mutate ? ({ role: "assistant", content: null,
+    tool_calls: [{ id: "write", type: "function", function: { name: "write_file",
+      arguments: JSON.stringify({ path: "src.mjs", content: "export const value = 1;\n" }) } }] })
+    : ({ role: "assistant", content: null, tool_calls: [{ id: "verify", type: "function",
+      function: { name: "run_command", arguments: JSON.stringify({ command: "npm run test" }) } }] }));
+  try {
+    const objective = "Fix src.mjs while preserving existing test behavior";
+    const subtask = { id: "fix", title: objective, objective, dependsOn: [],
+      likelyReadPaths: ["src.mjs"], likelyWritePaths: ["src.mjs"], integrationContract: "Run tests",
+      verificationCommands: ["npm run test"], estimatedDifficulty: "normal" as const, parallelSafe: false };
+    const logger = new Logger(join(root, "report"), "baseline-fail", true);
+    const gateway = new Gateway(await config(undefined, { modelPool: pool, baseUrl: mockServer.url, maxIterations: 3 }),
+      logger, new Budget(0.1, 200000, 60000));
+    const result = await implement(gateway, repo, objective, subtask,
+      { acceptanceCriteria: [objective], subtasks: [subtask] }, await profileRepo(repo), {}).catch((error) => {
+        throw Error(`${String(error)}; checks=${JSON.stringify(logger.events.filter((event) => event.type === "verification"))}`);
+      });
+    assert.equal(result.verification.status, mutate ? "VERIFIED_SUCCESS" : "NOT_FULLY_VERIFIED");
+    assert.ok(logger.events.some((event) => event.type === "verification_baseline_unchanged"));
+    assert.equal(logger.events.filter((event) => event.type === "escalation").length, 0);
+    assert.equal(await readFile(join(repo, "src.mjs"), "utf8"),
+      mutate ? "export const value = 1;\n" : "export const value = 0;\n");
+    if (!mutate) assert.equal(logger.events.filter((event) => event.type === "model_call").length, 1);
+  } finally { await mockServer.close(); await rm(root, { recursive: true, force: true }); }
+});
+test("coding worker expands one evidenced sibling scope and verifies its edit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-sibling-fix-"));
+  const repo = join(root, "repo");
+  await mkdir(join(repo, "src"), { recursive: true });
+  await mkdir(join(repo, "tests"));
+  await writeFile(join(repo, "package.json"), JSON.stringify({ type: "module", scripts: { test: "node --test tests/*.test.mjs" } }));
+  await writeFile(join(repo, "src/a.mjs"), 'import {value} from "./b.mjs"; export const result = value;\n');
+  await writeFile(join(repo, "src/b.mjs"), "export const value = 0;\n");
+  await writeFile(join(repo, "tests/feature.test.mjs"), "import {test} from 'node:test'; import assert from 'node:assert/strict'; import {result} from '../src/a.mjs'; test('feature',()=>assert.equal(result,1));\n");
+  await git(repo, "init", "-q");
+  await git(repo, "config", "user.email", "test@koda.local");
+  await git(repo, "config", "user.name", "Koda Test");
+  await git(repo, "add", ".");
+  await git(repo, "commit", "-qm", "baseline");
+  const mockServer = await mock(() => ({ role: "assistant", content: null,
+    tool_calls: [{ id: "write", type: "function", function: { name: "write_file",
+      arguments: JSON.stringify({ path: "src/b.mjs", content: "export const value = 1;\n" }) } }] }));
+  try {
+    const objective = "Fix src/b.mjs used by src/a.mjs so the feature test passes";
+    const subtask = { id: "fix", title: objective, objective, dependsOn: [],
+      likelyReadPaths: ["src/a.mjs", "src/b.mjs"], likelyWritePaths: ["src/a.mjs"],
+      integrationContract: "Feature test passes", verificationCommands: ["npm run test"],
+      estimatedDifficulty: "normal" as const, parallelSafe: false };
+    const logger = new Logger(join(root, "report"), "sibling-fix", true);
+    const gateway = new Gateway(await config(undefined, { modelPool: pool, baseUrl: mockServer.url, maxIterations: 4 }),
+      logger, new Budget(0.1, 200000, 60000));
+    const result = await implement(gateway, repo, objective, subtask,
+      { acceptanceCriteria: [objective], subtasks: [subtask] }, await profileRepo(repo), {});
+    assert.equal(result.verification.status, "VERIFIED_SUCCESS");
+    assert.deepEqual(subtask.likelyWritePaths, ["src/a.mjs", "src/b.mjs"]);
+    assert.equal(logger.events.filter((event) => event.type === "write_scope_expanded").length, 1);
+    assert.equal(await readFile(join(repo, "src/b.mjs"), "utf8"), "export const value = 1;\n");
+  } finally { await mockServer.close(); await rm(root, { recursive: true, force: true }); }
+});
+test("worker attempts are transactional: regressed patch rolls back before stronger model succeeds", async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-transactional-"));
+  const repo = join(root, "repo");
+  await mkdir(join(repo, "src"), { recursive: true });
+  await mkdir(join(repo, "tests"));
+  await writeFile(join(repo, "package.json"), JSON.stringify({ type: "module", scripts: { test: "node --test tests/*.test.mjs" } }));
+  await writeFile(join(repo, "src/value.mjs"), "export const value = 0;\n");
+  await writeFile(join(repo, "tests/value.test.mjs"), `import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {value} from '../src/value.mjs';
+test('first',()=>assert.equal(value,1));
+test('second',()=>assert.equal(value,1));
+test('no negative regression',()=>assert.notEqual(value,-1));
+`);
+  await git(repo, "init", "-q");
+  await git(repo, "config", "user.email", "test@koda.local");
+  await git(repo, "config", "user.name", "Koda Test");
+  await git(repo, "add", ".");
+  await git(repo, "commit", "-qm", "baseline");
+  const served: string[] = [];
+  let cleanBeforeStrong = false;
+  let handoffHadFailure = false;
+  const mockServer = await mock((body) => {
+    served.push(body.model);
+    if (body.model === "strong") {
+      cleanBeforeStrong = readFileSync(join(repo, "src/value.mjs"), "utf8") === "export const value = 0;\n";
+      handoffHadFailure = JSON.stringify(body.messages).includes("REJECTED ATTEMPT DIFF") &&
+        JSON.stringify(body.messages).includes("value = -1");
+    }
+    return { role: "assistant", content: null, tool_calls: [{ id: `write-${served.length}`,
+      type: "function", function: { name: "write_file", arguments: JSON.stringify({
+        path: "src/value.mjs", content: body.model === "strong"
+          ? "export const value = 1;\n" : "export const value = -1;\n",
+      }) } }] };
+  });
+  try {
+    const objective = "Fix src/value.mjs so all tests pass";
+    const subtask = { id: "fix", title: objective, objective, dependsOn: [],
+      likelyReadPaths: ["src/value.mjs", "tests/value.test.mjs"],
+      likelyWritePaths: ["src/value.mjs"], integrationContract: "Tests pass",
+      verificationCommands: ["npm run test"], estimatedDifficulty: "normal" as const, parallelSafe: false };
+    const logger = new Logger(join(root, "report"), "transactional", true);
+    const gateway = new Gateway(await config(undefined, { modelPool: pool,
+      baseUrl: mockServer.url, adaptiveCoding: false, specialistRouting: false,
+      maxIterations: 6, routing: { stateDirectory: join(root, "history") } }),
+      logger, new Budget(0.1, 200000, 60000));
+    const result = await implement(gateway, repo, objective, subtask,
+      { acceptanceCriteria: [objective], subtasks: [subtask] }, await profileRepo(repo), {}).catch((error) => {
+        throw Error(`${String(error)}; attempts=${JSON.stringify(logger.events.filter((event) =>
+          ["attempt_evaluation", "attempt_rollback", "coding_route_escalation", "verification"].includes(event.type)))}`);
+      });
+    assert.equal(result.verification.status, "VERIFIED_SUCCESS");
+    assert.deepEqual(served, ["fast", "strong"]);
+    assert.equal(cleanBeforeStrong, true);
+    assert.equal(handoffHadFailure, true);
+    assert.equal(await readFile(join(repo, "src/value.mjs"), "utf8"), "export const value = 1;\n");
+    assert.equal(logger.events.filter((event) => event.type === "attempt_rollback").length, 1);
+    assert.equal(logger.events.filter((event) => event.type === "attempt_checkpoint_promoted").length, 1);
+  } finally { await mockServer.close(); await rm(root, { recursive: true, force: true }); }
+});
+test("malformed scout final JSON retains concrete search evidence for coding", async () => {
+  const f = await fixture();
+  const m = await mock((body) => body.messages.length === 2
+    ? { role: "assistant", content: null, tool_calls: [{ id: "search", type: "function",
+        function: { name: "search_code", arguments: JSON.stringify({ query: "export function a" }) } }] }
+    : { role: "assistant", content: "not valid JSON" });
+  try {
+    const subtask = { id: "inspect", title: "Inspect", objective: "Find the existing implementation",
+      dependsOn: [], likelyReadPaths: [], likelyWritePaths: [], readOnly: true,
+      integrationContract: "Return evidence", verificationCommands: [],
+      estimatedDifficulty: "low" as const, parallelSafe: false };
+    const logger = new Logger(join(f.root, "scout-report"), "scout-search", true);
+    const gateway = new Gateway(await config(undefined, { modelPool: pool, baseUrl: m.url }),
+      logger, new Budget(0.1, 200000, 60000));
+    const evidence = await discover(gateway, f.repo, "Find the implementation", subtask,
+      { subtasks: [subtask] }, await profileRepo(f.repo));
+    assert.ok(evidence.relevantFiles.includes("src/a.ts"), JSON.stringify({ evidence, events: logger.events.filter((event) => event.type === "tool_result") }));
+    assert.ok(evidence.evidence.some((item) => item.includes("search_code:") && item.includes("src/a.ts")));
+    assert.ok(logger.events.some((event) => event.type === "discovery_fallback"));
+  } finally { await m.close(); await f.cleanup(); }
+});
 async function mock(
   handler: (body: any) => any,
   catalogModels: any[] = pool.models,
@@ -199,7 +470,7 @@ for (const finalFailure of [false, true])
         config: c,
         quiet: true,
         output: join(f.root, "report"),
-        verify: finalFailure ? ['node -e "process.exit(1)"'] : undefined,
+        verify: finalFailure ? ["node -e \"import('./src/a.ts').then(({a})=>process.exit(Number(a()===1)))\""] : undefined,
       });
       assert.equal(result.execution_strategy, "planned");
       assert.equal(
@@ -602,7 +873,9 @@ test("planner permits explicit read-only discovery but retains mutation ownershi
   );
 });
 
-test("planned discovery is read-only and its evidence reaches the dependent coder", async () => {
+for (const malformed of [false, true]) test(malformed
+  ? "malformed discovery finalization preserves context and continues to dependent coding"
+  : "planned discovery is read-only and its evidence reaches the dependent coder", async () => {
   const f = await fixture();
   const liveTask =
     "Across src/repo/commands.ts and src/repo/dependencies.ts, use a separate read-only discovery step before the dependent mutation step. Find one small real robustness issue that is not already covered by tests, fix it with the smallest possible change, and add a focused regression test. Do not change dependencies, do not weaken existing tests, and do not perform unrelated refactors. Verify the result with the relevant tests and typecheck.";
@@ -667,7 +940,7 @@ test("planned discovery is read-only and its evidence reaches the dependent code
             },
           ],
         };
-      return response({
+      return malformed ? response("Unable to produce JSON") : response({
         relevantFiles: ["src/a.ts", "src/b.ts"],
         symbols: ["a", "b"],
         reproduction: "test/a.test.ts expects a() to return 1",
@@ -680,7 +953,10 @@ test("planned discovery is read-only and its evidence reaches the dependent code
       });
     }
     assert.equal(input.subtask.id, "fix-verification");
-    assert.equal(input.evidence.likelyRootCause, "a returns 0");
+    if (malformed) {
+      assert.equal(input.evidence.uncertainty, "high");
+      assert.ok(input.evidence.relevantFiles.includes("src/a.ts"));
+    } else assert.equal(input.evidence.likelyRootCause, "a returns 0");
     assert.deepEqual(input.allowed_write_paths, ["src/a.ts"]);
     return {
       role: "assistant",
@@ -717,6 +993,8 @@ test("planned discovery is read-only and its evidence reaches the dependent code
     });
     assert.equal(result.execution_strategy, "planned");
     assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
+    if (malformed) assert.ok((await readFile(join(f.root, "discovery-report/events.jsonl"), "utf8"))
+      .includes('"type":"discovery_fallback"'));
     const events = (
       await readFile(join(f.root, "discovery-report/events.jsonl"), "utf8")
     )
@@ -732,13 +1010,9 @@ test("planned discovery is read-only and its evidence reaches the dependent code
     assert.equal(discoveryScope.read_only, true);
     assert.equal(events.filter((event) => event.type === "write_attempt" &&
       event.subtaskId === "inspect-verification").length, 0);
-    assert.ok(
-      events.some(
-        (event) =>
-          event.type === "discovery_complete" &&
-          event.subtaskId === "inspect-verification",
-      ),
-    );
+    assert.ok(events.some((event) =>
+      event.type === (malformed ? "discovery_fallback" : "discovery_complete") &&
+      event.subtaskId === "inspect-verification"));
     assert.equal(m.requests.filter((request) =>
       request.messages[0].content.includes("read-only repository scout")).length, 2);
     assert.equal(await git(f.repo, "status", "--porcelain"), "");
@@ -868,7 +1142,7 @@ test("discovery routing skips an otherwise eligible unknown-priced model", async
   }
 });
 
-test("discovery reports exhaustion only after an unusable tool-free finalization", async () => {
+test("discovery returns uncertain read-only evidence after an unusable tool-free finalization", async () => {
   const f = await fixture();
   const knownPool = {
     provider: "openrouter" as const,
@@ -930,17 +1204,16 @@ test("discovery reports exhaustion only after an unusable tool-free finalization
       estimatedDifficulty: "low" as const,
       parallelSafe: false,
     };
-    await assert.rejects(
-      discover(
+    const evidence = await discover(
         gateway,
         f.repo,
         subtask.objective,
         subtask,
         { subtasks: [subtask] },
         await profileRepo(f.repo),
-      ),
-      /Discovery iteration budget exhausted: finalization produced no usable result/,
-    );
+      );
+    assert.equal(evidence.uncertainty, "high");
+    assert.ok(evidence.relevantFiles.includes("src/a.ts"));
     assert.equal(m.requests.length, 2);
   } finally {
     await m.close();

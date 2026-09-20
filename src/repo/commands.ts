@@ -1,9 +1,10 @@
 import { scopedCommand, type WriteScope } from "./writeScope.js";
 import { execa } from "execa";
-import { realpath, mkdtemp, rm, mkdir, lstat, symlink } from "node:fs/promises";
-import { join, dirname, relative, isAbsolute, posix } from "node:path";
+import { realpath, mkdtemp, rm, mkdir, lstat, symlink, readFile, readdir, access } from "node:fs/promises";
+import { join, dirname, relative, isAbsolute, posix, resolve, delimiter } from "node:path";
 import { createConnection, createServer } from "node:net";
 import { randomBytes } from "node:crypto";
+import { constants } from "node:fs";
 import type { CommandResult } from "../types.js";
 import {
   dependenciesForWorkspace,
@@ -17,6 +18,124 @@ const within = (root: string, path: string) => {
   );
 };
 
+/** Bubblewrap needs these mountpoints before /tmp becomes read-only. */
+export function linuxTemporaryMountPoints(cwd: string, scratch: string, readRoots: string[] = []): string[] {
+  const points = new Set<string>();
+  for (const target of [cwd, scratch, ...readRoots]) {
+    if (!within("/tmp", target) || target === "/tmp") continue;
+    let parent = "/tmp";
+    for (const component of relative("/tmp", target).split("/").filter(Boolean)) {
+      parent = join(parent, component);
+      points.add(parent);
+    }
+  }
+  return [...points].sort((a, b) => a.length - b.length || a.localeCompare(b));
+}
+export function linuxTemporaryMountArguments(cwd: string, scratch: string, readRoots: string[] = []): string[] {
+  return ["--tmpfs", "/tmp",
+    ...linuxTemporaryMountPoints(cwd, scratch, readRoots).flatMap((point) => ["--dir", point]),
+    "--remount-ro", "/tmp", "--tmpfs", scratch];
+}
+
+/** Reuse existing environments only when their interpreter and import paths can
+ * be made available read-only without importing the original candidate source. */
+export async function pythonSandboxEnvironment(
+  root: string, inherited: NodeJS.ProcessEnv = process.env, strict = false,
+  sourceRoot?: string,
+) {
+  const workspace = await realpath(root);
+  const original = sourceRoot ? await realpath(sourceRoot) : undefined;
+  const systemPath = (path: string) =>
+    ["/usr", "/bin", "/sbin", "/opt", "/System", "/Library"].some((base) => within(base, path));
+  const remap = (path: string) => original && within(original, path)
+    ? join(workspace, relative(original, path)) : path;
+  const local = async (path: string | undefined) => {
+    if (!path || !isAbsolute(path)) return undefined;
+    try {
+      const resolved = await realpath(remap(await realpath(path)));
+      return within(workspace, resolved) ? resolved : undefined;
+    } catch { return undefined; }
+  };
+  const readRoots = new Set<string>();
+  const usableExternal = async (path: string) => {
+    try {
+      const envRoot = await realpath(path);
+      const config = await readFile(join(envRoot, "pyvenv.cfg"), "utf8");
+      const home = config.match(/^home\s*=\s*(.+)$/m)?.[1]?.trim();
+      if (!home || !isAbsolute(home)) return undefined;
+      const homePath = await realpath(home);
+      const baseRoot = /(?:^|\/)(?:bin|Scripts)$/.test(homePath)
+        ? dirname(homePath)
+        : homePath;
+      if (/^include-system-site-packages\s*=\s*true/im.test(config)) return undefined;
+      const interpreter = await realpath(join(envRoot, "bin", "python"));
+      // A real venv points back to the interpreter distribution named by
+      // pyvenv.cfg. Reject environment-local replacements, but do not assume
+      // system Python must live under a short hardcoded list of prefixes.
+      if (!within(baseRoot, interpreter)) return undefined;
+      await access(interpreter, constants.X_OK);
+      // Executable .pth files and editable installs can redirect imports to the
+      // original checkout. Do not guess whether arbitrary startup code is safe.
+      for (const version of await readdir(join(envRoot, "lib"))) {
+        if (!/^python\d/.test(version)) continue;
+        const site = join(envRoot, "lib", version, "site-packages");
+        for (const file of await readdir(site)) {
+          if (file.endsWith(".egg-link") || /editable/i.test(file)) return undefined;
+          if (!file.endsWith(".pth")) continue;
+          const lines = (await readFile(join(site, file), "utf8")).split(/\r?\n/);
+          for (const line of lines.map((line) => line.trim()).filter((line) => line && !line.startsWith("#"))) {
+            if (/^import[ \t]/.test(line)) {
+              if (/sys\.path|addsitedir|\bchdir\s*\(|\b(?:exec|eval)\s*\(/.test(line) ||
+                  (original && line.includes(original))) return undefined;
+              continue;
+            }
+            const target = await realpath(resolve(site, line));
+            if (!within(envRoot, target)) return undefined;
+          }
+        }
+      }
+      readRoots.add(envRoot);
+      readRoots.add(baseRoot);
+      return envRoot;
+    } catch { return undefined; }
+  };
+  let virtualEnv = await local(inherited.VIRTUAL_ENV);
+  const pythonHome = await local(inherited.PYTHONHOME);
+  let unavailable: string | undefined;
+  if (inherited.VIRTUAL_ENV && !virtualEnv) {
+    virtualEnv = await usableExternal(inherited.VIRTUAL_ENV);
+    if (!virtualEnv) unavailable = "python_environment_inaccessible";
+  }
+  const pathParts: string[] = [];
+  for (const part of (inherited.PATH ?? "").split(delimiter).filter(Boolean)) {
+    if (!isAbsolute(part)) continue;
+    const mapped = remap(await realpath(part).catch(() => resolve(part)));
+    const absolute = await realpath(mapped).catch(() => resolve(mapped));
+    if (inherited.VIRTUAL_ENV && !virtualEnv && within(resolve(inherited.VIRTUAL_ENV), absolute)) continue;
+    const parent = dirname(absolute);
+    const venvRoot = /(?:^|\/)(?:bin|Scripts)$/.test(absolute) ? parent : undefined;
+    if (venvRoot) {
+      const isVenv = await lstat(join(venvRoot, "pyvenv.cfg")).then(() => true).catch(() => false);
+      if (isVenv && !await local(venvRoot) && !readRoots.has(venvRoot) && !await usableExternal(venvRoot)) {
+        // An unrelated stale/unsafe venv later in PATH is not the selected
+        // Python environment. Drop that entry without poisoning usable system
+        // or explicitly selected interpreters.
+        continue;
+      }
+    }
+    if (strict && !within(workspace, absolute) && !systemPath(absolute) &&
+        ![...readRoots].some((root) => within(root, absolute))) continue;
+    pathParts.push(absolute);
+  }
+  if (!pathParts.length) pathParts.push("/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin");
+  return { PATH: [...new Set(pathParts)].join(delimiter),
+    // Relative entries follow project-unit `cd` commands.
+    PYTHONPATH: [".", "src", workspace, join(workspace, "src")].join(delimiter),
+    unavailable, readRoots: [...readRoots],
+    ...(virtualEnv ? { VIRTUAL_ENV: virtualEnv } : {}),
+    ...(pythonHome ? { PYTHONHOME: pythonHome } : {}) };
+}
+
 async function brokeredCommand(
   cwd: string,
   cmd: string,
@@ -24,6 +143,8 @@ async function brokeredCommand(
   readOnly: boolean,
   scope: WriteScope | undefined,
   dependencyBridges: DependencyBridge[],
+  strictPythonEnvironment: boolean,
+  pythonSourceRoot?: string,
 ) {
   const socket = process.env.KODA_SANDBOX_BROKER;
   const token = process.env.KODA_SANDBOX_BROKER_TOKEN;
@@ -46,6 +167,8 @@ async function brokeredCommand(
           readOnly,
           scope,
           dependencyBridges,
+          strictPythonEnvironment,
+          pythonSourceRoot,
         }) + "\n",
       ),
     );
@@ -122,6 +245,8 @@ async function sandboxBroker(
           !!message.readOnly,
           message.scope,
           bridges,
+          !!message.strictPythonEnvironment,
+          message.pythonSourceRoot,
         );
         client.end(JSON.stringify({ result }));
       } catch (error) {
@@ -151,6 +276,8 @@ export async function command(
   readOnly = false,
   scope?: WriteScope,
   inheritedBridges?: DependencyBridge[],
+  strictPythonEnvironment = false,
+  pythonSourceRoot?: string,
 ): Promise<CommandResult> {
   const dependencyBridges =
     inheritedBridges ?? (await dependenciesForWorkspace(cwd));
@@ -159,7 +286,7 @@ export async function command(
       cwd,
       scope,
       (copy, remaining) =>
-        command(copy, cmd, remaining, readOnly, undefined, dependencyBridges),
+        command(copy, cmd, remaining, readOnly, undefined, dependencyBridges, strictPythonEnvironment, pythonSourceRoot),
       timeoutMs,
     );
   const brokered = await brokeredCommand(
@@ -169,10 +296,21 @@ export async function command(
     readOnly,
     undefined,
     dependencyBridges,
+    strictPythonEnvironment,
+    pythonSourceRoot,
   );
   if (brokered) return brokered;
   const start = Date.now();
   cwd = await realpath(cwd);
+  const { unavailable: pythonUnavailable, readRoots: pythonReadRoots, ...pythonEnvironment } =
+    await pythonSandboxEnvironment(cwd, process.env, strictPythonEnvironment, pythonSourceRoot);
+  if (pythonUnavailable && /\b(?:python(?:\d+(?:\.\d+)?)?|pytest|tox)\b/i.test(cmd))
+    return {
+      command: cmd, exitCode: 1, stdout: "",
+      stderr: "The selected external Python environment cannot be safely reused in the verification sandbox",
+      unavailable: pythonUnavailable, outcome: "INFRA_FAILURE",
+      wallClockMs: Date.now() - start, timedOut: false,
+    };
   let scratchPrefix = "/tmp/k-";
   if (process.platform === "darwin" && process.env.KODA_SANDBOX_TMP_ROOT) {
     const inherited = await realpath(process.env.KODA_SANDBOX_TMP_ROOT);
@@ -220,7 +358,7 @@ export async function command(
     throw error;
   }
   const env = {
-    PATH: process.env.PATH!,
+    ...pythonEnvironment,
     HOME: scratch,
     npm_config_cache: join(scratch, "npm-cache"),
     TMPDIR: scratch,
@@ -258,8 +396,8 @@ export async function command(
     const ancestors: string[] = [];
     for (let p = dirname(cwd); p !== dirname(p); p = dirname(p))
       ancestors.push(`(literal ${q(p)})`);
-    const dependencyReads = activeBridges
-      .map((bridge) => `(subpath ${q(bridge.sourcePath)})`)
+    const dependencyReads = [...activeBridges.map((bridge) => bridge.sourcePath), ...pythonReadRoots]
+      .map((path) => `(subpath ${q(path)})`)
       .join(" ");
     const dependencyWriteDenials = activeBridges
       .map((bridge) => `(deny file-write* (subpath ${q(bridge.sourcePath)}))`)
@@ -281,29 +419,26 @@ export async function command(
       "/proc",
       "--dev",
       "/dev",
-      "--tmpfs",
-      "/tmp",
-      "--dir",
-      scratch,
-      "--remount-ro",
-      "/tmp",
-      "--tmpfs",
-      scratch,
+      ...linuxTemporaryMountArguments(cwd, scratch, pythonReadRoots),
     ];
     for (const p of ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/opt"])
       args.push("--ro-bind-try", p, p);
-    args.push(
-      readOnly ? "--ro-bind" : "--bind",
-      cwd,
-      cwd,
-      "--ro-bind",
-      join(cwd, ".git"),
-      join(cwd, ".git"),
-    );
+    args.push(readOnly ? "--ro-bind" : "--bind", cwd, cwd);
+    // Verification snapshots intentionally omit Git metadata. Bubblewrap
+    // treats a missing --ro-bind source as a fatal sandbox setup error, so
+    // only add the extra immutable Git mount for real worktrees/checkouts.
+    const gitMetadata = join(cwd, ".git");
+    try {
+      await lstat(gitMetadata);
+      args.push("--ro-bind", gitMetadata, gitMetadata);
+    } catch (error: any) {
+      if (error.code !== "ENOENT") throw error;
+    }
     // Mount children after the workspace parent so the read-only dependency
     // mounts cannot be hidden by the writable workspace bind.
     for (const bridge of activeBridges)
       args.push("--ro-bind", bridge.sourcePath, bridge.targetPath);
+    for (const root of pythonReadRoots) args.push("--ro-bind", root, root);
     args.push("--chdir", cwd, "/bin/sh", "-c", cmd);
   } else
     throw Error(

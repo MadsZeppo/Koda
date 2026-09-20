@@ -7,6 +7,7 @@ import { dependencyPathAvailable } from "./dependencies.js";
 
 export type Ecosystem = "javascript" | "python" | "generic";
 export type CheckKind = "test" | "typecheck" | "lint" | "build" | "check";
+export type VerificationRequirement = "required" | "advisory";
 export interface VerificationCandidate {
   kind: CheckKind;
   command: string;
@@ -16,6 +17,7 @@ export interface VerificationCandidate {
   available: boolean;
   reason?: string;
   origin?: "declared" | "inferred" | "generic";
+  requirement?: VerificationRequirement;
   mutatesSource: false;
   requiresInstalledDependencies: boolean;
 }
@@ -342,6 +344,11 @@ export async function detectEcosystem(
       reason?: string,
       confidence = 1,
     ) => {
+      const origin = source.startsWith("generic:")
+        ? "generic" as const
+        : /scripts\.|:task\./.test(source)
+          ? "declared" as const
+          : "inferred" as const;
       unit.verification.push({
         kind,
         command: scopedCheck(dir, cmd),
@@ -350,11 +357,8 @@ export async function detectEcosystem(
         confidence,
         available,
         reason,
-        origin: source.startsWith("generic:")
-          ? "generic"
-          : /scripts\.|:task\./.test(source)
-            ? "declared"
-            : "inferred",
+        origin,
+        requirement: origin === "declared" ? "required" : "advisory",
         mutatesSource: false,
         requiresInstalledDependencies: !/^node\s/.test(cmd),
       });
@@ -815,6 +819,21 @@ export async function detectEcosystem(
           "-p no:cacheprovider",
           "inferred:test-file convention",
         );
+      }
+      const unittestFiles = local.filter((f) => /(?:^|\/)test[^/]*\.py$/.test(f)).slice(0, 24);
+      const unittestContract = !!(await text(at(dir, "setup.py"))).match(/\btest_suite\s*=/) ||
+        ini.some((body) => /\bpython(?:3)?\s+-m\s+unittest\b|\bunittest\s+discover\b/.test(body)) ||
+        (await Promise.all(unittestFiles.map(text))).some((body) =>
+          /\b(?:import unittest|from unittest import|unittest\.TestCase)\b/.test(body));
+      if (unittestContract && unittestFiles.length) {
+        const interpreter = python ?? (await executable("python3") ? "python3" :
+          await executable("python") ? "python" : undefined);
+        const dirs = unique(unittestFiles.map((file) => posix.dirname(file)));
+        if (dirs.length === 1 && interpreter) {
+          unit.testRunners.push("unittest");
+          candidate("test", `${interpreter} -B -m unittest discover -s ${quote(dirs[0]! === dir ? "." : posix.relative(dir, dirs[0]!))} -p 'test*.py'`,
+            at(dir, "unittest test infrastructure"), true, undefined, 0.9);
+        }
       }
       if (ruff)
         await addPy(

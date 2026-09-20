@@ -1,5 +1,5 @@
 import type { Config } from "../config.js";
-import type { Attempt, OperationalCall } from "./history.js";
+import { attributableCodingFailure, type Attempt, type OperationalCall } from "./history.js";
 import { taskBucket } from "./features.js";
 import type { Features } from "./features.js";
 import type { SpecialistModel, SpecialistEvidence } from "./capabilityRegistry.js";
@@ -42,7 +42,7 @@ const POLICY = {
   interactiveP90Ms: 15000,
 } as const;
 const clamp = (n: number) => Math.max(0.05, Math.min(0.995, n));
-const failure = (row: Attempt) => row.verification === "FAILED" &&
+const failure = (row: Attempt) => attributableCodingFailure(row) &&
   !/provider|infra|timeout|rate.limit|transport|\b429\b|HTTP 5\d\d|unavailable|unknown pricing/i.test(row.reason ?? "");
 const value = (level: TaskDifficulty[keyof TaskDifficulty]) => level === "high" ? 2 : level === "medium" ? 1 : 0;
 const difficultyDistance = (a: TaskDifficulty, b: TaskDifficulty) =>

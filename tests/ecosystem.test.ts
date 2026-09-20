@@ -7,15 +7,18 @@ import {
   readFile,
   rm,
   chmod,
+  realpath,
 } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { execa } from "execa";
 import { profileRepo } from "../src/repo/profiler.js";
-import { git } from "../src/repo/commands.js";
+import { git, pythonSandboxEnvironment } from "../src/repo/commands.js";
 import { projectFor } from "../src/repo/ecosystem.js";
 import { verificationPlan } from "../src/verifier/plan.js";
 import { verify } from "../src/verifier/verifier.js";
+import { focusedLocalReproduction, optionalUnavailableCheck } from "../src/verifier/recovery.js";
+import { verificationAgainstBaseline, verificationResult, verificationRegressed, runtimeInfrastructureFailure } from "../src/verifier/verifier.js";
 import { compileContext } from "../src/context/compiler.js";
 import { extractFeatures, featureKey } from "../src/router/features.js";
 import { config } from "../src/config.js";
@@ -39,6 +42,49 @@ async function fixture(files: Record<string, string>) {
     close: () => rm(root, { recursive: true, force: true }),
   };
 }
+test("baseline-aware verification distinguishes unchanged failures, regressions, and infrastructure", () => {
+  const check = (command: string, stderr: string) => ({
+    command, exitCode: 1, stdout: "", stderr, wallClockMs: 1, timedOut: false,
+  });
+  const baseline = verificationResult([check("python3 -m pytest", "FAILED existing assertion\n1 failed in 1.2s")]);
+  const unchanged = verificationResult([check("python3 -m pytest", "FAILED existing assertion\n1 failed in 2.3s")]);
+  const changed = verificationResult([check("python3 -m pytest", "FAILED new assertion\n1 failed in 2.3s")]);
+  assert.equal(verificationRegressed(baseline, unchanged), false);
+  assert.equal(verificationRegressed(baseline, changed), true);
+  const assertionBase = verificationResult([check("node --test", "AssertionError\n  actual: 0\n  expected: 1")]);
+  const assertionChanged = verificationResult([check("node --test", "AssertionError\n  actual: 2\n  expected: 1")]);
+  assert.equal(verificationRegressed(assertionBase, assertionChanged), true);
+  assert.equal(verificationRegressed(baseline, verificationResult([check("python3 -m pytest", "FAILED existing assertion"), check("python3 -m compileall .", "SyntaxError")])), true);
+  assert.equal(runtimeInfrastructureFailure(check("python3 -m pytest", "socket.gaierror: Temporary failure in name resolution")), "verification_network_environment");
+  assert.equal(runtimeInfrastructureFailure(check("python3 -m pytest", "AssertionError: expected Network is unreachable")), undefined);
+});
+
+test("baseline comparison uses stable pytest test identities instead of volatile traces", () => {
+  const check = (command: string, stdout: string) => ({
+    command, exitCode: 1, stdout, stderr: "", wallClockMs: 1, timedOut: false,
+  });
+  const result = (output: string) => verificationResult([check("pytest -q", output)]);
+  const baseline = result([
+    "E ConnectionError: object at 0x111111 Network is unreachable",
+    "FAILED tests/test_api.py::test_timeout - ConnectionError at /tmp/koda-verify-old/repo",
+    "ERROR tests/test_api.py::test_server",
+    "1 failed, 1 error in 0.41s",
+  ].join("\n"));
+  const sameFailures = result([
+    "E ConnectionError: object at 0x999999 Network is unreachable",
+    "FAILED tests/test_api.py::test_timeout - ConnectionError at /tmp/koda-verify-new/repo",
+    "ERROR tests/test_api.py::test_server",
+    "1 failed, 1 error in 0.73s",
+  ].join("\n"));
+  const regression = result([
+    sameFailures.checks[0]!.stdout,
+    "FAILED tests/test_api.py::test_new_regression - AssertionError",
+  ].join("\n"));
+  assert.equal(verificationRegressed(baseline, sameFailures), false);
+  assert.equal(verificationAgainstBaseline(baseline, sameFailures).status,
+    "VERIFIED_SUCCESS");
+  assert.equal(verificationRegressed(baseline, regression), true);
+});
 for (const scenario of [
   {
     name: "pnpm Next TypeScript",
@@ -458,6 +504,205 @@ test("automatic project-local checks execute in cwd; source mutations are reject
     await f.close();
   }
 });
+test("unavailable external Python environment is infrastructure, never a fallback coding failure", async () => {
+  const f = await fixture({ "module.py": "value = 1\n" });
+  const external = await mkdtemp(join(tmpdir(), "koda-external-python-"));
+  await mkdir(join(external, "bin"));
+  await writeFile(join(external, "pyvenv.cfg"), "home = /usr/bin\n");
+  await writeFile(join(external, "bin/python3"), "#!/bin/sh\necho wrong-interpreter >&2\nexit 7\n");
+  await chmod(join(external, "bin/python3"), 0o755);
+  const previous = { PATH: process.env.PATH, VIRTUAL_ENV: process.env.VIRTUAL_ENV,
+    PYTHONHOME: process.env.PYTHONHOME };
+  try {
+    process.env.PATH = `${join(external, "bin")}:${previous.PATH ?? ""}`;
+    process.env.VIRTUAL_ENV = external;
+    process.env.PYTHONHOME = external;
+    const sanitized = await pythonSandboxEnvironment(f.root);
+    assert.ok(!sanitized.PATH.includes(join(external, "bin")));
+    assert.equal(sanitized.VIRTUAL_ENV, undefined);
+    assert.equal(sanitized.PYTHONHOME, undefined);
+    const candidate = { kind: "test" as const, command: "python3 -B -c 'print(42)'",
+      cwd: ".", source: "test:python-environment", confidence: 1, available: true,
+      mutatesSource: false as const, requiresInstalledDependencies: false };
+    const result = await verify(f.root, [candidate.command], 10000,
+      undefined, undefined, [candidate]);
+    assert.equal(result.status, "NOT_FULLY_VERIFIED", JSON.stringify(result));
+    assert.equal(result.checks[0]!.outcome, "INFRA_FAILURE");
+    assert.equal(result.failedChecks, 0);
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await f.close();
+    await rm(external, { recursive: true, force: true });
+  }
+});
+
+test("an unrelated unsafe virtualenv later in PATH does not poison system Python", async () => {
+  const f = await fixture({ "module.py": "value = 1\n" });
+  const external = await mkdtemp(join(tmpdir(), "koda-unselected-python-"));
+  try {
+    await mkdir(join(external, "bin"));
+    await writeFile(join(external, "pyvenv.cfg"), "home = /missing/python\n");
+    await writeFile(join(external, "bin", "python"), "not a Python interpreter\n");
+    const sanitized = await pythonSandboxEnvironment(f.root, {
+      PATH: `/usr/bin:/bin:${join(external, "bin")}`,
+    });
+    assert.equal(sanitized.unavailable, undefined);
+    assert.ok(!sanitized.PATH.includes(join(external, "bin")));
+    assert.match(sanitized.PATH, /\/usr\/bin/);
+  } finally {
+    await f.close();
+    await rm(external, { recursive: true, force: true });
+  }
+});
+
+test("valid worktree-local Python environment remains available", async () => {
+  const f = await fixture({ "module.py": "value = 1\n" });
+  try {
+    await mkdir(join(f.root, ".local-env", "bin"), { recursive: true });
+    await writeFile(join(f.root, ".local-env", "pyvenv.cfg"), "home = /usr/bin\n");
+    const local = join(f.root, ".local-env");
+    const sanitized = await pythonSandboxEnvironment(f.root, {
+      PATH: `${join(local, "bin")}:/usr/bin:/bin`, VIRTUAL_ENV: local,
+      PYTHONHOME: local,
+    });
+    assert.equal(sanitized.VIRTUAL_ENV, await realpath(local));
+    assert.equal(sanitized.PYTHONHOME, await realpath(local));
+    assert.ok(sanitized.PATH.startsWith(await realpath(join(local, "bin"))));
+  } finally { await f.close(); }
+});
+
+test("legacy setup.py/unittest infrastructure supplies a real local check", async () => {
+  const f = await fixture({
+    "setup.py": "from setuptools import setup\nsetup(name='sample', test_suite='tests')\n",
+    "sample.py": "def value():\n    return 2\n",
+    "tests/test_sample.py": "import unittest\nfrom sample import value\nclass SampleTest(unittest.TestCase):\n    def test_value(self): self.assertEqual(value(), 2)\n",
+  });
+  try {
+    const profile = await f.profile();
+    const candidates = verificationPlan(profile, ["sample.py"]);
+    const check = candidates.find((candidate) => candidate.available && candidate.command.includes("unittest discover"));
+    assert.ok(check);
+    const passed = await verify(f.root, [check.command], 10000, undefined, undefined, candidates);
+    assert.equal(passed.status, "VERIFIED_SUCCESS", JSON.stringify(passed));
+    await writeFile(join(f.root, "sample.py"), "def value():\n    return 3\n");
+    const failed = await verify(f.root, [check.command], 10000, undefined, undefined, candidates);
+    assert.equal(failed.status, "FAILED");
+  } finally { await f.close(); }
+});
+
+test("empty selection recovers a concrete local assertion after source mutation", async () => {
+  const f = await fixture({ "calculator.py": "def add(a, b):\n    return a - b\n" });
+  try {
+    const profile = await f.profile();
+    assert.deepEqual(verificationPlan(profile, ["calculator.py"]), []);
+    const task = "Fix add(2, 3) == 5 in calculator.py";
+    const check = await focusedLocalReproduction(profile, task, ["calculator.py"]);
+    assert.ok(check);
+    const initial = await verify(f.root, [check.command], 10000, undefined, undefined, [check]);
+    assert.equal(initial.status, "FAILED");
+    await writeFile(join(f.root, "calculator.py"), "def add(a, b):\n    return a + b\n");
+    const passed = await verify(f.root, [check.command], 10000, undefined, undefined, [check]);
+    assert.equal(passed.status, "VERIFIED_SUCCESS", JSON.stringify(passed));
+    assert.equal(passed.checks[0]?.source, "task:concrete-local-reproduction");
+  } finally { await f.close(); }
+});
+
+test("without a concrete safe reproduction, empty verification remains unverified", async () => {
+  const f = await fixture({ "calculator.py": "def add(a, b):\n    return a + b\n" });
+  try {
+    const profile = await f.profile();
+    assert.equal(await focusedLocalReproduction(profile, "Fix the arithmetic bug", ["calculator.py"]), undefined);
+    assert.equal(verificationResult([]).status, "NOT_FULLY_VERIFIED");
+    assert.equal(await focusedLocalReproduction(profile, "Fix absent(2) == 3", ["calculator.py"]), undefined);
+  } finally { await f.close(); }
+});
+
+test("DIRECT source edit with no discovered runner executes recovered final verification", async () => {
+  const { createServer } = await import("node:http");
+  const { run } = await import("../src/run.js");
+  const f = await fixture({ "calculator.py": "def add(a, b):\n    return a - b\n" });
+  const output = await mkdtemp(join(tmpdir(), "koda-python-recovery-"));
+  let calls = 0;
+  const server = createServer(async (req, res) => {
+    let raw = "";
+    for await (const chunk of req) raw += chunk;
+    const body = JSON.parse(raw);
+    calls++;
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ id: "mock", model: body.model, choices: [{ index: 0,
+      finish_reason: "tool_calls", message: { role: "assistant", content: null,
+        tool_calls: [{ id: "write", type: "function", function: { name: "write_file",
+          arguments: JSON.stringify({ path: "calculator.py", content: "def add(a, b):\n    return a + b\n" }) } }] } }],
+      usage: { prompt_tokens: 100, completion_tokens: 20, cost: 0 } }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const result = await run({ repo: f.root, task: "Fix calculator.py: add(2, 3) == 5.",
+      config: await config(undefined, { models: {},
+        baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`, maxIterations: 3 }),
+      output, quiet: true });
+    assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
+    assert.equal(result.finalVerificationStatus, "VERIFIED_SUCCESS");
+    assert.ok(calls >= 1);
+    assert.ok(result.verification.checks.some((check: any) =>
+      check.source === "task:concrete-local-reproduction" && check.outcome === "CHECK_PASS"));
+    assert.equal(await readFile(join(f.root, "calculator.py"), "utf8"),
+      "def add(a, b):\n    return a - b\n");
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await f.close();
+    await rm(output, { recursive: true, force: true });
+  }
+});
+
+test("unavailable inferred pytest does not suppress a local reproduction or erase declared checks", async () => {
+  const f = await fixture({
+    "requirements.txt": "pytest==999.0\n",
+    "calculator.py": "def add(a, b):\n    return a + b\n",
+    "tests/test_calculator.py": "def test_add(): pass\n",
+  });
+  try {
+    const profile = await f.profile();
+    const optional = verificationPlan(profile, ["calculator.py"]).find(optionalUnavailableCheck);
+    assert.ok(optional);
+    const reproduction = await focusedLocalReproduction(profile,
+      "Fix add(2, 3) == 5", ["calculator.py"]);
+    assert.ok(reproduction);
+    assert.equal((await verify(f.root, [reproduction.command], 10000,
+      undefined, undefined, [reproduction])).status, "VERIFIED_SUCCESS");
+    assert.equal(optionalUnavailableCheck({ ...optional, source: "pytest.ini" }), false);
+  } finally { await f.close(); }
+});
+test("required project evidence remains fully verified when an advisory runner is unavailable", async () => {
+  const f = await fixture({
+    "package.json": pkg({ test: "node -e \"process.exit(0)\"" }),
+    "requirements.txt": "pytest\n",
+    "module.js": "export const value = 1;\n",
+    "test_optional.py": "def test_optional(): assert True\n",
+  });
+  try {
+    const profile = await f.profile();
+    const candidates = verificationPlan(profile, ["module.js"], true);
+    const required = candidates.find((candidate) => candidate.source.includes("scripts.test"));
+    const advisory = candidates.find((candidate) =>
+      candidate.reason === "dependencies_not_available" && candidate.kind === "test");
+    assert.ok(required);
+    assert.ok(advisory);
+    const result = await verify(
+      f.root, candidates.map((candidate) => candidate.command), 10000,
+      undefined, undefined, candidates,
+    );
+    assert.equal(result.status, "VERIFIED_SUCCESS", JSON.stringify(result));
+    assert.equal(result.checks.find((check) => check.command === required.command)?.requirement, "required");
+    assert.equal(result.checks.find((check) => check.command === advisory.command)?.requirement, "advisory");
+    assert.equal(result.checks.find((check) => check.command === advisory.command)?.outcome, "CHECK_UNAVAILABLE");
+  } finally {
+    await f.close();
+  }
+});
+
 test("existing Python venv verifies locally but is not bridged in JavaScript-first V1", async () => {
   const f = await fixture({
     "pyproject.toml": "[project]\ndependencies=['pytest']",
@@ -665,7 +910,8 @@ test("filesystem workspace executes pnpm test and typecheck with bridged depende
   }
 });
 
-test("workspace DIRECT runtime edits and integrates with project-local checks and mandatory root final verification", async () => {
+for (const baselineFails of [true, false])
+test(`workspace DIRECT final verification: ${baselineFails ? "unchanged baseline is neutral" : "new root failure is a regression"}`, async () => {
   const { createServer } = await import("node:http");
   const { run } = await import("../src/run.js");
   const f = await fixture({
@@ -673,7 +919,8 @@ test("workspace DIRECT runtime edits and integrates with project-local checks an
       { check: "node final.cjs" },
       { workspaces: ["packages/*"] },
     ),
-    "final.cjs": "process.exit(1)",
+    "final.cjs": baselineFails ? "process.exit(1)" :
+      "import('./packages/calc/src/calc.js').then(({add})=>process.exit(add(2,3)===5?1:0))",
     "packages/calc/package.json": pkg(
       { test: "node --test" },
       { type: "module" },
@@ -739,9 +986,9 @@ test("workspace DIRECT runtime edits and integrates with project-local checks an
     assert.equal(result.execution_strategy, "direct");
     assert.equal(result.plannerModelCalls, 0);
     assert.equal(calls, 1);
-    assert.equal(result.status, "FAILED");
+    assert.equal(result.status, baselineFails ? "VERIFIED_SUCCESS" : "FAILED");
     assert.equal(result.verificationDimensions!.test, "PASS");
-    assert.equal(result.verificationDimensions!.check, "FAIL");
+    assert.equal(result.verificationDimensions!.check, baselineFails ? "PASS" : "FAIL");
     assert.equal(
       await readFile(
         join(result.integration!.path, "packages/calc/src/calc.js"),

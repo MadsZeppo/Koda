@@ -451,6 +451,12 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
         );
         if (deadline === undefined) return await request;
         let timer: ReturnType<typeof setTimeout> | undefined;
+        let expired = false;
+        void request.then(() => {
+          if (expired) gateway.logger.log("stable_late_finalization_ignored", {
+            subtaskId: subtask.id, model, iteration,
+          });
+        }, () => undefined);
         try {
           return await Promise.race([
             request,
@@ -458,9 +464,12 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
               timer = setTimeout(() => reject(new StableScopeTimeoutError("Stable scope finalization timed out")), remaining);
             }),
           ]);
-        } finally { if (timer) clearTimeout(timer); }
+        } finally {
+          expired = Date.now() >= deadline;
+          if (timer) clearTimeout(timer);
+        }
       } catch (error) {
-        if (error instanceof StableScopeTimeoutError) throw error;
+        if (error instanceof StableScopeTimeoutError || finalization) throw error;
         if (
           !pool ||
           !selected ||
@@ -484,8 +493,6 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
         const previous = selected.model;
 
         excluded.push(previous.id);
-
-        pool.disabled.add(previous.id);
 
         selected = universalSelection
           ? specialistCascade[++specialistIndex]
@@ -537,9 +544,19 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
     return significantTerms.some((term) => fileName.includes(term)) ||
       significantTerms.filter((term) => text.includes(term)).length >= 2;
   };
+  const strongReadEvidence = (file: string) => {
+    if (!inspected.has(file) || isTestPath(file)) return false;
+    const text = sourceText(file).toLowerCase();
+    const stem = posix.basename(file).replace(/\.[^.]+$/, "").toLowerCase();
+    return significantTerms.some((term) => term === stem) ||
+      significantTerms.filter((term) => text.includes(term)).length >= 2;
+  };
   const trustedSources = () => {
     const trusted = new Set(profile.files.filter((file) => !isTestPath(file) && explicitlyNamed(file)));
     for (const file of inspected) {
+      if (!isTestPath(file) && known.has(file) && sourceRelevant(file)) trusted.add(file);
+    }
+    for (const file of searchHits) {
       if (!isTestPath(file) && known.has(file) && sourceRelevant(file)) trusted.add(file);
     }
     // Only inspected files connected to an already relevant implementation
@@ -580,21 +597,31 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
     } catch { return false; }
   };
   const deterministicScope = async () => {
-    if (!tools.progressEvidence.length || /\b(?:inspect|discover|find)\b/i.test(task) ||
-        !/\b(?:test|tests|regression)\b/i.test(task))
+    if (!tools.progressEvidence.length)
       return undefined;
-    const explicit = [...inspected].filter((file) => !isTestPath(file) && explicitlyNamed(file));
-    const anchors = explicit.length ? explicit : [...inspected].filter((file) => {
+    const discoveryObjective = /\b(?:inspect|discover|find|investigate|trace)\b/i.test(task);
+    const concrete = new Set([
+      ...searchHits,
+      ...[...inspected].filter((file) => strongReadEvidence(file) ||
+        (!discoveryObjective && explicitlyNamed(file))),
+    ]);
+    if (!concrete.size) return undefined;
+    const explicit = [...inspected].filter((file) => !isTestPath(file) &&
+      explicitlyNamed(file) && concrete.has(file));
+    const evidencedSources = new Set([...inspected, ...searchHits].filter((file) =>
+      known.has(file) && !isTestPath(file)));
+    const anchors = explicit.length ? explicit : [...evidencedSources].filter((file) => {
       if (isTestPath(file)) return false;
       const stem = posix.basename(file).replace(/\.[^.]+$/, "").toLowerCase();
-      return significantTerms.some((term) => term === stem);
+      return concrete.has(file) &&
+        (searchHits.has(file) || significantTerms.some((term) => term === stem));
     });
     if (!anchors.length || anchors.length > 2) return undefined;
     const sources = new Set(anchors);
     // One inspected, directly imported implementation neighbor may be needed
     // for feature plumbing. Never traverse the whole dependency graph.
     for (const anchor of anchors) {
-      const neighbors = imports(anchor).filter((file) => inspected.has(file) && !isTestPath(file));
+      const neighbors = imports(anchor).filter((file) => evidencedSources.has(file) && !isTestPath(file));
       if (neighbors.length === 1) sources.add(neighbors[0]!);
       else if (neighbors.length > 1) return undefined;
     }
@@ -621,6 +648,29 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
       ? tests.slice(0, 1).map((entry) => entry.slice(4)) : [])];
     if (paths.length > 6 || !(await Promise.all(paths.map(safeExistingFile))).every(Boolean)) return undefined;
     return paths;
+  };
+  const evidenceFallback = async (error: unknown) => {
+    let paths = await deterministicScope();
+    if (!paths) {
+      const sources = [...trustedSources()].filter((file) =>
+        searchHits.has(file) || strongReadEvidence(file));
+      if (sources.length > 0 && sources.length <= 3 &&
+          sources.every((file) => searchHits.has(file) || strongReadEvidence(file))) {
+        const tests: string[] = [];
+        if (requestsTestMutation(task)) {
+          for (const file of profile.files.filter(isTestPath))
+            if (await matchingTest(file, new Set(sources))) tests.push(file);
+          if (tests.length > 1) return undefined;
+        }
+        paths = [...sources, ...tests];
+      }
+    }
+    if (!paths) return undefined;
+    gateway.logger.log("stable_scope_finalization_fallback", {
+      subtaskId: subtask.id, reason: String(error), paths,
+    });
+    return acceptLock(JSON.stringify({ paths,
+      reason: `Use concrete repository evidence for ${paths.join(", ")}` }), true);
   };
   const scopeSummary = async () => {
     const sources = trustedSources();
@@ -672,7 +722,10 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
       dependencies: [...inspected].flatMap(imports).filter((file) => known.has(file)),
       uncertainty: "low",
       suggestedApproach: task,
-      evidence: [...inspected].map((file) => `Read ${file} during Stable inspection`),
+      evidence: [...new Set([
+        ...[...inspected].map((file) => `Read ${file} during Stable inspection`),
+        ...[...searchHits].map((file) => `Search matched ${file} during Stable inspection`),
+      ])],
     });
     const handoff = declarationSchema.parse({
       issue: proposal.reason,
@@ -727,6 +780,10 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
         if (parsed.success) {
           if ((await currentDiff(path)) !== before)
             throw Error("Stable read-only inspection mutated the workspace");
+          if (!allowRepositoryTools) {
+            const fallback = await evidenceFallback(`Finalizer reported no scope: ${parsed.data.reason}`);
+            if (fallback) return fallback;
+          }
           gateway.logger.log("stable_non_actionable", {
             subtaskId: subtask.id, reason: parsed.data.reason,
           });
@@ -899,7 +956,7 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
     if (deterministic) {
       return acceptLock(JSON.stringify({
         paths: deterministic,
-        reason: `Implement the requested change in ${deterministic.join(", ")}`,
+      reason: `${task.slice(0, 360)} (${deterministic.join(", ")})`,
       }), true);
     }
     gateway.logger.log("stable_finalization_start", {
@@ -932,7 +989,14 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
       { role: "system", content: "Stable scope decision. Call lock_write_scope({paths, reason}) or report_no_scope({reason}). Choose the minimum justified existing files. No repository tools or EvidencePacket." },
       { role: "user", content: JSON.stringify(summary) },
     ];
-    const finalMessage = await call(3, finalizationTools, true, finalMessages, scopeDeadline);
+    let finalMessage: any;
+    try {
+      finalMessage = await call(3, finalizationTools, true, finalMessages, scopeDeadline);
+    } catch (error) {
+      const fallback = await evidenceFallback(error);
+      if (fallback) return fallback;
+      throw error;
+    }
 
     const prepared = await processMessage(finalMessage, false);
 
@@ -944,8 +1008,20 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
       role: "user",
       content: `Lock the minimal write scope now using lock_write_scope, based only on the evidence already collected. Do not reread the repository. ${lastScopeError ? `Previous proposal was rejected: ${lastScopeError}.` : "Previous response did not lock a scope."} If no actionable scope is justified, call report_no_scope. This is the only correction turn.`,
     });
-    const corrected = await processMessage(await call(4, finalizationTools, true, finalMessages, scopeDeadline), false);
+    let corrected;
+    try {
+      corrected = await processMessage(await call(4, finalizationTools, true, finalMessages, scopeDeadline), false);
+    } catch (error) {
+      const fallback = await evidenceFallback(error);
+      if (fallback) return fallback;
+      throw error;
+    }
     if (corrected) return corrected;
+
+    const protocolFallback = await evidenceFallback(
+      lastScopeError || "Stable scope finalization produced no valid control decision",
+    );
+    if (protocolFallback) return protocolFallback;
 
     /**
      * No valid control transition happened.

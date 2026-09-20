@@ -45,6 +45,11 @@ test("execution strategy: an explicit tiny calculator correction is direct", () 
     "calculator.cjs", "tests/calculator.test.cjs",
   ]);
 });
+test("a localized bug report with reproduction steps remains one worker", () => {
+  const repository = profile(["src/codec.py", "tests/test_codec.py", "setup.py"]);
+  const task = "Bug: encoding a value fails. Reproduce: call encode('x') and observe a wrong result. Expected: return the original value. Fix this localized behavior in src/codec.py; use the existing test for verification.";
+  assert.ok(["direct", "stable"].includes(chooseExecutionStrategy(task, repository).execution_strategy));
+});
 test("execution strategy: one explicit documentation or configuration path is direct", () => {
   const repository = profile([
     "README.md",

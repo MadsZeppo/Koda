@@ -20,7 +20,7 @@ import { ProgressTracker } from "../src/router/progress.js";
 import { Budget, parseUsage } from "../src/openrouter/usage.js";
 import { Worktrees } from "../src/worktrees/manager.js";
 import { git, command } from "../src/repo/commands.js";
-import { verificationResult, verify } from "../src/verifier/verifier.js";
+import { advisoryInfrastructureOnly, verificationResult, verify } from "../src/verifier/verifier.js";
 import {
   repoBackedVerificationCommands,
   workerChecks,
@@ -338,6 +338,64 @@ test("verification derives status from exit codes, no checks stays unverified", 
   assert.equal(unavailable.status, "NOT_FULLY_VERIFIED");
   assert.equal(unavailable.checks[0]!.outcome, "CHECK_UNAVAILABLE");
   assert.equal(check(2).failingTests, 2);
+});
+test("advisory infrastructure is non-blocking only beside required evidence", () => {
+  const requiredPass = {
+    command: "required-test", stdout: "ok", stderr: "", exitCode: 0,
+    timedOut: false, wallClockMs: 1, requirement: "required" as const,
+  };
+  const unavailable = {
+    command: "discovered-extra", stdout: "", stderr: "missing dependency",
+    unavailable: "dependencies_not_available", exitCode: 0, timedOut: false,
+    wallClockMs: 0, requirement: "advisory" as const,
+  };
+  const supported = verificationResult([requiredPass, unavailable]);
+  assert.equal(supported.status, "VERIFIED_SUCCESS");
+  assert.equal(supported.checks[1]!.outcome, "CHECK_UNAVAILABLE");
+  assert.equal(verificationResult([unavailable]).status, "NOT_FULLY_VERIFIED");
+  assert.equal(
+    verificationResult([{ ...unavailable, requirement: "required" }]).status,
+    "NOT_FULLY_VERIFIED",
+  );
+  assert.equal(advisoryInfrastructureOnly(verificationResult([unavailable])), true);
+  assert.equal(
+    advisoryInfrastructureOnly(
+      verificationResult([{ ...unavailable, requirement: "required" }]),
+    ),
+    false,
+  );
+});
+test("verification candidates carry explicit required and advisory semantics", async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-check-requirement-"));
+  try {
+    const required = {
+      kind: "check" as const, command: "node -e \"process.exit(0)\"", cwd: ".",
+      source: "task:acceptance", confidence: 1, available: true,
+      requirement: "required" as const, mutatesSource: false as const,
+      requiresInstalledDependencies: false,
+    };
+    const advisory = {
+      kind: "test" as const, command: "missing-advisory-runner", cwd: ".",
+      source: "inferred:test-file convention", confidence: 0.7, available: false,
+      reason: "dependencies_not_available", requirement: "advisory" as const,
+      mutatesSource: false as const, requiresInstalledDependencies: true,
+    };
+    const result = await verify(
+      root, [required.command, advisory.command], 10000,
+      undefined, undefined, [required, advisory],
+    );
+    assert.equal(result.status, "VERIFIED_SUCCESS");
+    assert.equal(result.checks[0]!.requirement, "required");
+    assert.equal(result.checks[1]!.requirement, "advisory");
+    assert.equal(result.checks[1]!.outcome, "CHECK_UNAVAILABLE");
+    const blocked = await verify(
+      root, [required.command, advisory.command], 10000,
+      undefined, undefined, [required, { ...advisory, requirement: "required" }],
+    );
+    assert.equal(blocked.status, "NOT_FULLY_VERIFIED");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 test("file tools reject traversal and escaping symlinks", async () => {
   const root = await mkdtemp(join(tmpdir(), "koda-path-"));

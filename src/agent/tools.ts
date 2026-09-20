@@ -7,6 +7,7 @@ import {
   realpath,
   readdir,
   lstat,
+  open,
 } from "node:fs/promises";
 import { dirname, resolve, relative, join, isAbsolute } from "node:path";
 import { truncateBytes } from "../context/bounds.js";
@@ -17,6 +18,7 @@ import type { Logger } from "../telemetry/logger.js";
 import { filesystemDiff, workspaceChanges } from "../workspace/diff.js";
 import { changeCode, listWorkspaceFiles } from "../workspace/files.js";
 import { createHash } from "node:crypto";
+import { nearbyRepoPaths } from "../repo/navigation.js";
 export const toolDefinitions: ChatCompletionTool[] = [
   [
     "search_code",
@@ -84,8 +86,8 @@ export const requestContextTool: ChatCompletionTool = {
   type: "function",
   function: {
     name: "request_context",
-    description: "Once only: request a bounded excerpt from one already trusted locked dependency",
-    parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false },
+    description: "Once only: request a bounded excerpt from one locked file or trusted dependency; choose startLine or an exact symbol when the needed code is later in the file",
+    parameters: { type: "object", properties: { path: { type: "string" }, startLine: { type: "integer", minimum: 1 }, symbol: { type: "string" } }, required: ["path"], additionalProperties: false },
   },
 };
 export async function safePath(root: string, input: string) {
@@ -136,6 +138,7 @@ export class AgentTools {
   readonly actions: string[] = [];
   readonly commandEvidence: unknown[] = [];
   readonly progressEvidence: string[] = [];
+  readonly missingReadAttempts = new Map<string, number>();
   constructor(
     readonly root: string,
     readonly readOnly: boolean,
@@ -143,7 +146,7 @@ export class AgentTools {
     readonly logger: Logger,
     readonly subtaskId: string,
     readonly resultBytes = 4000,
-    readonly writeScope?: WriteScope,
+    public writeScope?: WriteScope,
     readonly contextPaths: readonly string[] = [],
   ) {}
   private contextRequests = 0;
@@ -160,10 +163,59 @@ export class AgentTools {
     });
     let result: unknown;
     let progressKey: string | undefined;
+    let searchMatched = false;
+    let navigationUseful = true;
     switch (name) {
       case "read_file": {
         const p = await safePath(this.root, args.path);
-        const s = await lstat(p);
+        let s;
+        try { s = await lstat(p); }
+        catch (error: any) {
+          if (error.code !== "ENOENT") throw error;
+          this.missingReadAttempts.set(args.path, (this.missingReadAttempts.get(args.path) ?? 0) + 1);
+          const files = await listWorkspaceFiles(this.root);
+          const nearby = nearbyRepoPaths(args.path, files);
+          const symbol = String(args.path).split("/").at(-1)?.replace(/\.[^.]+$/, "")
+            .replace(/^(?:test_|spec_)/, "").replace(/[._-](?:test|spec)$/, "") ?? "";
+          let contentMatches: string[] = [];
+          if (/^[\w-]{3,80}$/.test(symbol) && files.length) {
+            const found = await execa("rg", ["-l", "-F", "--max-filesize", "1M", "--", symbol,
+              ...files.slice(0, 200)], { cwd: this.root, reject: false, maxBuffer: 1024 * 1024 });
+            if (found.exitCode === 0) contentMatches = found.stdout.split("\n").filter(Boolean).slice(0, 6);
+          }
+          const candidates = [...new Set([...nearby.map((item) => item.path), ...contentMatches])];
+          const source = candidates.find((file) => /\.(?:[cm]?[jt]sx?|py|go|rs|java|rb)$/i.test(file) &&
+            !/(?:^|\/)(?:tests?|__tests__)(?:\/|$)/i.test(file));
+          let excerpt = "";
+          if (source) {
+            try {
+              const file = await safePath(this.root, source);
+              const stat = await lstat(file);
+              if (stat.isFile() && stat.nlink === 1) {
+                const handle = await open(file, "r");
+                try {
+                  const bytes = Buffer.alloc(2400);
+                  const read = await handle.read(bytes, 0, bytes.length, 0);
+                  excerpt = bytes.subarray(0, read.bytesRead).toString("utf8");
+                } finally { await handle.close(); }
+              }
+            }
+            catch {}
+          }
+          navigationUseful = !!source;
+          progressKey = `navigation:${args.path}:${source ?? "none"}`;
+          result = JSON.stringify({ missingPath: args.path,
+            nearbyTree: files.filter((file) => file.startsWith(dirname(args.path) + "/")).slice(0, 20),
+            candidateFiles: candidates.slice(0, 6), source, excerpt,
+            instruction: source
+              ? "Use existing repository paths. The missing path is not a valid read target."
+              : "No reliable target found. Do not retry the missing path or invent a write target.",
+          });
+          this.logger.log("missing_path_navigation", {
+            subtaskId: this.subtaskId, path: args.path, candidates: candidates.slice(0, 6), source,
+          });
+          break;
+        }
         if (!s.isFile() || s.size > 1024 * 1024)
           throw Error("Read requires regular file under 1MB");
         const lines = (await readFile(p, "utf8")).split("\n");
@@ -183,32 +235,29 @@ export class AgentTools {
         break;
       case "search_code": {
         const files = await listWorkspaceFiles(this.root);
-        const safe: string[] = [];
+        const query = typeof args.query === "string" ? args.query.trim() : "";
+        if (!query || query.length > 256) throw Error("Invalid search query");
+        const hits: string[] = [];
+        let pattern: RegExp | undefined;
+        try { pattern = new RegExp(query); } catch { /* Literal search remains available. */ }
         for (const f of files) {
+          if (hits.length >= 40) break;
           try {
             const p = await safePath(this.root, f);
-            if ((await lstat(p)).isFile()) safe.push(relative(this.root, p));
+            const stat = await lstat(p);
+            if (!stat.isFile() || stat.size > 1024 * 1024) continue;
+            const source = await readFile(p, "utf8");
+            if (source.includes("\0")) continue;
+            const lines = source.split("\n");
+            for (let index = 0; index < lines.length && hits.length < 40; index++) {
+              const line = lines[index]!;
+              if (line.includes(query) || pattern?.test(line))
+                hits.push(`${f}:${index + 1}: ${line.slice(0, 240)}`);
+            }
           } catch {}
         }
-        if (!safe.length) {
-          result = "No files";
-          break;
-        }
-        const r = await execa(
-          "rg",
-          [
-            "-n",
-            "--max-count",
-            "10",
-            "--max-filesize",
-            "1M",
-            "--",
-            args.query,
-            ...safe,
-          ],
-          { cwd: this.root, reject: false, maxBuffer: 2 * 1024 * 1024 },
-        );
-        result = (r.stdout + r.stderr).slice(0, 16000);
+        searchMatched = hits.length > 0;
+        result = hits.length ? hits.join("\n").slice(0, 16000) : "No matches";
         break;
       }
       case "write_file":
@@ -373,7 +422,15 @@ export class AgentTools {
           throw Error("request_context requires a regular file under 1MB");
         const content = new TextDecoder("utf-8", { fatal: true }).decode(await readFile(target));
         if (content.includes("\0")) throw Error("request_context requires text");
-        result = truncateBytes(content, 3200);
+        const lines = content.split("\n");
+        if (args.startLine !== undefined && (!Number.isInteger(args.startLine) || args.startLine < 1))
+          throw Error("request_context startLine must be a positive integer");
+        if (args.symbol !== undefined && (typeof args.symbol !== "string" || !args.symbol.trim()))
+          throw Error("request_context symbol must be nonempty text");
+        const hit = args.symbol ? lines.findIndex((line) => line.includes(args.symbol)) : -1;
+        if (args.symbol && hit < 0) throw Error("request_context symbol not found");
+        const start = args.startLine ? args.startLine - 1 : Math.max(0, hit - 8);
+        result = truncateBytes(lines.slice(start, start + 100).join("\n"), 3200);
         break;
       }
       case "run_command": {
@@ -402,9 +459,9 @@ export class AgentTools {
     }
     const text = typeof result === "string" ? result : JSON.stringify(result);
     const nonempty = text.trim() && text !== "No files";
-    if (name === "read_file" && nonempty)
+    if (name === "read_file" && nonempty && navigationUseful)
       this.progressEvidence.push(progressKey!);
-    else if (name === "search_code" && nonempty)
+    else if (name === "search_code" && searchMatched)
       this.progressEvidence.push(
         `search_code:${createHash("sha256").update(text).digest("hex")}`,
       );

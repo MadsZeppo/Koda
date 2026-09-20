@@ -11,8 +11,10 @@ import type { Subtask, Plan, EvidencePacket } from "../planner/schemas.js";
 import type { RepoProfile, VerificationResult } from "../types.js";
 import type { WorkerContext } from "../context/compiler.js";
 import { boundMessages, truncateBytes } from "../context/bounds.js";
-import { verify, verificationResult } from "../verifier/verifier.js";
+import { advisoryInfrastructureOnly, verify, verificationResult, verificationRegressed, verificationAgainstBaseline } from "../verifier/verifier.js";
 import { workerChecks, workerChecksAreTaskSpecific } from "../verifier/selection.js";
+import { recoverPostMutationChecks } from "../verifier/recovery.js";
+import type { VerificationCandidate } from "../repo/ecosystem.js";
 import { WriteScope } from "../repo/writeScope.js";
 
 import {
@@ -26,6 +28,7 @@ import { coderPrompt } from "./prompts.js";
 import type { StableImplementationHandoff } from "./stable.js";
 import type { RepairPacket } from "./repairPacket.js";
 import { STABLE_EVENTS } from "./executionEvents.js";
+import { AttemptCheckpoint } from "./attemptCheckpoint.js";
 
 export interface StablePacketOptions {
   evidence?: EvidencePacket;
@@ -50,9 +53,10 @@ const orderedTools = (names: readonly string[]) =>
 const infrastructureError = (result: VerificationResult) => {
   const failed = result.checks.find(
     (check) =>
-      check.outcome === "INFRA_FAILURE" ||
-      (check.outcome === "CHECK_UNAVAILABLE" &&
-        check.unavailable !== "unsafe_verification_command"),
+      (check.requirement ?? "required") === "required" &&
+      (check.outcome === "INFRA_FAILURE" ||
+        (check.outcome === "CHECK_UNAVAILABLE" &&
+          check.unavailable !== "unsafe_verification_command")),
   );
   return failed
     ? `${failed.command}: ${failed.unavailable ?? "verification could not execute"}`
@@ -93,10 +97,12 @@ export async function implementStablePacket(
     workerChecksAreTaskSpecific(subtask, profile, options.compiledContext)
       ? workerChecks(subtask, profile, options.compiledContext)
       : [];
-  const focusedCommands =
+  let focusedCommands =
     subtask.verificationCommands.length > 0
       ? subtask.verificationCommands
       : inferredFocused;
+  const recoveredCandidates: VerificationCandidate[] = [];
+  let recoveryAttempted = false;
 
   const selectionCommands = options.repairPacket.verificationCommands.length
     ? options.repairPacket.verificationCommands
@@ -231,7 +237,7 @@ export async function implementStablePacket(
   };
 
   const contextPaths = [
-    ...new Set(options.repairPacket.importLinks.map(([, dependency]) => dependency)),
+    ...new Set([...writeScope.paths, ...options.repairPacket.importLinks.map(([, dependency]) => dependency)]),
   ];
   const tools = new AgentTools(
     path,
@@ -243,6 +249,8 @@ export async function implementStablePacket(
     writeScope,
     contextPaths,
   );
+  let acceptedCheckpoint = await AttemptCheckpoint.capture(path, writeScope);
+  gateway.logger.log("attempt_checkpoint_created", { subtaskId: subtask.id });
 
   const lockedFiles = async () =>
     Promise.all(
@@ -348,6 +356,8 @@ export async function implementStablePacket(
           reason,
           verifiedQualityFailure,
         });
+        acceptedCheckpoint = await AttemptCheckpoint.capture(path, writeScope);
+        gateway.logger.log("attempt_checkpoint_created", { subtaskId: subtask.id, model: activeModel() });
         return true;
       } catch {
         // A configured model pool is authoritative for this run. Do not escape
@@ -356,6 +366,10 @@ export async function implementStablePacket(
       }
     }
     const moved = configuredFallback();
+    if (moved) {
+      acceptedCheckpoint = await AttemptCheckpoint.capture(path, writeScope);
+      gateway.logger.log("attempt_checkpoint_created", { subtaskId: subtask.id, model: activeModel() });
+    }
     return moved;
   };
 
@@ -364,6 +378,7 @@ export async function implementStablePacket(
     failed?: VerificationResult,
     instruction =
       "Continue from the CURRENT modified workspace. Mutate before any further verification.",
+    rejectedDiff = "",
   ) => {
     messages = [
       { role: "system", content: baseSystem },
@@ -376,6 +391,7 @@ export async function implementStablePacket(
           allowed_write_paths: writeScope.paths,
           currentLockedFiles: await lockedFiles(),
           currentDiff: truncateBytes(await currentDiff(path), gateway.config.context.maxBytes),
+          rejectedAttemptDiff: rejectedDiff,
           failedChecks: failed
             ? failed.checks.filter((check) => check.exitCode !== 0)
             : [],
@@ -387,6 +403,16 @@ export async function implementStablePacket(
   };
 
   const runFocusedVerification = async () => {
+    if (!focusedCommands.length && !selectionCommands.length && !recoveryAttempted) {
+      recoveryAttempted = true;
+      gateway.logger.log("verification_recovery_attempt", { subtaskId: subtask.id,
+        paths: writeScope.paths });
+      recoveredCandidates.push(...await recoverPostMutationChecks(path, task, writeScope.paths));
+      focusedCommands = recoveredCandidates.map((candidate) => candidate.command);
+      gateway.logger.log(focusedCommands.length ? "verification_recovery" : "verification_recovery_exhausted", {
+        subtaskId: subtask.id, commands: focusedCommands,
+      });
+    }
     if (!focusedCommands.length) return verificationResult([]);
     const result = await verify(
       path,
@@ -398,7 +424,12 @@ export async function implementStablePacket(
           ...check,
         }),
       writeScope,
-      profile.ecosystem?.projectUnits.flatMap((unit) => unit.verification),
+      [...(profile.ecosystem?.projectUnits.flatMap((unit) => unit.verification) ?? []),
+        ...recoveredCandidates].map((candidate) =>
+          subtask.verificationCommands.includes(candidate.command)
+            ? { ...candidate, requirement: "required" as const }
+            : candidate,
+        ),
     );
     const infra = infrastructureError(result);
     if (infra) {
@@ -416,6 +447,25 @@ export async function implementStablePacket(
       diffBytes: Buffer.byteLength(await currentDiff(path)),
     });
     return result;
+  };
+
+  const baselineFocused = focusedCommands.length
+    ? await verify(path, focusedCommands,
+        () => Math.min(gateway.config.commandTimeoutMs, gateway.budget.remainingMs()),
+        (check) => gateway.logger.log("stable_focused_baseline", { subtaskId: subtask.id, ...check }),
+        writeScope, profile.ecosystem?.projectUnits.flatMap((unit) => unit.verification))
+    : verificationResult([]);
+  const baselineInfra = infrastructureError(baselineFocused);
+  if (baselineInfra) throw Error(`Verification infrastructure unavailable: ${baselineInfra}`);
+  let lastFocusedFailure: VerificationResult | undefined;
+  const rejectCurrentAttempt = async (reason: string) => {
+    const rejectedDiff = truncateBytes(await currentDiff(path), gateway.config.context.maxBytes);
+    const changed = await acceptedCheckpoint.restore(path, writeScope);
+    if (changed.length) gateway.logger.log("attempt_rollback", {
+      subtaskId: subtask.id, model: activeModel(),
+      changedPaths: changed.map((change) => change.path), reason,
+    });
+    return rejectedDiff;
   };
 
   gateway.logger.log("route", { subtaskId: subtask.id, role, model: activeModel() });
@@ -445,6 +495,7 @@ export async function implementStablePacket(
         );
       } catch (error) {
         if (!canFallback(error, gateway) || gateway.config.forceModel) throw error;
+        const rejectedDiff = await rejectCurrentAttempt("provider_failure_after_mutation");
         // Provider/protocol failures are infrastructure outcomes: expose them in
         // telemetry without writing them into verified quality history.
         gateway.logger.log("model_attempt", {
@@ -467,6 +518,9 @@ export async function implementStablePacket(
         contextRecoveryConsumed = false;
         await resetToCurrentWorkspace(
           `provider_or_protocol_fallback: ${String(error)}`,
+          lastFocusedFailure,
+          "The previous model's mutation was rolled back. Implement from the clean accepted source using the rejected attempt as evidence.",
+          rejectedDiff,
         );
         turn--;
         continue;
@@ -508,15 +562,19 @@ export async function implementStablePacket(
       const afterDiff = await currentDiff(path);
       if (afterDiff === beforeDiff) {
         if (sameModelRepairUsed && !requestedContext) {
+          const rejectedDiff = await rejectCurrentAttempt("same_model_repair_no_mutation");
           const moved = await moveToFallback(
             "same-model repair produced no mutation after focused failure",
-            true,
+            !!lastFocusedFailure && verificationRegressed(baselineFocused, lastFocusedFailure),
           );
           if (!moved) throw Error("Stable mutation protocol exhausted without a diff");
           sameModelRepairUsed = false;
           noMutationTurns = 0;
           contextRecoveryConsumed = false;
-          await resetToCurrentWorkspace("same_model_repair_no_mutation_model_fallback");
+          await resetToCurrentWorkspace("same_model_repair_no_mutation_model_fallback",
+            lastFocusedFailure,
+            "The failed patch was rolled back. Implement from the clean accepted source using the rejected attempt as evidence.",
+            rejectedDiff);
           continue;
         }
         if (requestedContext) {
@@ -568,17 +626,23 @@ export async function implementStablePacket(
       contextRecoveryAvailable = false;
       contextRecoveryConsumed = false;
 
-      const focused = await runFocusedVerification();
-      if (focused.status === "VERIFIED_SUCCESS" || !focusedCommands.length) {
+      const focused = verificationAgainstBaseline(baselineFocused, await runFocusedVerification());
+      if (focused.status === "VERIFIED_SUCCESS" ||
+          advisoryInfrastructureOnly(focused) || !focusedCommands.length) {
+        if (focused.status === "VERIFIED_SUCCESS") {
+          acceptedCheckpoint = await AttemptCheckpoint.capture(path, writeScope);
+          gateway.logger.log("attempt_checkpoint_promoted", { subtaskId: subtask.id, model: activeModel() });
+        }
         gateway.logger.log(STABLE_EVENTS.readyForFinal, {
           subtaskId: subtask.id,
           diffBytes: Buffer.byteLength(afterDiff),
-          reason: "task_diff_verified",
+          reason: "focused_check_passed_final_verification_pending",
         });
         return { verification: verificationResult([]), role, evidence };
       }
 
       if (!sameModelRepairUsed) {
+        lastFocusedFailure = focused;
         sameModelRepairUsed = true;
         gateway.logger.log(STABLE_EVENTS.sameModelRepair, {
           subtaskId: subtask.id,
@@ -593,16 +657,18 @@ export async function implementStablePacket(
         continue;
       }
 
+      const rejectedDiff = await rejectCurrentAttempt("focused_verification_failed");
       const moved = await moveToFallback(
         "focused verification still failing after same-model repair",
-        true,
+        verificationRegressed(baselineFocused, focused),
       );
       if (!moved) return { verification: focused, role, evidence };
       sameModelRepairUsed = false;
       await resetToCurrentWorkspace(
         "focused_verification_failed_model_fallback",
         focused,
-        "Continue from the CURRENT modified source and diff. Do not restart from stale RepairPacket source.",
+        "The failed patch was rolled back. Implement from the clean accepted source using the rejected attempt and failed check as evidence.",
+        rejectedDiff,
       );
     }
     throw Error("Stable mutation protocol exhausted without verified completion");

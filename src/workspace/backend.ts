@@ -61,6 +61,7 @@ export interface WorkspaceBackend {
   ): Promise<void>;
   cleanupWorker(instance: WorkspaceInstance): Promise<void>;
   changes(path: string): Promise<FileChange[]>;
+  persistCandidate(output: string, integration: WorkspaceInstance): Promise<FileChange[]>;
   conflictContext(revision: WorkspaceRevision): Promise<unknown>;
   apply(
     output: string,
@@ -131,9 +132,7 @@ abstract class BaseBackend implements WorkspaceBackend {
     integration: WorkspaceInstance,
     verified: boolean,
   ): Promise<ApplyResult> {
-    const changes = await this.changes(integration.path);
-    validateChangePaths(changes);
-    await writeApplyArtifact(output, this, integration.path, changes, false);
+    const changes = await this.persistCandidate(output, integration);
     if (!verified) {
       await updateArtifact(output, { applyStatus: "not_verified" });
       return {
@@ -164,8 +163,21 @@ abstract class BaseBackend implements WorkspaceBackend {
       return { requested: true, status: "conflict", conflicts, changes };
     }
     await applyChangeFiles(integration.path, this.originalRoot, changes);
+    const applied = await snapshotTree(this.originalRoot, undefined, this.explicitlyIncluded);
+    const accepted = await this.changes(integration.path);
+    if (JSON.stringify(accepted) !== JSON.stringify(changes) || changes.some((change) => {
+      const actual = applied.files[change.path];
+      return change.type === "delete" ? !!actual :
+        !actual || actual.hash !== change.afterHash || actual.mode !== change.afterMode;
+    })) throw Error("Applied target does not match the accepted verified integration state");
     await updateArtifact(output, { applied: true, applyStatus: "applied", applyConflicts: [] });
     return { requested: true, status: "applied", conflicts: [], changes };
+  }
+  async persistCandidate(output: string, integration: WorkspaceInstance) {
+    const changes = await this.changes(integration.path);
+    validateChangePaths(changes);
+    await writeApplyArtifact(output, this, integration.path, changes, false);
+    return changes;
   }
   async conflictContext(revision: WorkspaceRevision): Promise<unknown> {
     return { incomingChanges: revision.changes };
@@ -174,6 +186,7 @@ abstract class BaseBackend implements WorkspaceBackend {
 
 class GitBackend extends BaseBackend {
   readonly mode = "git" as const;
+  private readonly worktreeBaselines = new Map<string, Snapshot>();
   private manager: Worktrees;
   private integrator?: Integrator;
   private integration?: WorkspaceInstance;
@@ -190,14 +203,25 @@ class GitBackend extends BaseBackend {
       `${this.requestedBaseCommit ?? "HEAD"}^{commit}`,
     );
     this.integration = await this.manager.create("integration", this.baseCommit);
+    this.worktreeBaselines.set(this.integration.path,
+      await snapshotTree(this.integration.path, undefined, this.explicitlyIncluded));
     this.integrator = new Integrator(this.integration.path, this.logger);
     return this.integration;
+  }
+  override async changes(path: string) {
+    return changesBetween(
+      this.worktreeBaselines.get(path) ?? this.baseline,
+      await snapshotTree(path, undefined, this.explicitlyIncluded),
+    );
   }
   async createWorker(name: string) {
     const base = await this.integrator!.exclusive(() =>
       git(this.integration!.path, "rev-parse", "HEAD"),
     );
-    return this.manager.create(name, base);
+    const worker = await this.manager.create(name, base);
+    this.worktreeBaselines.set(worker.path,
+      await snapshotTree(worker.path, undefined, this.explicitlyIncluded));
+    return worker;
   }
   async finalizeWorker(instance: WorkspaceInstance, message: string) {
     const before = await git(instance.path, "rev-parse", "HEAD");
@@ -220,6 +244,7 @@ class GitBackend extends BaseBackend {
   }
   async cleanupWorker(instance: WorkspaceInstance) {
     await this.manager.cleanup(instance.path);
+    this.worktreeBaselines.delete(instance.path);
   }
   async conflictContext(revision: WorkspaceRevision) {
     return {
@@ -353,6 +378,10 @@ async function writeApplyArtifact(
   applied: boolean,
 ) {
   const workspace = join(output, "workspace");
+  await rm(join(workspace, "before"), { recursive: true, force: true });
+  await rm(join(workspace, "after"), { recursive: true, force: true });
+  await mkdir(join(workspace, "before"), { recursive: true });
+  await mkdir(join(workspace, "after"), { recursive: true });
   for (const change of changes) {
     if (change.type !== "create") {
       const target = join(workspace, "before", change.path);
@@ -366,6 +395,33 @@ async function writeApplyArtifact(
     }
   }
   await mkdir(output, { recursive: true });
+  if (changes.length) {
+    const baseline = await realpath(join(workspace, "before"));
+    const candidate = await realpath(join(workspace, "after"));
+    const diff = await execa(
+      "git",
+      [
+        "diff",
+        "--no-index",
+        "--binary",
+        "--no-renames",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "--",
+        baseline,
+        candidate,
+      ],
+      { reject: false, maxBuffer: 16 * 1024 * 1024 },
+    );
+    if (diff.exitCode !== 0 && diff.exitCode !== 1)
+      throw Error(`Candidate patch generation failed: ${diff.stderr}`);
+    const normalized = diff.stdout
+      .replaceAll(`a${baseline}/`, "a/")
+      .replaceAll(`b${candidate}/`, "b/")
+      .replaceAll(`a/${baseline.replace(/^\//, "")}/`, "a/")
+      .replaceAll(`b/${candidate.replace(/^\//, "")}/`, "b/");
+    await writeFile(join(output, "candidate.patch"), normalized + (normalized.endsWith("\n") ? "" : "\n"));
+  }
   await writeFile(
     join(output, "workspace.json"),
     JSON.stringify(
@@ -376,6 +432,9 @@ async function writeApplyArtifact(
         originalRoot: backend.originalRoot,
         baselineStats: backend.stats,
         changes,
+        candidateProduced: changes.length > 0,
+        candidatePatchPath: changes.length ? join(output, "candidate.patch") : null,
+        candidateChangedFiles: changes.map((change) => change.path),
         applied,
         applyRequested: backend.applyRequested,
         applyStatus: backend.applyRequested ? "pending" : "preview",

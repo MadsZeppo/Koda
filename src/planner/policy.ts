@@ -12,6 +12,7 @@ import {
 import { planSchema, type Plan } from "./schemas.js";
 import { validateDag } from "../orchestrator/dag.js";
 import { normalizePlan } from "../orchestrator/coalesce.js";
+import { unambiguousRepoPath } from "../repo/navigation.js";
 export type PlannerComplexity = "trivial" | "standard" | "complex";
 export interface PlanningFile {
   path: string;
@@ -34,6 +35,72 @@ export function validatePlanningCandidate(raw: unknown): Plan {
       throw Error("Planner did not establish executable write responsibility");
   }
   return plan; // The runtime retains its normal normalization/coalescing telemetry.
+}
+const testEditRequested = (task: string) =>
+  /\b(?:add|write|create)\b.{0,35}\b(?:tests?|specs?|regression)\b|\b(?:modify|update|change|edit)\b.{0,35}\b(?:tests?|specs?)\b/i.test(task);
+
+/** Reconcile model-supplied ownership with the actual repository before execution. */
+export async function reconcilePlannedPaths(plan: Plan, task: string, profile: RepoProfile): Promise<Plan> {
+  const known = new Set(profile.files);
+  const allowTestWrites = testEditRequested(task);
+  const removed = new Map<string, string[]>();
+  const kept = plan.subtasks.filter((subtask) => {
+    if (allowTestWrites || subtask.readOnly === true ||
+        !subtask.likelyWritePaths.length || !subtask.likelyWritePaths.every(isTestPath)) return true;
+    removed.set(subtask.id, subtask.dependsOn);
+    return false;
+  });
+  const expand = (id: string): string[] => removed.has(id)
+    ? removed.get(id)!.flatMap(expand) : [id];
+  for (const subtask of kept) {
+    subtask.dependsOn = [...new Set(subtask.dependsOn.flatMap(expand))];
+    if (!allowTestWrites && subtask.readOnly !== true)
+      subtask.likelyWritePaths = subtask.likelyWritePaths.filter((path) => !isTestPath(path));
+    const rewrite = (oldPath: string, actual: string) => {
+      for (const field of ["title", "objective", "integrationContract"] as const)
+        subtask[field] = subtask[field].replaceAll(oldPath, actual);
+    };
+    const resolvedWrites: string[] = [];
+    for (const path of subtask.likelyWritePaths) {
+      const actual = known.has(path) ? path : unambiguousRepoPath(path, profile.files);
+      if (actual) {
+        const stat = await lstat(await safePath(profile.root, actual));
+        if (!stat.isFile() || stat.nlink > 1) throw Error(`Unsafe planned write path: ${actual}`);
+        if (path !== actual) rewrite(path, actual);
+        resolvedWrites.push(actual);
+        continue;
+      }
+      const explicitCreation = task.includes(path) && /\b(?:add|create|implement|introduce)\b/i.test(task);
+      const supportedTestCreation = allowTestWrites && isTestPath(path);
+      if (!explicitCreation && !supportedTestCreation)
+        throw Error(`Planned write path does not exist and has no unambiguous repository match: ${path}`);
+      const parent = await lstat(posix.dirname(path) === "."
+        ? profile.root : await safePath(profile.root, posix.dirname(path)));
+      if (!parent.isDirectory()) throw Error(`Planned write parent does not exist: ${path}`);
+      resolvedWrites.push(path);
+    }
+    subtask.likelyWritePaths = [...new Set(resolvedWrites)];
+    const reads: string[] = [];
+    for (const path of subtask.likelyReadPaths) {
+      const actual = known.has(path) ? path : unambiguousRepoPath(path, profile.files);
+      if (actual) {
+        const stat = await lstat(await safePath(profile.root, actual));
+        if (!stat.isFile() || stat.nlink > 1) throw Error(`Unsafe planned read path: ${actual}`);
+        if (path !== actual) rewrite(path, actual);
+        reads.push(actual);
+      } else {
+        try {
+          const stat = await lstat(await safePath(profile.root, path));
+          if (stat.isDirectory()) { reads.push(path); continue; }
+        } catch {}
+        // Read hints are advisory; discard nonexistent paths and name the
+        // uncertainty so the coder does not repeatedly request them.
+        subtask.objective = subtask.objective.replaceAll(path, "existing repository files");
+      }
+    }
+    subtask.likelyReadPaths = [...new Set(reads)];
+  }
+  return validatePlanningCandidate({ ...plan, subtasks: kept });
 }
 const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const mentioned = (s: string, alias: string) =>

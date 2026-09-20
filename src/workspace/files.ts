@@ -6,11 +6,13 @@ import {
   mkdir,
   readFile,
   readdir,
+  readlink,
   realpath,
   rename,
   rm,
+  symlink,
 } from "node:fs/promises";
-import { dirname, join, posix, resolve } from "node:path";
+import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import { generatedPath } from "../repo/ecosystem.js";
 import { execa } from "execa";
 
@@ -18,6 +20,7 @@ export interface FileRecord {
   hash: string;
   mode: number;
   size: number;
+  linkTarget?: string;
 }
 export interface Snapshot {
   files: Record<string, FileRecord>;
@@ -86,13 +89,33 @@ const safeRelative = (path: string) =>
 const hash = (value: Buffer) =>
   createHash("sha256").update(value).digest("hex");
 
-/** Bounded, deterministic traversal. Unsafe links are rejected, never followed. */
+const pathWithin = (root: string, target: string) => {
+  const candidate = relative(root, target);
+  return (
+    candidate === "" ||
+    (!isAbsolute(candidate) &&
+      candidate !== ".." &&
+      !candidate.startsWith(`..${sep}`))
+  );
+};
+
+const pointsIntoGit = (root: string, target: string) => {
+  const candidate = relative(root, target).split(sep).join("/");
+  return candidate === ".git" || candidate.startsWith(".git/");
+};
+
+/**
+ * Bounded, deterministic traversal.
+ * Relative symlinks are accepted only when both their lexical and canonical
+ * targets remain inside the repository. Symlinks are recorded, never traversed.
+ */
 export async function snapshotTree(
   root: string,
   limits = defaultSnapshotLimits,
   explicitlyIncluded: ReadonlySet<string> = new Set(),
 ): Promise<Snapshot> {
   root = resolve(root);
+  const canonicalRoot = await realpath(root);
   const files: Record<string, FileRecord> = {};
   const includedRoots = generatedRoots(explicitlyIncluded);
   let fileCount = 0,
@@ -105,8 +128,57 @@ export async function snapshotTree(
       if (alwaysExcluded(path, includedRoots)) continue;
       const full = join(root, path);
       const stat = await lstat(full);
-      if (stat.isSymbolicLink())
-        throw Error(`Unsafe workspace topology: symlink ${path}`);
+      if (stat.isSymbolicLink()) {
+        let linkTarget: string;
+        try {
+          linkTarget = await readlink(full);
+        } catch {
+          throw Error(`Unsafe workspace topology: symlink ${path}`);
+        }
+
+        const lexicalTarget = resolve(dirname(full), linkTarget);
+        if (
+          isAbsolute(linkTarget) ||
+          !pathWithin(root, lexicalTarget) ||
+          pointsIntoGit(root, lexicalTarget)
+        ) {
+          throw Error(`Unsafe workspace topology: symlink ${path}`);
+        }
+
+        let canonicalTarget: string;
+        try {
+          canonicalTarget = await realpath(full);
+        } catch {
+          // Broken links and symlink loops are unsafe.
+          throw Error(`Unsafe workspace topology: symlink ${path}`);
+        }
+
+        if (
+          !pathWithin(canonicalRoot, canonicalTarget) ||
+          pointsIntoGit(canonicalRoot, canonicalTarget)
+        ) {
+          throw Error(`Unsafe workspace topology: symlink ${path}`);
+        }
+
+        const linkSize = Buffer.byteLength(linkTarget);
+        if (linkSize > limits.maxFileBytes)
+          throw Error(`Workspace snapshot limit exceeded: file_size path=${path}`);
+
+        fileCount++;
+        totalBytes += linkSize;
+        if (fileCount > limits.maxFiles)
+          throw Error("Workspace snapshot limit exceeded: file_count");
+        if (totalBytes > limits.maxTotalBytes)
+          throw Error("Workspace snapshot limit exceeded: total_bytes");
+
+        files[path] = {
+          hash: hash(Buffer.from(linkTarget)),
+          mode: stat.mode & 0o777,
+          size: linkSize,
+          linkTarget,
+        };
+        continue;
+      }
       if (stat.isDirectory()) {
         await visit(path);
         continue;
@@ -153,7 +225,13 @@ export function changesBetween(before: Snapshot, after: Snapshot): FileChange[] 
         return [
           { type: "delete", path, beforeHash: a.hash, beforeMode: a.mode },
         ];
-      if (a && b && (a.hash !== b.hash || a.mode !== b.mode))
+      if (
+        a &&
+        b &&
+        (a.hash !== b.hash ||
+          a.mode !== b.mode ||
+          a.linkTarget !== b.linkTarget)
+      )
         return [
           {
             type: "modify",
@@ -183,6 +261,13 @@ export async function copySnapshot(
   for (const [path, entry] of Object.entries(snapshot.files)) {
     const destination = join(target, path);
     await mkdir(dirname(destination), { recursive: true });
+    if (entry.linkTarget !== undefined) {
+      const currentTarget = await readlink(join(source, path));
+      if (currentTarget !== entry.linkTarget)
+        throw Error("Workspace changed while its snapshot was being copied");
+      await symlink(entry.linkTarget, destination);
+      continue;
+    }
     await copyFile(join(source, path), destination);
     await chmod(destination, entry.mode);
   }
@@ -208,11 +293,15 @@ export async function applyChangeFiles(
       continue;
     }
     await mkdir(dirname(destination), { recursive: true });
+    const sourcePath = join(source, change.path);
+    const sourceStat = await lstat(sourcePath);
+    if (sourceStat.isSymbolicLink())
+      throw Error(`Unsafe workspace mutation: symlink ${change.path}`);
     const temporary = join(
       dirname(destination),
       `.koda-${randomUUID()}.tmp`,
     );
-    await copyFile(join(source, change.path), temporary);
+    await copyFile(sourcePath, temporary);
     await chmod(temporary, change.afterMode ?? 0o644);
     await rename(temporary, destination);
   }
