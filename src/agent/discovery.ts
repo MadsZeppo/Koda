@@ -210,7 +210,7 @@ export async function discover(
       model,
       boundMessages(messages, gateway.config.context.maxPromptBytes),
       subtask.id,
-      "discover",
+      "finalize",
       2,
       undefined,
       { maxOutputTokens: 1200, timeoutMs: Math.min(15000, deadline - Date.now()) },

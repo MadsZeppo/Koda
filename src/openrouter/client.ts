@@ -18,6 +18,11 @@ export interface CodingRoute {
   reason: string;
   attempt: number;
 }
+export type ModelDeadlineClass = "inspection" | "planning" | "implementation" | "finalization";
+export const modelDeadlineClass = (stage: string): ModelDeadlineClass =>
+  /final/i.test(stage) ? "finalization"
+    : /^(?:inspect|discover|read)/i.test(stage) ? "inspection"
+      : /^(?:plan|decompose)/i.test(stage) ? "planning" : "implementation";
 const transientStatus = (status?: number) =>
   status === 408 ||
   status === 409 ||
@@ -39,6 +44,10 @@ export function isRouteEndpointIncompatibility(error: unknown) {
 }
 export class Gateway {
   private sdk: OpenAI;
+  private readonly phaseSpent = { discovery: 0, planning: 0 };
+  private readonly phaseReserved = { discovery: 0, planning: 0 };
+  private readonly phaseTokens = { discovery: 0, planning: 0 };
+  private readonly phaseReservedTokens = { discovery: 0, planning: 0 };
   readonly modelRouter?: PoolRouter;
   constructor(
     readonly config: Config,
@@ -52,7 +61,7 @@ export class Gateway {
         ? process.env.OPENROUTER_API_KEY : process.env.KODA_MODEL_API_KEY) || "missing",
       baseURL: config.baseUrl,
       maxRetries: 0,
-      timeout: 120000,
+      timeout: Math.max(...Object.values(config.modelTimeoutMs)),
     });
   }
   async call(
@@ -69,6 +78,8 @@ export class Gateway {
       codingRoute?: CodingRoute;
     },
   ) {
+    const deadlineClass = modelDeadlineClass(stage);
+    const configuredTimeout = this.config.modelTimeoutMs[deadlineClass];
     const maxOutputTokens = Math.min(
       limits?.maxOutputTokens ?? this.config.maxOutputTokens,
       this.config.maxOutputTokens,
@@ -76,9 +87,9 @@ export class Gateway {
     if (!Number.isInteger(maxOutputTokens) || maxOutputTokens <= 0)
       throw Error("Invalid output token limit");
     const timeoutMs = Math.min(
-      limits?.timeoutMs ?? 120000,
-      120000,
-      this.budget.remainingMs(),
+      limits?.timeoutMs ?? configuredTimeout,
+      configuredTimeout,
+      this.budget.remainingMs() - this.config.phaseBudget.verificationReserveMs,
     );
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0)
       throw Error("Invalid model timeout");
@@ -160,12 +171,47 @@ export class Gateway {
           (fingerprint?.primary ? `${fingerprint.primary}_${fingerprint.scope}` : "general"),
         modelRequested: model, modelServed: served, provider: providerName,
         wallClockMs, outcome, costUsd,
+        classification: outcome === "error" ? "OPERATIONAL_FAILURE" : undefined,
       });
     };
     const estimated =
       (tokenBound * promptPrice) / 1e6 +
       (maxOutputTokens * completionPrice) / 1e6;
-    const release = this.budget.reserve(estimated, reserveTokens);
+    const phase = deadlineClass === "planning" ? "planning"
+      : deadlineClass === "inspection" || deadlineClass === "finalization" ? "discovery" : undefined;
+    if (phase) {
+      const fraction = phase === "planning" ? this.config.phaseBudget.planningMaxFraction
+        : this.config.phaseBudget.discoveryMaxFraction;
+      if (this.phaseSpent[phase] + this.phaseReserved[phase] + estimated > this.budget.usd * fraction)
+        throw Error(`${phase} phase budget exhausted`);
+      if (this.phaseTokens[phase] + this.phaseReservedTokens[phase] + reserveTokens >
+          this.budget.maxTokens * fraction)
+        throw Error(`${phase} phase token budget exhausted`);
+      const reserve = this.config.phaseBudget.implementationReserveFraction;
+      if (estimated > this.budget.availableUsd(reserve) || reserveTokens > this.budget.availableTokens(reserve))
+        throw Error(`${phase} cannot consume implementation reserve`);
+      this.phaseReserved[phase] += estimated;
+      this.phaseReservedTokens[phase] += reserveTokens;
+    }
+    let release: ReturnType<Budget["reserve"]>;
+    try {
+      release = this.budget.reserve(estimated, reserveTokens);
+    } catch (error) {
+      if (phase) {
+        this.phaseReserved[phase] -= estimated;
+        this.phaseReservedTokens[phase] -= reserveTokens;
+      }
+      throw error;
+    }
+    let phaseReleased = false;
+    const releasePhase = (costUsd?: number | null, tokens = 0) => {
+      if (!phase || phaseReleased) return;
+      phaseReleased = true;
+      this.phaseReserved[phase] -= estimated;
+      this.phaseReservedTokens[phase] -= reserveTokens;
+      if (costUsd !== undefined && costUsd !== null) this.phaseSpent[phase] += costUsd;
+      this.phaseTokens[phase] += tokens;
+    };
     const start = Date.now();
     let responseLogged = false;
     try {
@@ -199,6 +245,7 @@ export class Gateway {
       );
       const usage = parseUsage(response.usage);
       release(usage);
+      releasePhase(usage.costUsd, usage.promptTokens + usage.completionTokens);
       this.logger.log("model_call", {
         subtaskId,
         stage,
@@ -278,6 +325,7 @@ export class Gateway {
       const transient = !responseLogged && isTransientProviderError(e);
       if (rejected || transient) release(parseUsage({ cost: 0 }));
       else release();
+      releasePhase(rejected || transient ? 0 : null);
       if (!responseLogged)
         this.logger.log("model_call", {
           subtaskId,
@@ -303,6 +351,7 @@ export class Gateway {
           ...parseUsage(rejected || transient ? { cost: 0 } : undefined),
           attempt,
           outcome: "error",
+          classification: "OPERATIONAL_FAILURE",
           error: String(e),
         });
       if (!responseLogged) operation("error", null, null, Date.now() - start,
@@ -320,9 +369,22 @@ export class Gateway {
         attempt,
         wallClockMs: Date.now() - start,
         error: String(e),
+        classification: "OPERATIONAL_FAILURE",
       });
       throw e;
     }
+  }
+  availableUsd(stage: string) {
+    const deadlineClass = modelDeadlineClass(stage);
+    return deadlineClass === "implementation"
+      ? this.budget.remainingUsd()
+      : this.budget.availableUsd(this.config.phaseBudget.implementationReserveFraction);
+  }
+  availableTokens(stage: string) {
+    const deadlineClass = modelDeadlineClass(stage);
+    return deadlineClass === "implementation"
+      ? this.budget.remainingTokens()
+      : this.budget.availableTokens(this.config.phaseBudget.implementationReserveFraction);
   }
 }
 

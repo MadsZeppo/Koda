@@ -11,6 +11,21 @@ const schema = z.object({
   maxIterations: z.number().int().positive().default(18),
   maxMinutes: z.number().positive().default(20),
   commandTimeoutMs: z.number().positive().default(120000),
+  modelTimeoutMs: z.object({
+    inspection: z.number().positive().default(18000),
+    planning: z.number().positive().default(30000),
+    implementation: z.number().positive().default(45000),
+    finalization: z.number().positive().default(12000),
+  }).default({}),
+  phaseBudget: z.object({
+    discoveryMaxFraction: z.number().positive().max(1).default(0.25),
+    planningMaxFraction: z.number().positive().max(1).default(0.25),
+    implementationReserveFraction: z.number().min(0).max(1).default(0.5),
+    verificationReserveMs: z.number().nonnegative().default(15000),
+  }).refine((value) =>
+    value.discoveryMaxFraction + value.implementationReserveFraction <= 1 &&
+    value.planningMaxFraction + value.implementationReserveFraction <= 1,
+  "Inspection/planning caps must preserve the implementation reserve").default({}),
   maxOutputTokens: z.number().int().positive().default(4096),
   maxInputPrice: z.number().positive().default(20),
   maxOutputPrice: z.number().positive().default(100),

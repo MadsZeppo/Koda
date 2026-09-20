@@ -143,8 +143,8 @@ Maximum four tasks. Preserve real dependencies. Combine same-file fixes; declare
             phase,
             excluded,
             Buffer.byteLength(JSON.stringify({ messages })) + 256,
-            gateway.budget.remainingUsd(),
-            gateway.budget.remainingTokens(),
+            gateway.availableUsd("plan"),
+            gateway.availableTokens("plan"),
           )
         : undefined;
       const model = selected?.id ?? legacy[attempt];

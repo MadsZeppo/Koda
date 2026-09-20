@@ -85,6 +85,47 @@ test("baseline comparison uses stable pytest test identities instead of volatile
     "VERIFIED_SUCCESS");
   assert.equal(verificationRegressed(baseline, regression), true);
 });
+
+test("Django repository stays Python-primary despite incidental JavaScript tooling", async () => {
+  const f = await fixture({
+    "pyproject.toml": "[project]\nname='service'\ndependencies=['django','pytest','pytest-django']\n[tool.pytest.ini_options]\nDJANGO_SETTINGS_MODULE='service.settings'\n",
+    "manage.py": "import django\n",
+    "service/settings.py": "INSTALLED_APPS = []\n",
+    "service/views.py": "def health(request): return None\n",
+    "tests/test_views.py": "def test_health(): assert True\n",
+    "package.json": pkg({ format: "prettier --check static" }, { devDependencies: { prettier: "1" } }),
+    "scripts/theme.js": "export const theme = {};\n",
+  });
+  try {
+    const profile = await f.profile();
+    assert.equal(profile.ecosystem!.ecosystem, "python");
+    assert.ok(profile.ecosystem!.languages.includes("python"));
+    assert.ok(profile.ecosystem!.languages.includes("javascript"));
+    assert.ok(profile.ecosystem!.frameworks.includes("django"));
+    assert.ok(profile.ecosystem!.projectUnits[0]!.testRunners.includes("pytest"));
+    assert.ok(profile.verificationCommands.some((command) => /pytest/.test(command)));
+  } finally { await f.close(); }
+});
+
+test("separate Python and JavaScript project roots remain intentionally mixed", async () => {
+  const f = await fixture({
+    "pyproject.toml": "[project]\nname='backend'\ndependencies=['pytest']\n[tool.pytest.ini_options]\n",
+    "backend/api.py": "def api(): return 1\n",
+    "tests/test_api.py": "def test_api(): assert True\n",
+    "web/package.json": pkg({ test: "node --test" }, { dependencies: { react: "1" } }),
+    "web/package-lock.json": "{}",
+    "web/src/app.js": "export const app = true;\n",
+    "web/src/app.test.js": "import {test} from 'node:test';\n",
+  });
+  try {
+    const profile = await f.profile();
+    assert.equal(profile.ecosystem!.ecosystem, "python");
+    assert.deepEqual(profile.ecosystem!.projectUnits.map((unit) => [unit.root, unit.ecosystem]),
+      [[".", "python"], ["web", "javascript"]]);
+    assert.deepEqual(profile.ecosystem!.languages.sort(), ["javascript", "python"]);
+    assert.equal(profile.ecosystem!.monorepo, true);
+  } finally { await f.close(); }
+});
 for (const scenario of [
   {
     name: "pnpm Next TypeScript",

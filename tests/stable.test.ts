@@ -116,17 +116,56 @@ test("Stable inspection uses the universal selector when local scope remains amb
       select: async () => { throw Error("legacy Stable selection must not run"); },
     };
     (gateway as any).call = async (model: string) => {
+      modelCalls++;
       assert.equal(model, "qualified-worker");
       return { role: "assistant", content: null, tool_calls: [{ id: "no-scope", type: "function",
         function: { name: "report_no_scope", arguments: JSON.stringify({ reason: "The relevant implementation is ambiguous" }) } }] };
     };
     const objective = "Inspect the two local implementations and fix the specific bug";
+    let modelCalls = 0;
     const work: Subtask = { id: "stable", title: objective, objective, dependsOn: [],
       likelyReadPaths: ["src/first.js", "src/second.js"], likelyWritePaths: [], readOnly: true,
       integrationContract: "", verificationCommands: [], estimatedDifficulty: "normal", parallelSafe: false };
     await assert.rejects(prepareStableWorker(gateway, root, objective, work,
       await profileRepo(root), { files: [], repoMap: [], localDependencies: [] }), /no actionable scope/i);
     assert.equal(specialistCalls, 1);
+    assert.equal(modelCalls, 1, "the no-scope fallback is bounded to one attempt");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("an initial empty mutation scope gets one bounded deterministic fallback", async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-stable-actionable-fallback-"));
+  try {
+    await mkdir(join(root, "src"));
+    await writeFile(join(root, "src/target.ts"), "export const target = 1;\n");
+    await git(root, "init", "-q");
+    await git(root, "config", "user.name", "Scope Fallback Test");
+    await git(root, "config", "user.email", "scope-fallback@test.local");
+    await git(root, "add", ".");
+    await git(root, "commit", "-qm", "baseline");
+    const logger = new Logger(join(root, ".git", "fallback-log"), "scope-fallback", true);
+    const gateway = new Gateway(await config(undefined, { models: {} }), logger,
+      new Budget(1, 100000, 60000));
+    let calls = 0;
+    (gateway as any).call = async () => {
+      calls++;
+      return { role: "assistant", content: null, tool_calls: [{ id: "none", type: "function",
+        function: { name: "report_no_scope", arguments: JSON.stringify({
+          reason: "The initial inspection did not identify an actionable file",
+        }) } }] };
+    };
+    const objective = "Inspect and fix src/target.ts, then verify the behavior";
+    const work: Subtask = { id: "stable", title: objective, objective, dependsOn: [],
+      likelyReadPaths: ["src/target.ts"], likelyWritePaths: [], readOnly: true,
+      integrationContract: "Fix the named implementation", verificationCommands: [],
+      estimatedDifficulty: "normal", parallelSafe: false };
+    const prepared = await prepareStableWorker(gateway, root, objective, work,
+      await profileRepo(root), { files: [{ path: "src/target.ts", snippet: "export const target = 1;" }],
+        repoMap: ["src/target.ts"], localDependencies: [] });
+    assert.deepEqual(prepared.writePaths, ["src/target.ts"]);
+    assert.equal(calls, 1);
+    assert.equal(logger.events.filter((event) =>
+      event.type === "stable_actionable_scope_fallback").length, 1);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -579,7 +618,7 @@ test("non-actionable stable inspection stops before coding", async () => {
       /no actionable scope/,
     );
     assert.equal(fixture.calls.length, 2);
-    assert.ok(fixture.calls.every((call) => call.stage === "inspect"));
+    assert.deepEqual(fixture.calls.map((call) => call.stage), ["inspect", "finalize"]);
     assert.ok(fixture.calls.every((call) => call.tools));
   } finally {
     await rm(fixture.root, { recursive: true, force: true });

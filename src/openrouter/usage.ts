@@ -59,4 +59,10 @@ export class Budget {
   remainingTokens() {
     return Math.max(0, this.maxTokens - this.tokens - this.reservedTokens);
   }
+  availableUsd(reserveFraction = 0) {
+    return Math.max(0, this.remainingUsd() - this.usd * reserveFraction);
+  }
+  availableTokens(reserveFraction = 0) {
+    return Math.max(0, this.remainingTokens() - this.maxTokens * reserveFraction);
+  }
 }

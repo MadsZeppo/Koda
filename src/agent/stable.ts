@@ -284,7 +284,7 @@ export async function prepareStableWorker(
     !gateway.config.forceModel;
   const specialistCascade = universalSelection
     ? await pool!.selectSpecialist(fingerprint, features, subtask.id,
-        gateway.budget.remainingUsd())
+        gateway.availableUsd("inspect"))
     : [];
   if (universalSelection && !specialistCascade.length)
     throw Error("No discovered model has sufficient priced capability and quality evidence for Stable inspection");
@@ -437,7 +437,7 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
 
           subtask.id,
 
-          "inspect",
+          finalization ? "finalize" : "inspect",
 
           iteration,
 
@@ -528,6 +528,8 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
   const known = new Set(profile.files);
   const inspected = new Set<string>();
   const searchHits = new Set<string>();
+  const fallbackAnchors = new Set<string>();
+  let actionableFallbackUsed = false;
   const significantTerms = (task.toLowerCase().match(/[a-z]{3,}/g) ?? [])
     .filter((term) => !/^(?:the|and|for|that|with|when|from|new|add|keep|about|after|before|check|files|small|tests|there|these|using|would|write|focus|focused|change|changes|issue|implementation|regression|please|should)$/.test(term));
   const explicitlyNamed = (file: string) =>
@@ -553,6 +555,7 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
   };
   const trustedSources = () => {
     const trusted = new Set(profile.files.filter((file) => !isTestPath(file) && explicitlyNamed(file)));
+    for (const file of fallbackAnchors) trusted.add(file);
     for (const file of inspected) {
       if (!isTestPath(file) && known.has(file) && sourceRelevant(file)) trusted.add(file);
     }
@@ -602,6 +605,7 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
     const discoveryObjective = /\b(?:inspect|discover|find|investigate|trace)\b/i.test(task);
     const concrete = new Set([
       ...searchHits,
+      ...fallbackAnchors,
       ...[...inspected].filter((file) => strongReadEvidence(file) ||
         (!discoveryObjective && explicitlyNamed(file))),
     ]);
@@ -780,6 +784,27 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
         if (parsed.success) {
           if ((await currentDiff(path)) !== before)
             throw Error("Stable read-only inspection mutated the workspace");
+          if (allowRepositoryTools && !actionableFallbackUsed) {
+            actionableFallbackUsed = true;
+            const sources = subtask.likelyReadPaths
+              .filter((file) => known.has(file) && isSourcePath(file) && !isTestPath(file));
+            const explicit = sources.filter((file) => task.includes(file));
+            const candidates = explicit.length === 1 ? explicit : sources.length === 1 ? sources : [];
+            if (candidates.length === 1) {
+              const file = candidates[0]!;
+              const content = await tools.execute("read_file", {
+                path: file, startLine: 1, endLine: 240,
+              });
+              inspected.add(file);
+              inspectedText.set(file, `${inspectedText.get(file) ?? ""}\n${content}`);
+              fallbackAnchors.add(file);
+              gateway.logger.log("stable_actionable_scope_fallback", {
+                subtaskId: subtask.id, reason: parsed.data.reason, file, attempt: 1,
+              });
+              const fallback = await evidenceFallback(`Initial inspection reported no scope: ${parsed.data.reason}`);
+              if (fallback) return fallback;
+            }
+          }
           if (!allowRepositoryTools) {
             const fallback = await evidenceFallback(`Finalizer reported no scope: ${parsed.data.reason}`);
             if (fallback) return fallback;

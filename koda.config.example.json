@@ -5,6 +5,18 @@
   "maxIterations": 18,
   "maxMinutes": 20,
   "commandTimeoutMs": 120000,
+  "modelTimeoutMs": {
+    "inspection": 18000,
+    "planning": 30000,
+    "implementation": 45000,
+    "finalization": 12000
+  },
+  "phaseBudget": {
+    "discoveryMaxFraction": 0.25,
+    "planningMaxFraction": 0.25,
+    "implementationReserveFraction": 0.5,
+    "verificationReserveMs": 15000
+  },
   "maxOutputTokens": 4096,
   "maxInputPrice": 20,
   "maxOutputPrice": 100,

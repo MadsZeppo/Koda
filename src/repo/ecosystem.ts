@@ -312,12 +312,24 @@ export async function detectEcosystem(
       !langs.includes("typescript")
     )
       langs.push("typescript");
+    const pythonSources = local.filter((f) => /\.py$/.test(f)).length;
+    const javascriptSources = local.filter((f) => /\.[cm]?[jt]sx?$/.test(f)).length;
+    const pythonApplication = hasPy && pythonSources > 0;
+    const javascriptApplication = hasJS && javascriptSources > 0 &&
+      (Object.keys(pkg.scripts ?? {}).length > 0 ||
+        Object.keys(pkg.dependencies ?? {}).length > 0 ||
+        Object.keys(pkg.devDependencies ?? {}).length > 0 ||
+        own.some((f) => /(?:^|\/)(?:ts|js)config(?:\.[^/]+)?\.json$/.test(f)));
     const ecosystem: Ecosystem =
-      hasJS ||
-      own.some((f) => /(?:^|\/)(?:ts|js)config(?:\.[^/]+)?\.json$/.test(f))
-        ? "javascript"
-        : hasPy
+      pythonApplication && (!javascriptApplication || pythonSources > javascriptSources * 2)
           ? "python"
+        : javascriptApplication ||
+          own.some((f) => /(?:^|\/)(?:ts|js)config(?:\.[^/]+)?\.json$/.test(f))
+          ? "javascript"
+          : hasJS
+            ? "javascript"
+          : hasPy
+            ? "python"
           : langs.includes("python")
             ? "python"
             : local.some(
@@ -363,7 +375,7 @@ export async function detectEcosystem(
         requiresInstalledDependencies: !/^node\s/.test(cmd),
       });
     };
-    if (ecosystem === "javascript") {
+    if (ecosystem === "javascript" || hasJS) {
       unit.packageName = pkg.name;
       unit.scripts = Object.fromEntries(
         Object.entries(pkg.scripts ?? {}).filter(
