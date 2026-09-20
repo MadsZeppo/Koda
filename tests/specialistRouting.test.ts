@@ -318,11 +318,11 @@ test("backend complexity, quality parity, unknown pricing and provider-independe
   assert.equal(route(simple.fingerprint, simple.features, [], [unpriced, strong]).cascade[0]?.model.id, strong.model.id);
 });
 
-test("strong focused verification can justify a cheaper first attempt; weak UI verification cannot", () => {
+test("strong focused verification can bridge a quality gap too large for weak UI checks", () => {
   assert.equal(scenario("Polish React layout", undefined, ["pnpm run typecheck"]).fingerprint.verificationStrength, "weak");
   const s = scenario("Change React layout", undefined, ["node --test tests/dashboard.test.ts"]);
   const lessCertainCheap = { ...cheap,
-    model: { ...cheap.model, qualityPrior: 0.91 },
+    model: { ...cheap.model, qualityPrior: 0.89 },
     evidence: [{ source: "design_benchmark" as const, value: 1200, detail: "design" }] };
   s.fingerprint.verificationStrength = "strong";
   const strongRoute = route(s.fingerprint, s.features, [], [lessCertainCheap, strong]);
@@ -449,7 +449,53 @@ test("parallel PLANNED coding subtasks choose independently and report reference
     assert.equal(routes[1].reference_model, strong.model.id);
     assert.equal(typeof routes[0].candidates[0].quality_gap, "number");
     assert.equal(typeof routes[0].candidates[0].uncertainty, "number");
+    for (const event of routes) {
+      assert.deepEqual(event.selected_plan.models, event.fallback_chain);
+      assert.equal(event.selected_model, event.selected_plan.models[0]);
+      assert.equal(event.expected_standalone_success, event.selected_plan.expectedStandaloneSuccess);
+      assert.equal(event.expected_final_success, event.selected_plan.expectedFinalSuccess);
+      assert.equal(event.expected_completion_cost_usd, event.selected_plan.expectedCompletionCost);
+      assert.equal(event.expected_completion_latency_ms, event.selected_plan.expectedCompletionLatencyMs);
+      assert.equal(event.quality_gap, event.selected_plan.qualityGap);
+      assert.ok(event.plans.every((plan: any) => typeof plan.reason === "string"));
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("race reservations select complete plans without silently removing their rescue", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "koda-race-plans-"));
+  try {
+    const logger = new Logger(dir, "race-plans", true);
+    const middle = { ...cheap, model: { ...cheap.model, id: "middle", qualityPrior: 0.94 },
+      metadata: { ...cheap.metadata, inputPrice: 1, outputPrice: 2 } };
+    const pool = new PoolRouter({ ...settings, baseUrl: "http://127.0.0.1:1",
+      modelPool: { models: [cheap.model, middle.model, strong.model] },
+      routing: { ...settings.routing, stateDirectory: dir } } as any, logger);
+    (pool.capabilities as any).forTask = async () => [cheap, middle, strong];
+    const task = scenario("Fix backend endpoint", ["src/api.ts"], ["node --test tests/api.test.ts"]);
+    const choices = await Promise.all(["first", "second"].map((id) =>
+      pool.selectSpecialist(task.fingerprint, task.features, id, 10, "race")));
+    assert.notEqual(choices[0]![0]!.model.id, choices[1]![0]!.model.id);
+    const routes = logger.events.filter((event) => event.type === "specialist_route");
+    for (const [index, event] of routes.entries()) {
+      assert.deepEqual(event.selected_plan.models, choices[index]!.map((candidate) => candidate.model.id));
+      assert.deepEqual(event.selected_plan.models, event.fallback_chain);
+    }
+    assert.equal(routes[0]!.reference_model, routes[1]!.reference_model);
+    assert.ok(routes[1]!.plans.some((plan: any) => plan.reason === "already reserved for race"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Stable plans exclude tools-only models that cannot force the required tool call", () => {
+  const task = scenario("Fix backend endpoint", ["src/api.ts"], ["node --test tests/api.test.ts"], "stable");
+  const compatible = { ...strong, metadata: { ...strong.metadata, supportedParameters: ["tools", "tool_choice"] } };
+  for (const toolsRequired of [true, false]) {
+    const result = route({ ...task.fingerprint, toolsRequired }, task.features, [], [cheap, compatible]);
+    assert.equal(result.considered.find((candidate) => candidate.model.id === cheap.model.id)?.rejected, "tool_choice unsupported");
+    assert.deepEqual(result.selectedPlan?.models, [strong.model.id]);
   }
 });

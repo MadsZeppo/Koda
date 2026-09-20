@@ -11,6 +11,9 @@ export interface SpecialistEstimate extends Candidate {
   evidence: SpecialistEvidence[];
   expectedCompletionCost: number;
   expectedCompletionLatencyMs: number;
+  expectedAttemptCost: number;
+  expectedAttemptLatencyMs: number;
+  expectedFinalSuccess: number;
   uncertainty: number;
   conservativeQuality: number;
   qualityGap: number;
@@ -24,10 +27,29 @@ export interface SpecialistEstimate extends Candidate {
   operationalErrorRate: number;
   rejection?: string;
 }
+export interface ExecutionPlanEstimate {
+  models: string[];
+  expectedStandaloneSuccess: number;
+  expectedFinalSuccess: number;
+  conservativeFinalSuccess: number;
+  expectedCompletionCost: number;
+  expectedCompletionLatencyMs: number;
+  costPerVerifiedCompletion: number;
+  latencyPerVerifiedCompletionMs: number;
+  qualityGap: number;
+  escalationProbability: number;
+  detectionProbability: number;
+  score: number;
+  eligible: boolean;
+  reason: string;
+}
 export interface SpecialistRoute {
   cascade: SpecialistEstimate[];
   considered: SpecialistEstimate[];
   reference?: SpecialistEstimate;
+  plans: ExecutionPlanEstimate[];
+  selectedPlan?: ExecutionPlanEstimate;
+  referencePlan?: ExecutionPlanEstimate;
   allowedRegret: number;
   reason: string;
 }
@@ -35,15 +57,14 @@ export interface SpecialistRoute {
 const POLICY = {
   externalPriorWeight: 4,
   strongVerificationRegret: 0.065,
-  mediumVerificationRegret: 0.015,
-  weakUncertaintyLimit: 0.075,
-  minimumEvidence: 0.1,
+  // Recoverable failure coverage, not confidence that a passing check proves
+  // correctness. Sparse evidence must not imply independent rescue success.
+  detection: { strong: 0.95, medium: 0.65, weak: 0.25 },
   latencyUsdPerSecond: 0.001,
   interactiveP90Ms: 15000,
 } as const;
 const clamp = (n: number) => Math.max(0.05, Math.min(0.995, n));
-const failure = (row: Attempt) => attributableCodingFailure(row) &&
-  !/provider|infra|timeout|rate.limit|transport|\b429\b|HTTP 5\d\d|unavailable|unknown pricing/i.test(row.reason ?? "");
+const failure = attributableCodingFailure;
 const value = (level: TaskDifficulty[keyof TaskDifficulty]) => level === "high" ? 2 : level === "medium" ? 1 : 0;
 const difficultyDistance = (a: TaskDifficulty, b: TaskDifficulty) =>
   (Object.keys(a) as (keyof TaskDifficulty)[]).reduce((n, key) => n + Math.abs(value(a[key]) - value(b[key])), 0);
@@ -116,7 +137,7 @@ export function curateSpecialists(models: SpecialistModel[], fp: TaskFingerprint
 
 export function optimizeSpecialists(models: SpecialistModel[], fp: TaskFingerprint,
   features: Features, history: Attempt[], config: Config, budgetUsd: number,
-  operations: OperationalCall[] = []): SpecialistRoute {
+  operations: OperationalCall[] = [], excludedInitial: ReadonlySet<string> = new Set()): SpecialistRoute {
   const input = Math.ceil(features.contextBytes / 4) + 256;
   const output = config.maxOutputTokens;
   // Executable, focused verification can reject a failed bounded attempt.
@@ -127,16 +148,18 @@ export function optimizeSpecialists(models: SpecialistModel[], fp: TaskFingerpri
   const firstAttemptQualityFloor = economicalTrial
     ? Math.max(0.05, config.routing.minimumQuality - POLICY.strongVerificationRegret)
     : config.routing.minimumQuality;
-  const considered = curateSpecialists(models, fp, { input, output }, budgetUsd).map((item) => {
+  const considered: SpecialistEstimate[] = curateSpecialists(models, fp, { input, output }, budgetUsd).map((item) => {
     const { model, metadata: md } = item;
     const cost = md.inputPrice === undefined || md.outputPrice === undefined ? Infinity
       : (input * md.inputPrice + output * md.outputPrice) / 1e6;
     const rejected = !model.enabled ? "disabled" : md.available === false ? "unavailable"
-      : !Number.isFinite(cost) ? "unknown pricing" : cost > budgetUsd ? "run budget"
+      : !Number.isFinite(cost) ? "unknown pricing"
       : md.contextLength !== undefined && input + output > md.contextLength ? "context limit"
-      : fp.toolsRequired && (md.supportedParameters
+      : (fp.toolsRequired || fp.executionStrategy === "stable") && (md.supportedParameters
           ? !md.supportedParameters.includes("tools")
           : !model.strengths.includes("tool_use")) ? "tools unsupported"
+      : fp.executionStrategy === "stable" && md.supportedParameters &&
+          !md.supportedParameters.includes("tool_choice") ? "tool_choice unsupported"
       : fp.visionRequired && !item.vision ? "vision unsupported" : undefined;
     const rows = history.filter((row) => (row.modelServed ?? row.modelRequested) === model.id &&
       (row.verification === "VERIFIED_SUCCESS" || failure(row)));
@@ -172,6 +195,17 @@ export function optimizeSpecialists(models: SpecialistModel[], fp: TaskFingerpri
       ? recent.filter((call) => call.outcome === "error").length / (recent.length + 4) : 0;
     const latencySlaPassed = p90 === null || p90 <= POLICY.interactiveP90Ms;
     const latency = ewma * (1 + operationalErrorRate);
+    // Attempts may contain multiple model calls. Learn their token/time totals
+    // at current prices; provider errors never enter the quality posterior.
+    const measured = weighted.filter(({ row }) => row.inputTokens >= 0 && row.outputTokens >= 0);
+    const measuredWeight = measured.reduce((sum, { weight }) => sum + weight, 0);
+    const expectedAttemptCost = Number.isFinite(cost) ?
+      (cost * POLICY.externalPriorWeight + measured.reduce((sum, { row, weight }) =>
+        sum + weight * (row.inputTokens * md.inputPrice! + row.outputTokens * md.outputPrice!) / 1e6, 0)) /
+      (POLICY.externalPriorWeight + measuredWeight) : Infinity;
+    const expectedAttemptLatencyMs = Math.max(latency,
+      (model.latencyPriorMs * POLICY.externalPriorWeight + measured.reduce((sum, { row, weight }) =>
+        sum + weight * row.wallClockMs, 0)) / (POLICY.externalPriorWeight + measuredWeight));
     return {
       model, metadata: md, quality, conservativeQuality: clamp(quality - uncertainty), uncertainty,
       cost, latency, score: Infinity,
@@ -181,6 +215,7 @@ export function optimizeSpecialists(models: SpecialistModel[], fp: TaskFingerpri
       evidence: [...item.evidence, ...rows.map((row) => ({ source: "verified_history" as const,
         value: row.verification === "VERIFIED_SUCCESS" ? 1 : 0, detail: row.verification }))],
       expectedCompletionCost: Infinity, expectedCompletionLatencyMs: Infinity,
+      expectedAttemptCost, expectedAttemptLatencyMs, expectedFinalSuccess: quality,
       qualityGap: Infinity, qualityFloorPassed: false as boolean,
       firstAttemptQualityFloor,
       callCount: recent.length, latencyEwmaMs: ewma,
@@ -189,31 +224,89 @@ export function optimizeSpecialists(models: SpecialistModel[], fp: TaskFingerpri
     } satisfies SpecialistEstimate;
   });
   const eligible = considered.filter((candidate) => !candidate.rejected);
-  const reference = [...eligible].sort((a, b) => b.conservativeQuality - a.conservativeQuality || a.cost - b.cost)[0];
-  const baseRegret = config.routing.maxQualityRegret;
-  const allowedRegret = fp.verificationStrength === "strong" ? baseRegret + POLICY.strongVerificationRegret
-    : fp.verificationStrength === "medium" ? baseRegret + POLICY.mediumVerificationRegret
-    : Math.min(baseRegret, 0.012);
-  for (const candidate of eligible) {
-    candidate.qualityGap = (reference?.conservativeQuality ?? candidate.conservativeQuality) - candidate.conservativeQuality;
-    const weakUncertain = fp.verificationStrength === "weak" && candidate.uncertainty > POLICY.weakUncertaintyLimit && candidate !== reference;
-    candidate.qualityFloorPassed = candidate.qualityGap <= allowedRegret && !weakUncertain;
-    if (!candidate.qualityFloorPassed) { candidate.rejected = weakUncertain ? "weak verification and uncertain quality" : "quality parity"; continue; }
-    const rescue = candidate === reference ? undefined : reference;
-    // One detected failure followed by the reference. No independent-success cascade multiplication.
-    candidate.expectedCompletionCost = candidate.cost +
-      (fp.verificationStrength === "weak" ? 0 : 1 - candidate.quality) * (rescue?.cost ?? 0);
-    candidate.expectedCompletionLatencyMs = candidate.latency +
-      (fp.verificationStrength === "weak" ? 0 : 1 - candidate.quality) * (rescue?.latency ?? 0);
-    candidate.score = candidate.expectedCompletionCost + config.routing.latencyWeight *
-      candidate.expectedCompletionLatencyMs / 1000 * POLICY.latencyUsdPerSecond +
-      (candidate.latencySlaPassed ? 0 : 0.02);
+  const reference = [...eligible].filter((candidate) => candidate.quality >= config.routing.minimumQuality)
+    .sort((a, b) => b.conservativeQuality - a.conservativeQuality || b.quality - a.quality ||
+      a.cost - b.cost || a.model.id.localeCompare(b.model.id))[0];
+  const highRisk = fp.difficulty.changeRisk === "high" || fp.architectureHeavy ||
+    fp.difficulty.architecturalComplexity === "high";
+  const allowedRegret = Math.min(config.routing.maxQualityRegret,
+    fp.verificationStrength === "weak" ? 0.012 : 0.025) * (highRisk ? 0.5 : 1);
+  const detectionProbability = POLICY.detection[fp.verificationStrength];
+  const plans: ExecutionPlanEstimate[] = [];
+  const plansByInitial = new Map<string, ExecutionPlanEstimate[]>();
+  const estimate = (initial: SpecialistEstimate, rescue?: SpecialistEstimate): ExecutionPlanEstimate => {
+    // Nested solvability is conservative about correlated errors: rescue earns
+    // only its quality advantage, never (1 - pA) * pB independent-success credit.
+    const expectedFinalSuccess = initial.quality + (rescue
+      ? detectionProbability * Math.max(0, rescue.quality - initial.quality) : 0);
+    const conservativeFinalSuccess = initial.conservativeQuality + (rescue
+      ? detectionProbability * Math.max(0, rescue.conservativeQuality - initial.conservativeQuality) : 0);
+    const escalationProbability = rescue ? detectionProbability * (1 - initial.quality) : 0;
+    const expectedCompletionCost = initial.expectedAttemptCost + escalationProbability * (rescue?.expectedAttemptCost ?? 0);
+    const expectedCompletionLatencyMs = initial.expectedAttemptLatencyMs + escalationProbability * (rescue?.expectedAttemptLatencyMs ?? 0);
+    // Shared task uncertainty cancels in regret; additional uncertainty about a
+    // candidate still counts. There is no absolute uncertainty veto for weak checks.
+    const qualityGap = reference ? Math.max(0, reference.quality - expectedFinalSuccess,
+      reference.conservativeQuality - conservativeFinalSuccess) : Infinity;
+    const initialGap = reference ? Math.max(0, reference.quality - initial.quality,
+      reference.conservativeQuality - initial.conservativeQuality) : Infinity;
+    const rejection = !reference ? "minimum quality reference unavailable"
+      : excludedInitial.has(initial.model.id) ? "already reserved for race"
+      : highRisk && initialGap > allowedRegret ? "high-risk first-attempt quality"
+      : !rescue && initial.quality < config.routing.minimumQuality ? "minimum quality"
+      : qualityGap > allowedRegret ? "quality parity"
+      // Never credit an escalation that the remaining budget cannot support.
+      : Math.max(initial.cost, initial.expectedAttemptCost) + (rescue ? Math.max(rescue.cost, rescue.expectedAttemptCost) : 0) > budgetUsd
+        ? "completion budget" : undefined;
+    const costPerVerifiedCompletion = expectedCompletionCost / expectedFinalSuccess;
+    const latencyPerVerifiedCompletionMs = expectedCompletionLatencyMs / expectedFinalSuccess;
+    return {
+      models: [initial.model.id, ...(rescue ? [rescue.model.id] : [])],
+      expectedStandaloneSuccess: initial.quality, expectedFinalSuccess, conservativeFinalSuccess,
+      expectedCompletionCost, expectedCompletionLatencyMs, costPerVerifiedCompletion,
+      latencyPerVerifiedCompletionMs, qualityGap, escalationProbability,
+      detectionProbability: rescue ? detectionProbability : 0,
+      score: config.routing.costWeight * costPerVerifiedCompletion + config.routing.latencyWeight *
+        latencyPerVerifiedCompletionMs / 1000 * POLICY.latencyUsdPerSecond +
+        config.routing.latencyWeight * (initial.latencySlaPassed ? 0 : 0.02),
+      eligible: !rejection, reason: rejection ?? "within reference regret; eligible completion economics",
+    };
+  };
+  for (const initial of eligible) {
+    const standalone = estimate(initial);
+    const alternatives = [standalone];
+    for (const rescue of eligible) {
+      if (rescue === initial || rescue.quality < config.routing.minimumQuality ||
+          rescue.quality <= initial.quality || rescue.conservativeQuality < initial.conservativeQuality) continue;
+      alternatives.push(estimate(initial, rescue));
+    }
+    // Existing workers recover attributable failures when a stronger qualified
+    // model is available. A singleton is a counterfactual, not permission to
+    // abandon that recovery; price the complete executable policy instead.
+    if (standalone.eligible && alternatives.some((plan) => plan.models.length > 1 && plan.eligible)) {
+      standalone.eligible = false;
+      standalone.reason = "existing recovery policy requires fallback";
+    }
+    plans.push(...alternatives);
+    plansByInitial.set(initial.model.id, alternatives);
   }
-  const parity = eligible.filter((c) => c.qualityFloorPassed)
-    .sort((a, b) => a.score - b.score || a.model.id.localeCompare(b.model.id));
-  // Strong verification permits extra regret only when retry economics beat starting at the reference.
-  const cascade = parity.filter((c) => c === reference || fp.verificationStrength !== "strong" ||
-    c.qualityGap <= baseRegret || c.score < (reference?.score ?? Infinity));
-  return { cascade, considered, reference, allowedRegret,
-    reason: "quality and technical compatibility first; expected verified completion cost and latency second" };
+  const order = (a: ExecutionPlanEstimate, b: ExecutionPlanEstimate) =>
+    a.score - b.score || a.models.join("\0").localeCompare(b.models.join("\0"));
+  const selectedPlan = plans.filter((plan) => plan.eligible).sort(order)[0];
+  const referencePlan = plans.find((plan) => plan.models.length === 1 && plan.models[0] === reference?.model.id);
+  for (const candidate of eligible) {
+    const alternatives = plansByInitial.get(candidate.model.id)!;
+    const best = alternatives.filter((plan) => plan.eligible).sort(order)[0] ??
+      alternatives.sort((a, b) => a.qualityGap - b.qualityGap || order(a, b))[0]!;
+    candidate.qualityFloorPassed = best.eligible;
+    candidate.qualityGap = best.qualityGap;
+    candidate.expectedFinalSuccess = best.expectedFinalSuccess;
+    candidate.expectedCompletionCost = best.expectedCompletionCost;
+    candidate.expectedCompletionLatencyMs = best.expectedCompletionLatencyMs;
+    candidate.score = best.score;
+    candidate.rejected = candidate.rejection = best.eligible ? undefined : best.reason;
+  }
+  const cascade = selectedPlan?.models.map((id) => considered.find((candidate) => candidate.model.id === id)!) ?? [];
+  return { cascade, considered, reference, plans, selectedPlan, referencePlan, allowedRegret,
+    reason: "reference outcome and conservative final-quality regret first; cost and latency per verified completion second" };
 }

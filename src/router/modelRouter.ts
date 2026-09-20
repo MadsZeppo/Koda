@@ -148,12 +148,12 @@ export class PoolRouter {
     const models = (await this.capabilities.forTask(fingerprint)).filter(
       (item) => !this.disabled.has(item.model.id),
     );
+    const reserved = raceGroup ? this.raceSelections.get(raceGroup) ?? new Set<string>() : new Set<string>();
     const result = optimizeSpecialists(
       models, fingerprint, features, this.history.read(), this.config, budgetUsd,
-      this.history.readOperations(),
+      this.history.readOperations(), reserved,
     );
-    const reserved = raceGroup ? this.raceSelections.get(raceGroup) ?? new Set<string>() : new Set<string>();
-    const cascade = result.cascade.filter((candidate) => !reserved.has(candidate.model.id));
+    const cascade = result.cascade;
     if (raceGroup && cascade.length) {
       reserved.add(cascade[0]!.model.id);
       this.raceSelections.set(raceGroup, reserved);
@@ -166,14 +166,23 @@ export class PoolRouter {
       reference_model: result.reference?.model.id ?? null,
       reference_expected_success: result.reference?.quality ?? null,
       reference_conservative_success: result.reference?.conservativeQuality ?? null,
-      reference_expected_cost_usd: result.reference?.expectedCompletionCost ?? null,
-      reference_expected_latency_ms: result.reference?.expectedCompletionLatencyMs ?? null,
+      reference_plan: result.referencePlan ?? null,
+      reference_expected_cost_usd: result.referencePlan?.expectedCompletionCost ?? null,
+      reference_expected_latency_ms: result.referencePlan?.expectedCompletionLatencyMs ?? null,
       selected_model: cascade[0]?.model.id ?? null,
+      selected_plan: result.selectedPlan ?? null,
+      expected_standalone_success: result.selectedPlan?.expectedStandaloneSuccess ?? null,
+      expected_final_success: result.selectedPlan?.expectedFinalSuccess ?? null,
+      expected_completion_cost_usd: result.selectedPlan?.expectedCompletionCost ?? null,
+      expected_completion_latency_ms: result.selectedPlan?.expectedCompletionLatencyMs ?? null,
+      quality_gap: result.selectedPlan?.qualityGap ?? null,
+      plans: result.plans,
       fallback_chain: cascade.map((candidate) => candidate.model.id),
       candidates: result.considered.map((candidate) => ({
         id: candidate.model.id,
         rejected: candidate.rejected,
         success: candidate.quality,
+        expected_final_success: candidate.expectedFinalSuccess,
         conservative_success: candidate.conservativeQuality,
         quality_gap: candidate.qualityGap,
         uncertainty: candidate.uncertainty,
@@ -181,6 +190,7 @@ export class PoolRouter {
         confidence: candidate.confidence,
         call_cost_usd: Number.isFinite(candidate.cost) ? candidate.cost : null,
         expected_completion_cost_usd: Number.isFinite(candidate.expectedCompletionCost) ? candidate.expectedCompletionCost : null,
+        expected_completion_latency_ms: Number.isFinite(candidate.expectedCompletionLatencyMs) ? candidate.expectedCompletionLatencyMs : null,
         latency_ms: candidate.latency,
         call_count: candidate.callCount,
         latency_ewma_ms: candidate.latencyEwmaMs,

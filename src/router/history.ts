@@ -29,7 +29,8 @@ export interface Attempt {
 /** Legacy FAILED rows lack proof that a candidate patch caused a regression. */
 export const attributableCodingFailure = (row: Attempt) =>
   row.verification === "FAILED" &&
-  row.failureAttribution === "verified_patch_regression";
+  row.failureAttribution === "verified_patch_regression" &&
+  !/provider|infra|timeout|rate.limit|transport|\b429\b|HTTP 5\d\d|unavailable|not[_ -]available|sandbox|environment[_ -]provisioning|missing[_ -]environment|unknown pricing/i.test(row.reason ?? "");
 export interface OperationalCall {
   type: "operational_call";
   timestamp: string;

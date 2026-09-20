@@ -2111,9 +2111,7 @@ export async function implement(
             selected = specialistCascade.length
               ? specialistIndex + 1 < specialistCascade.length
                 ? specialistCascade[++specialistIndex]
-                : previousCandidate.model.tier === "frontier"
-                  ? undefined
-                  : await pool.selectFrontierRescue(features, subtask.id)
+                : undefined
               : await pool.select(
                   features,
                   subtask.id,
