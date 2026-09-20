@@ -136,6 +136,13 @@ test(`Stable scope ${failure} falls back to concrete evidence and reaches verifi
     const names = body.tools?.map((tool: any) => tool.function.name) ?? [];
     const tool = (id: string, name: string, args: object) => ({ id, type: "function",
       function: { name, arguments: JSON.stringify(args) } });
+    if (failure === "no-scope" && names.includes("search_code")) {
+      response.end(JSON.stringify({ id: "no-scope", model: body.model, choices: [{ index: 0,
+        message: { role: "assistant", content: null, tool_calls: [
+          tool("none", "report_no_scope", { reason: "No safe scope could be identified by this model." }),
+        ] } }], usage: { prompt_tokens: 20, completion_tokens: 20, cost: 0 } }));
+      return;
+    }
     if (names.includes("search_code")) {
       response.end(JSON.stringify({ id: "inspect", model: body.model, choices: [{ index: 0,
         message: { role: "assistant", content: null, tool_calls: [
@@ -147,13 +154,6 @@ test(`Stable scope ${failure} falls back to concrete evidence and reaches verifi
       if (failure === "429") {
         response.statusCode = 429;
         response.end(JSON.stringify({ error: { message: "Provider returned error" } }));
-        return;
-      }
-      if (failure === "no-scope") {
-        response.end(JSON.stringify({ id: "no-scope", model: body.model, choices: [{ index: 0,
-          message: { role: "assistant", content: null, tool_calls: [
-            tool("none", "report_no_scope", { reason: "No safe scope could be identified by this model." }),
-          ] } }], usage: { prompt_tokens: 20, completion_tokens: 20, cost: 0 } }));
         return;
       }
       // Simulate a provider that returns after Koda's hard scope deadline.
@@ -191,10 +191,12 @@ test(`Stable scope ${failure} falls back to concrete evidence and reaches verifi
     assert.equal(result.execution_strategy, "stable");
     assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
     const events = (await readFile(join(output, "events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-    assert.ok(events.some((event) => event.type === "stable_scope_finalization_fallback"));
+    assert.ok(events.some((event) => event.type === (failure === "no-scope"
+      ? "stable_actionable_scope_fallback" : "stable_scope_finalization_fallback")));
     assert.equal(requests.filter((request) => request.tools?.some((tool: any) =>
       tool.function.name === "lock_write_scope") && !request.tools?.some((tool: any) =>
-      tool.function.name === "search_code")).length, 1, "no second finalizer model request");
+      tool.function.name === "search_code")).length, failure === "no-scope" ? 0 : 1,
+      "no second finalizer model request");
     assert.ok(events.some((event) => event.type === "coding_worker_start"));
     assert.ok(events.some((event) => event.type === "write_success" && event.path === "src/a.js"));
     assert.ok(events.some((event) => event.type === "final_verification" && event.outcome === "CHECK_PASS"));

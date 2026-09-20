@@ -127,7 +127,10 @@ test("Stable inspection uses the universal selector when local scope remains amb
       likelyReadPaths: ["src/first.js", "src/second.js"], likelyWritePaths: [], readOnly: true,
       integrationContract: "", verificationCommands: [], estimatedDifficulty: "normal", parallelSafe: false };
     await assert.rejects(prepareStableWorker(gateway, root, objective, work,
-      await profileRepo(root), { files: [], repoMap: [], localDependencies: [] }), /no actionable scope/i);
+      await profileRepo(root), { files: [
+        { path: "src/first.js", snippet: "// specific bug\nexport const first = 1;" },
+        { path: "src/second.js", snippet: "// specific bug\nexport const second = 2;" },
+      ], repoMap: ["src/first.js", "src/second.js"], localDependencies: [] }), /no actionable scope/i);
     assert.equal(specialistCalls, 1);
     assert.equal(modelCalls, 1, "the no-scope fallback is bounded to one attempt");
   } finally { await rm(root, { recursive: true, force: true }); }
@@ -166,6 +169,79 @@ test("an initial empty mutation scope gets one bounded deterministic fallback", 
     assert.equal(calls, 1);
     assert.equal(logger.events.filter((event) =>
       event.type === "stable_actionable_scope_fallback").length, 1);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("no-scope fallback ranks inspected content and locks only the evidence-backed source and test", async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-stable-ranked-fallback-"));
+  try {
+    await mkdir(join(root, "src", "agent"), { recursive: true });
+    await mkdir(join(root, "tests"));
+    await writeFile(join(root, "src/agent/prompts.ts"),
+      "export const scopePrompt = 'require concrete inspection evidence before scope lock';\n");
+    await writeFile(join(root, "src/run.ts"), "export const run = () => 'unrelated orchestration';\n");
+    await writeFile(join(root, "tests/prompts.test.ts"),
+      "import { scopePrompt } from '../src/agent/prompts.js'; test('scope evidence', () => scopePrompt.includes('evidence'));\n");
+    await git(root, "init", "-q"); await git(root, "config", "user.name", "Ranked Fallback");
+    await git(root, "config", "user.email", "ranked@test.local"); await git(root, "add", ".");
+    await git(root, "commit", "-qm", "baseline");
+    const logger = new Logger(join(root, ".git", "fallback-log"), "ranked-fallback", true);
+    const gateway = new Gateway(await config(undefined, { models: {} }), logger,
+      new Budget(1, 100000, 60000));
+    let calls = 0;
+    (gateway as any).call = async () => {
+      calls++;
+      return { role: "assistant", content: null, tool_calls: [{ id: "none", type: "function",
+        function: { name: "report_no_scope", arguments: JSON.stringify({
+          reason: "The model did not gather repository evidence",
+        }) } }] };
+    };
+    const objective = "Fix the scope prompt inspection evidence behavior and update the regression test";
+    const work: Subtask = { id: "stable", title: objective, objective, dependsOn: [],
+      likelyReadPaths: ["src/agent/prompts.ts", "src/run.ts", "tests/prompts.test.ts"],
+      likelyWritePaths: [], readOnly: true, integrationContract: "Keep the scope conservative",
+      verificationCommands: [], estimatedDifficulty: "normal", parallelSafe: false };
+    const prepared = await prepareStableWorker(gateway, root, objective, work,
+      await profileRepo(root), { files: [
+        { path: "src/agent/prompts.ts", snippet: "export const scopePrompt = 'require concrete inspection evidence before scope lock';" },
+        { path: "src/run.ts", snippet: "export const run = () => 'unrelated orchestration';" },
+        { path: "tests/prompts.test.ts", snippet: "import { scopePrompt } from '../src/agent/prompts.js'; test('scope evidence', () => scopePrompt.includes('evidence'));" },
+      ], repoMap: ["src/agent/prompts.ts", "src/run.ts", "tests/prompts.test.ts"], localDependencies: [] });
+    assert.deepEqual(prepared.writePaths, ["src/agent/prompts.ts", "tests/prompts.test.ts"]);
+    assert.ok(!prepared.writePaths.includes("src/run.ts"));
+    assert.equal(calls, 1);
+    assert.equal(logger.events.filter((event) => event.type === "stable_actionable_scope_fallback").length, 1);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("repository filenames without inspected content do not authorize fallback writes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-stable-filename-only-"));
+  try {
+    await mkdir(join(root, "src"));
+    await writeFile(join(root, "src/first.ts"), "export const first = 1;\n");
+    await writeFile(join(root, "src/second.ts"), "export const second = 2;\n");
+    await git(root, "init", "-q"); await git(root, "config", "user.name", "Filename Test");
+    await git(root, "config", "user.email", "filename@test.local"); await git(root, "add", ".");
+    await git(root, "commit", "-qm", "baseline");
+    const logger = new Logger(join(root, ".git", "fallback-log"), "filename-only", true);
+    const gateway = new Gateway(await config(undefined, { models: {} }), logger,
+      new Budget(1, 100000, 60000));
+    let calls = 0;
+    (gateway as any).call = async () => {
+      calls++;
+      return { role: "assistant", content: "I could not identify the implementation." };
+    };
+    const objective = "Implement the requested behavior with a focused test";
+    const work: Subtask = { id: "stable", title: objective, objective, dependsOn: [],
+      likelyReadPaths: ["src/first.ts", "src/second.ts"], likelyWritePaths: [], readOnly: true,
+      integrationContract: "", verificationCommands: [], estimatedDifficulty: "normal", parallelSafe: false };
+    await assert.rejects(prepareStableWorker(gateway, root, objective, work,
+      await profileRepo(root), { files: [], repoMap: ["src/first.ts", "src/second.ts"],
+        localDependencies: [] }), /no actionable evidence/i);
+    assert.equal(calls, 1);
+    assert.equal(logger.events.filter((event) => event.type === "stable_actionable_scope_fallback").length, 1);
+    assert.deepEqual(logger.events.find((event) =>
+      event.type === "stable_actionable_scope_fallback")?.paths, []);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
