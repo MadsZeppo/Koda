@@ -17,7 +17,6 @@ import { Gateway } from "./openrouter/client.js";
 import {
   chooseExecutionStrategy,
   directWritePaths,
-  requestsTestMutation,
   type ExecutionStrategy,
 } from "./router/executionStrategy.js";
 import {
@@ -34,6 +33,8 @@ import { truncateBytes } from "./context/bounds.js";
 import { AttemptCheckpoint } from "./agent/attemptCheckpoint.js";
 import { WriteScope } from "./repo/writeScope.js";
 import { discover } from "./agent/discovery.js";
+import { prepareStableWorker } from "./agent/stable.js";
+import { buildRepairPacket } from "./agent/repairPacket.js";
 import { advisoryInfrastructureOnly, verify, verificationAgainstBaseline, verificationResult, verificationRegressions } from "./verifier/verifier.js";
 import { focusedLocalReproduction, optionalUnavailableCheck } from "./verifier/recovery.js";
 import {
@@ -200,7 +201,7 @@ export async function run(options: RunOptions) {
       | {
           subtask: Subtask;
           context: Awaited<ReturnType<typeof compileContext>>;
-          evidence: EvidencePacket;
+          prepared: Awaited<ReturnType<typeof prepareStableWorker>>;
         }
       | undefined;
     let directRepairContext:
@@ -217,28 +218,64 @@ export async function run(options: RunOptions) {
         profile,
         options.config.context,
       );
-      const subtask: Subtask = {
+      const inspectionTask: Subtask = {
         id: "stable",
         title: options.task,
         objective: options.task,
         dependsOn: [],
         likelyReadPaths: strategy.likelyFiles,
-        likelyWritePaths: ["."],
-        readOnly: false,
+        likelyWritePaths: [],
+        readOnly: true,
         integrationContract:
-          "Discover the concrete implementation files in the isolated candidate workspace, implement the smallest correct change, and preserve existing public interfaces",
+          "Inspect, declare exact files, implement the fix and regression test",
         verificationCommands: [],
         estimatedDifficulty: "normal",
         parallelSafe: false,
       };
+      logger.log("task_start", { subtaskId: inspectionTask.id });
+      const prepared = await prepareStableWorker(
+        gateway,
+        integration.path,
+        options.task,
+        inspectionTask,
+        profile,
+        context,
+      );
+      const subtask: Subtask = {
+        ...inspectionTask,
+        readOnly: false,
+        likelyWritePaths: prepared.writePaths,
+      };
+      const stableFocusedCheck = targetedProjectUnitNativeCheck(
+        subtask,
+        profile,
+        context,
+      );
 
-      logger.log("task_start", { subtaskId: subtask.id });
-      logger.log("stable_discovery_start", {
+      if (stableFocusedCheck) {
+        taskVerificationCommands = [stableFocusedCheck];
+        taskVerificationIsFocused = true;
+        subtask.verificationCommands = [stableFocusedCheck];
+      }
+      const { packet: repairPacket, context: implementationContext } =
+        await buildRepairPacket(
+          integration.path, options.task, prepared.writePaths, profile,
+          profile.verificationCommands, gateway.config.context.maxPromptBytes,
+          prepared.evidence,
+          "deterministic" in prepared && prepared.deterministic
+            ? prepared.evidence.relevantFiles.filter(isTestPath) : [],
+        );
+      logger.log("stable_context_focused", {
         subtaskId: subtask.id,
-        initial_write_scope: ["."],
-        context_files: context.files.map((file) => file.path),
+        before_bytes: Buffer.byteLength(JSON.stringify(context)),
+        after_bytes: Buffer.byteLength(JSON.stringify(implementationContext)),
+        files: implementationContext.files.map((file) => file.path),
       });
-
+      stableRepairContext = {
+        subtask,
+        context: implementationContext,
+        prepared,
+      };
       const result = await implement(
         gateway,
         integration.path,
@@ -248,151 +285,36 @@ export async function run(options: RunOptions) {
         profile,
         {
           codingWorker,
-          compiledContext: context,
+          compiledContext: implementationContext,
+          evidence: prepared.evidence,
           finalVerificationOnly: true,
+          stableHandoff: prepared.handoff,
+          repairPacket,
         },
       );
-
-      const operationalFailure = result.verification.checks.find(
-        (check) =>
-          check.outcome === "INFRA_FAILURE" ||
-          check.outcome === "CHECK_UNAVAILABLE",
-      );
-      if (operationalFailure) {
-        status = "NOT_FULLY_VERIFIED";
-        throw Error(
-          `Verification infrastructure unavailable: ${operationalFailure.command}: ${operationalFailure.unavailable ?? operationalFailure.stderr ?? "verification could not execute"}`,
-        );
-      }
-
       if (result.verification.status === "FAILED")
         throw Error("stable: worker failed before final verification");
-
       await assertWriteResponsibility(integration.path, subtask);
-
-      const alreadySatisfied =
-        "noChangesRequired" in result && result.noChangesRequired;
-
+      const alreadySatisfied = "noChangesRequired" in result && result.noChangesRequired;
       if (!alreadySatisfied) {
         const pendingChanges = await backend.changes(integration.path);
-        const actualChangedPaths = [
-          ...new Set(pendingChanges.map((change) => change.path)),
-        ];
-
-        if (!actualChangedPaths.length)
-          throw Error("stable: discovery worker produced no changes");
-
-        const reservedChanges = actualChangedPaths.filter(
-          (path) =>
-            path === ".koda" ||
-            path.startsWith(".koda/") ||
-            path === ".git" ||
-            path.startsWith(".git/"),
-        );
-        if (reservedChanges.length)
-          throw Error(
-            `stable: worker modified Koda/Git internal paths: ${reservedChanges.join(", ")}`,
-          );
-
-        const unauthorizedTests = requestsTestMutation(options.task)
-          ? []
-          : actualChangedPaths.filter(isTestPath);
-        if (unauthorizedTests.length)
-          throw Error(
-            `stable: worker changed tests without an explicit test-edit request: ${unauthorizedTests.join(", ")}`,
-          );
-
-        if (
-          !taskRelevantMutationPaths(
-            options.task,
-            actualChangedPaths,
-            pendingChanges,
-          ).length
-        )
-          throw Error(
-            "stable: worker produced no task-relevant implementation changes",
-          );
-
-        const repairProfile = await profileRepo(integration.path);
-        const repairSubtask: Subtask = {
-          ...subtask,
-          likelyReadPaths: [
-            ...new Set([...strategy.likelyFiles, ...actualChangedPaths]),
-          ],
-          likelyWritePaths: actualChangedPaths,
-        };
-
-        const repairContext = await compileContext(
-          integration.path,
-          options.task,
-          actualChangedPaths,
-          repairProfile,
-          options.config.context,
-          true,
-        );
-
-        const stableFocusedCheck = targetedProjectUnitNativeCheck(
-          repairSubtask,
-          repairProfile,
-          repairContext,
-        );
-        if (stableFocusedCheck) {
-          taskVerificationCommands = [stableFocusedCheck];
-          taskVerificationIsFocused = true;
-          repairSubtask.verificationCommands = [stableFocusedCheck];
-        }
-
-        const candidateEvidence: EvidencePacket = {
-          ...result.evidence,
-          relevantFiles: [
-            ...new Set([
-              ...result.evidence.relevantFiles,
-              ...actualChangedPaths,
-            ]),
-          ],
-          evidence: [
-            ...new Set([
-              ...result.evidence.evidence,
-              ...actualChangedPaths.map(
-                (path) => `mini_swe_changed_path:${path}`,
-              ),
-            ]),
-          ],
-        };
-
-        stableRepairContext = {
-          subtask: repairSubtask,
-          context: repairContext,
-          evidence: candidateEvidence,
-        };
-
-        logger.log("stable_discovery_scope_locked", {
-          subtaskId: subtask.id,
-          initial_write_scope: ["."],
-          actual_changed_paths: actualChangedPaths,
-          repair_write_scope: repairSubtask.likelyWritePaths,
-        });
-
+        if (!taskRelevantMutationPaths(options.task, prepared.writePaths, pendingChanges).length)
+          throw Error("stable: worker produced no task-relevant implementation changes");
         const revision = await backend.finalizeWorker(
           integration,
           `agent: ${options.task}`,
         );
-
         if (!revision.changes.length)
           throw Error("stable: worker produced no changes");
-
         logger.log("integrated", {
           subtaskId: subtask.id,
           commit: revision.commit,
           changes: revision.changes.map((change) => change.path),
         });
       }
-
       logger.log("task_complete", {
         subtaskId: subtask.id,
-        verification: alreadySatisfied
-          ? "VERIFIED_SUCCESS"
-          : "AWAITING_FINAL_VERIFICATION",
+        verification: alreadySatisfied ? "VERIFIED_SUCCESS" : "AWAITING_FINAL_VERIFICATION",
       });
     } else if (strategy.execution_strategy === "direct") {
       const context =
@@ -935,7 +857,7 @@ export async function run(options: RunOptions) {
             {
               codingWorker,
               compiledContext: stableRepairContext.context,
-              evidence: stableRepairContext.evidence,
+              evidence: stableRepairContext.prepared.evidence,
               finalVerificationOnly: true,
               adaptiveStartTier:
                 options.config.adaptiveCoding && !options.config.forceModel
@@ -943,6 +865,7 @@ export async function run(options: RunOptions) {
                     ? "high"
                     : "frontier"
                   : undefined,
+              stableHandoff: stableRepairContext.prepared.handoff,
               stableRepair: {
                 attempt,
                 failedChecks: repairChecks,
@@ -950,7 +873,7 @@ export async function run(options: RunOptions) {
                   (change) => change.path,
                 ),
                 failedDiff: await failedPatchContext(),
-                implicatedSymbols: stableRepairContext.evidence.symbols,
+                implicatedSymbols: stableRepairContext.prepared.evidence.symbols,
                 baselineChecks: finalBaseline.checks,
                 regressionDiagnostics: regressionDiagnostics(finalBaseline, failedChecks),
                 failureContext: await failureContext(failedChecks),

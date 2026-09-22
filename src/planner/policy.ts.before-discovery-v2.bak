@@ -39,25 +39,9 @@ export function validatePlanningCandidate(raw: unknown): Plan {
 const testEditRequested = (task: string) =>
   /\b(?:add|write|create)\b.{0,35}\b(?:tests?|specs?|regression)\b|\b(?:modify|update|change|edit)\b.{0,35}\b(?:tests?|specs?)\b/i.test(task);
 
-const repositoryDirectories = (files: readonly string[]) => {
-  const directories = new Set<string>();
-
-  for (const file of files) {
-    let directory = posix.dirname(file);
-
-    while (directory !== ".") {
-      directories.add(directory);
-      directory = posix.dirname(directory);
-    }
-  }
-
-  return directories;
-};
-
 /** Reconcile model-supplied ownership with the actual repository before execution. */
 export async function reconcilePlannedPaths(plan: Plan, task: string, profile: RepoProfile): Promise<Plan> {
   const known = new Set(profile.files);
-  const knownDirectories = repositoryDirectories(profile.files);
   const allowTestWrites = testEditRequested(task);
   const removed = new Map<string, string[]>();
   const kept = plan.subtasks.filter((subtask) => {
@@ -78,14 +62,6 @@ export async function reconcilePlannedPaths(plan: Plan, task: string, profile: R
     };
     const resolvedWrites: string[] = [];
     for (const path of subtask.likelyWritePaths) {
-      if (knownDirectories.has(path)) {
-        const stat = await lstat(await safePath(profile.root, path));
-        if (!stat.isDirectory())
-          throw Error(`Unsafe planned write directory: ${path}`);
-        resolvedWrites.push(path);
-        continue;
-      }
-
       const actual = known.has(path) ? path : unambiguousRepoPath(path, profile.files);
       if (actual) {
         const stat = await lstat(await safePath(profile.root, actual));
@@ -94,12 +70,10 @@ export async function reconcilePlannedPaths(plan: Plan, task: string, profile: R
         resolvedWrites.push(actual);
         continue;
       }
-
       const explicitCreation = task.includes(path) && /\b(?:add|create|implement|introduce)\b/i.test(task);
       const supportedTestCreation = allowTestWrites && isTestPath(path);
       if (!explicitCreation && !supportedTestCreation)
         throw Error(`Planned write path does not exist and has no unambiguous repository match: ${path}`);
-
       const parent = await lstat(posix.dirname(path) === "."
         ? profile.root : await safePath(profile.root, posix.dirname(path)));
       if (!parent.isDirectory()) throw Error(`Planned write parent does not exist: ${path}`);
@@ -364,20 +338,9 @@ export async function planningPolicy(
     context.files.push(file);
     if (!fits()) context.files.pop();
   }
-  const repoDirectories = [...repositoryDirectories(profile.files)]
-    .filter((directory) => directory.split("/").length <= 3)
-    .sort((a, b) => {
-      const aRelevant = targetPaths.some((path) => path.startsWith(a + "/")) ? 0 : 1;
-      const bRelevant = targetPaths.some((path) => path.startsWith(b + "/")) ? 0 : 1;
-
-      return aRelevant - bRelevant ||
-        a.split("/").length - b.split("/").length ||
-        a.localeCompare(b);
-    });
-
-  for (const path of [...targetPaths, ...repoDirectories, ...profile.files]
+  for (const path of [...targetPaths, ...profile.files]
     .filter((p, i, a) => a.indexOf(p) === i)
-    .slice(0, 80)) {
+    .slice(0, 60)) {
     context.repoMap.push(path);
     if (!fits()) context.repoMap.pop();
   }

@@ -41,19 +41,9 @@ export function taskRelevantMutationPaths(
   lockedPaths: readonly string[],
   changes: readonly MutationPath[],
 ) {
-  const owns = (root: string, path: string) => {
-    const normalized = root.replace(/\/$/, "");
-    return normalized === "." ||
-      path === normalized ||
-      path.startsWith(normalized + "/");
-  };
-
-  const changed = changes.filter((change) =>
-    lockedPaths.some((root) => owns(root, change.path)));
-
+  const changed = changes.filter((change) => lockedPaths.includes(change.path));
   const implementationRequired = lockedPaths.some((path) => !isTestPath(path)) &&
     !isExplicitTestOnlyTask(task);
-
   return implementationRequired
     ? changed.filter((change) => !isTestPath(change.path)).map((change) => change.path)
     : changed.map((change) => change.path);
