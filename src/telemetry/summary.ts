@@ -108,8 +108,8 @@ export function summarize(
     cachedTokens: calls.reduce((n, c) => n + c.cachedTokens, 0),
     cacheWriteTokens: calls.reduce((n, c) => n + c.cacheWriteTokens, 0),
     models,
-    parallelPeak: observedPeak,
-    maxConcurrentCodingWorkers: observedPeak,
+    parallelPeak: Math.max(observedPeak, _legacyParallelPeak ?? 0),
+    maxConcurrentCodingWorkers: Math.max(observedPeak, _legacyParallelPeak ?? 0),
     coderExecutions: logger.events.filter(
       (e) => e.type === "coding_worker_start",
     ).length,

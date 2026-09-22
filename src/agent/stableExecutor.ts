@@ -159,7 +159,7 @@ export async function implementStablePacket(
     });
     gateway.logger.log("no_changes_required", {
       subtaskId: subtask.id, status: "VERIFIED_SUCCESS",
-      reason: "requested_test_assertions_already_pass",
+      reason: "acceptance_checks_already_pass",
       diffBytes: 0, verificationCommands: baselineFocused.checks.map((check) => check.command),
     });
     return { verification: baselineFocused, role: "CHEAP_CODER_A" as Role,

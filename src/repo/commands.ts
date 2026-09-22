@@ -135,8 +135,6 @@ export async function pythonSandboxEnvironment(
   const inheritedLocal = await local(inherited.VIRTUAL_ENV);
   if (!selected && inheritedLocal)
     selected = await usableEnvironment(inheritedLocal, false);
-  if (!selected && inherited.VIRTUAL_ENV && !inheritedLocal)
-    selected = await usableEnvironment(inherited.VIRTUAL_ENV, true);
 
   const pathParts: string[] = [];
   for (const part of (inherited.PATH ?? "").split(delimiter).filter(Boolean)) {
@@ -153,7 +151,8 @@ export async function pythonSandboxEnvironment(
         ![...readRoots].some((root) => within(root, absolute))) continue;
     pathParts.push(absolute);
   }
-  if (!selected && !unsafeSelectedEnvironment) {
+  const probeSystemPython = async () => {
+    if (unsafeSelectedEnvironment) return;
     for (const directory of pathParts) {
       for (const name of ["python3", "python"]) {
         try {
@@ -161,13 +160,17 @@ export async function pythonSandboxEnvironment(
           await access(candidate, constants.X_OK);
           if (systemPath(candidate)) {
             selected = { interpreter: candidate, environmentRoot: undefined };
-            break;
+            return;
           }
         } catch {}
       }
-      if (selected) break;
     }
+  };
+  if (!selected && inherited.VIRTUAL_ENV && !inheritedLocal) {
+    selected = await usableEnvironment(inherited.VIRTUAL_ENV, true);
+    if (!selected && unsafeSelectedEnvironment) unsafeSelectedEnvironment = false;
   }
+  if (!selected) await probeSystemPython();
   const virtualEnv = selected?.environmentRoot;
   const selectedBin = virtualEnv ? join(virtualEnv, "bin") : undefined;
   const executablePath = [selectedBin, ...pathParts,

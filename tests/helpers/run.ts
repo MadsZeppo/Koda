@@ -37,11 +37,17 @@ class MockCodingWorker implements CodingWorker {
           definitions: [], diagnostics: input.context?.diagnostics,
           previousFailedDiff: input.context?.previousFailedDiff } }) },
     ];
+    const tinyDirect = input.writeScope.length > 0 &&
+      input.writeScope.every((path) => /\.(?:md|mdx|txt|rst)$/i.test(path));
+    const tinyTools = tinyDirect &&
+      input.writeScope.every((path) => input.context?.completePaths?.includes(path))
+      ? toolDefinitions.filter((tool) => tool.function.name === "write_file")
+      : toolDefinitions;
     const start = this.gateway.logger.events.length;
     try {
       for (let turn = 0; turn < input.maxSteps; turn++) {
         const response: any = await this.gateway.call(input.model, messages,
-          input.attemptId, "implement", turn, toolDefinitions,
+          input.attemptId, "implement", turn, tinyTools,
           { requireTool: true, maxOutputTokens: input.maxOutputTokens,
             codingRoute: input.codingRoute });
         messages.push(response);

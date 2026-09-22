@@ -11,8 +11,10 @@ import { extractFeatures } from "../router/features.js";
 import { taskFingerprint } from "../router/taskFingerprint.js";
 import { verificationPlan } from "../verifier/plan.js";
 import { objectiveCanBeAlreadySatisfied, workerChecks,
-  workerChecksAreTaskSpecific } from "../verifier/selection.js";
-import { recoverPostMutationChecks } from "../verifier/recovery.js";
+  workerChecksAreTaskSpecific, tinyDocumentationChecks } from "../verifier/selection.js";
+import { optionalUnavailableCheck, focusedLocalReproduction,
+  recoverPostMutationChecks } from "../verifier/recovery.js";
+import { implementStablePacket } from "./stableExecutor.js";
 import { advisoryInfrastructureOnly, verify, verificationAgainstBaseline,
   verificationRegressed, verificationResult } from "../verifier/verifier.js";
 import type { StableImplementationHandoff } from "./stable.js";
@@ -61,7 +63,7 @@ const infrastructureOnly = (result: VerificationResult) => result.checks.some((c
   !result.checks.some((check) => check.outcome === "CHECK_FAIL");
 
 const protocolIncompatibility = (message?: string) =>
-  /(?:no endpoints?|unsupported|not support|tool_choice|requested parameters?|protocol)/i
+  /(?:no endpoints?(?:\s+found)?|unsupported|not support|tool_choice|requested parameters?|protocol|404)/i
     .test(message ?? "");
 
 const roleFor = (candidate?: Candidate): Role => candidate?.model.tier === "frontier"
@@ -77,6 +79,19 @@ export async function implement(
   profile: RepoProfile,
   options: MiniSweImplementationOptions = {},
 ) {
+  if (options.finalVerificationOnly && options.stableHandoff && options.repairPacket &&
+      !options.stableRepair) {
+    return implementStablePacket(gateway, path, task, subtask, plan, profile, {
+      evidence: options.evidence,
+      compiledContext: options.compiledContext,
+      selectedCandidate: options.selectedCandidate,
+      model: options.model,
+      stableHandoff: options.stableHandoff,
+      repairPacket: options.repairPacket,
+      raceGroup: options.raceGroup,
+      stop: options.stop,
+    });
+  }
   const writeScope = new WriteScope(subtask.likelyWritePaths, gateway.logger, subtask.id);
   const context = options.compiledContext ?? await compileContext(path, subtask.objective,
     [...writeScope.paths, ...workerReadPaths(subtask, plan.subtasks)], profile,
@@ -94,25 +109,91 @@ export async function implement(
   gateway.logger.log("worker_scope", { subtaskId: subtask.id,
     allowed_write_paths: writeScope.paths, context_files: context.files.map((file) => file.path) });
 
+  const tinyDocs = options.tinyDirect &&
+    subtask.likelyWritePaths.every((file) => /\.(?:md|mdx|txt|rst)$/i.test(file));
   let commands = options.stableRepair?.failedChecks.map((check) => check.command) ??
-    (subtask.verificationCommands.length ? subtask.verificationCommands
-      : options.finalVerificationOnly
-        ? verificationPlan(profile, [...writeScope.paths], true).filter((check) => check.available)
-          .map((check) => check.command)
-        : workerChecks(subtask, profile, context));
+    (tinyDocs
+      ? subtask.likelyWritePaths.flatMap((file) => tinyDocumentationChecks(profile, file))
+      : subtask.verificationCommands.length ? subtask.verificationCommands
+        : options.finalVerificationOnly
+          ? verificationPlan(profile, [...writeScope.paths], true).filter((check) => check.available)
+            .map((check) => check.command)
+          : workerChecks(subtask, profile, context));
+  const profiledCandidates = profile.ecosystem?.projectUnits.flatMap((unit) => unit.verification) ?? [];
+  if (!subtask.verificationCommands.length && !options.stableRepair)
+    commands = commands.filter((command) => {
+      const candidate = profiledCandidates.find((item) => item.command === command);
+      return !candidate || !optionalUnavailableCheck(candidate);
+    });
+  if (tinyDocs && !commands.length && !options.stableRepair)
+    commands = verificationPlan(profile, [...writeScope.paths], true)
+      .filter((check) => check.available).map((check) => check.command);
+  const recovery = !tinyDocs && !commands.length && !options.stableRepair
+    ? await focusedLocalReproduction(profile, task, subtask.likelyWritePaths) : undefined;
+  const recoveredCandidates = recovery ? [recovery] : [];
+  let postMutationRecoveryAttempted = false;
+  if (recovery) {
+    commands = [recovery.command];
+    gateway.logger.log("verification_recovery", { subtaskId: subtask.id,
+      command: recovery.command, source: recovery.source });
+  }
   commands = [...new Set(commands)];
-  const candidates = profile.ecosystem?.projectUnits.flatMap((unit) => unit.verification) ?? [];
-  const runChecks = (selected: string[]) => verify(path, selected,
-    () => Math.min(gateway.config.commandTimeoutMs, gateway.budget.remainingMs()),
-    (check) => gateway.logger.log("verification", { subtaskId: subtask.id, ...check }),
-    writeScope, candidates.map((candidate) =>
-      subtask.verificationCommands.includes(candidate.command)
-        ? { ...candidate, requirement: "required" as const } : candidate));
+  const candidates = profiledCandidates;
+  const runChecks = async (selected: string[], afterMutation = false) => {
+    if (afterMutation && !tinyDocs && !selected.length && !postMutationRecoveryAttempted) {
+      postMutationRecoveryAttempted = true;
+      gateway.logger.log("verification_recovery_attempt", { subtaskId: subtask.id,
+        paths: subtask.likelyWritePaths });
+      const discovered = await recoverPostMutationChecks(path, task, subtask.likelyWritePaths);
+      selected = discovered.map((candidate) => candidate.command);
+      recoveredCandidates.push(...discovered);
+      gateway.logger.log(discovered.length ? "verification_recovery" : "verification_recovery_exhausted", {
+        subtaskId: subtask.id, commands: selected,
+        source: discovered.map((candidate) => candidate.source),
+      });
+    }
+    if (options.finalVerificationOnly && !afterMutation)
+      return verificationResult([]);
+    if (options.finalVerificationOnly && afterMutation && tinyDocs && !selected.length)
+      return verificationResult([]);
+    return verify(path, selected,
+      () => Math.min(gateway.config.commandTimeoutMs, gateway.budget.remainingMs()),
+      (check) => gateway.logger.log("verification", { subtaskId: subtask.id, ...check }),
+      writeScope, [...candidates, ...recoveredCandidates].map((candidate) =>
+        subtask.verificationCommands.includes(candidate.command)
+          ? { ...candidate, requirement: "required" as const } : candidate));
+  };
+  const infrastructureError = (result: VerificationResult) => {
+    const failed = result.checks.find((check) =>
+      (check.requirement ?? "required") === "required" &&
+      (check.outcome === "INFRA_FAILURE" ||
+        (check.outcome === "CHECK_UNAVAILABLE" &&
+          check.unavailable !== "unsafe_verification_command")));
+    return failed
+      ? `${failed.command}: ${failed.unavailable ?? "verification could not execute"}`
+      : undefined;
+  };
   const baseline = options.stableRepair?.baselineChecks?.length
     ? verificationResult(options.stableRepair.baselineChecks)
-    : commands.length ? await runChecks(commands) : verificationResult([]);
+    : options.tinyDirect
+      ? verificationResult([])
+      : commands.length ? await runChecks(commands) : verificationResult([]);
+  const initialInfrastructureError = infrastructureError(baseline);
+  if (initialInfrastructureError) {
+    gateway.logger.log("verification_infrastructure_failure", { subtaskId: subtask.id,
+      error: initialInfrastructureError, checks: baseline.checks });
+    throw Error(`Verification infrastructure unavailable: ${initialInfrastructureError}`);
+  }
   if (infrastructureOnly(baseline))
     return { verification: baseline, role: "CHEAP_CODER_A" as Role, evidence };
+  const docChecksAvailable = tinyDocs &&
+    subtask.likelyWritePaths.some((file) => tinyDocumentationChecks(profile, file).length);
+  if (tinyDocs && commands.length && !docChecksAvailable && !options.stableRepair) {
+    const probe = await runChecks(commands);
+    const probeInfra = infrastructureError(probe);
+    if (probeInfra || infrastructureOnly(probe))
+      return { verification: probe, role: "CHEAP_CODER_A" as Role, evidence };
+  }
 
   const lockedTests = await Promise.all(writeScope.paths.filter((file) =>
     /(?:^|\/)(?:tests?|__tests__)(?:\/|$)|\.(?:test|spec)\./i.test(file)).map(async (file) => ({
@@ -224,6 +305,7 @@ export async function implement(
   let diagnostics = options.stableRepair?.failedChecks.map((check) =>
     `${check.command}\n${check.stderr || check.stdout}`).join("\n");
   let previousFailedDiff = options.stableRepair?.failedDiff;
+  let tinyNoMutationAttempts = 0;
   for (let attempt = 0; attempt < Math.max(1, gateway.config.maxIterations); attempt++) {
     if (options.stop?.()) throw Error("Speculative attempt superseded");
     const checkpoint = await AttemptCheckpoint.capture(path, writeScope);
@@ -320,7 +402,12 @@ export async function implement(
       await checkpoint.restore(path, writeScope);
       const failedModel = model;
       const failedRole = role;
-      const moved = await nextModel();
+      if (options.tinyDirect) {
+        tinyNoMutationAttempts++;
+        if (!adaptiveTier && tinyNoMutationAttempts >= 2)
+          throw Error("Tiny direct task produced no mutation after bounded recovery");
+      }
+      const moved = options.tinyDirect && !adaptiveTier ? false : await nextModel();
       gateway.logger.log("model_attempt", { subtaskId: subtask.id,
         modelRequested: failedModel, modelServed: result.model,
         verification: "NOT_FULLY_VERIFIED", escalated: moved,
@@ -334,18 +421,40 @@ export async function implement(
           reason: "no_mutation" });
         continue;
       }
+      if (options.tinyDirect && !adaptiveTier) {
+        if (tinyNoMutationAttempts < 2) continue;
+        throw Error("Tiny direct task produced no mutation after bounded recovery");
+      }
       throw Error("mini-SWE attempt completed without a candidate diff");
     }
-    if (!commands.length) {
-      const recovered = await recoverPostMutationChecks(path, task, writeScope.paths);
-      commands = recovered.map((candidate) => candidate.command);
+    if (options.tinyDirect && options.finalVerificationOnly) {
+      gateway.logger.log("ready_for_final_verification", { subtaskId: subtask.id,
+        diffBytes: Buffer.byteLength(diff), reason: "tiny_mutation_complete" });
+      if (pool) {
+        if (attemptTier && attemptTier !== "frontier")
+          pool.recordServed(features, subtask.id, eventStart, "VERIFIED_SUCCESS",
+            attempt > 0, undefined, fingerprint);
+        else pool.record(selected?.model ?? ({ id: model } as any), features, subtask.id,
+          eventStart, "VERIFIED_SUCCESS", attempt > 0, undefined, fingerprint);
+      }
+      gateway.logger.log("model_attempt", { subtaskId: subtask.id,
+        modelRequested: model, modelServed: result.model,
+        verification: "VERIFIED_SUCCESS", escalated: attempt > 0,
+        reason: "tiny_mutation_complete" });
+      return { verification: verificationResult([]), role, evidence };
     }
-    const candidateVerification = commands.length ? await runChecks(commands) : verificationResult([]);
+    let postCommands = commands;
+    if (tinyDocs)
+      postCommands = [...new Set(subtask.likelyWritePaths.flatMap((file) =>
+        tinyDocumentationChecks(profile, file)))];
+    const candidateVerification = await runChecks(postCommands, true);
     const relative = verificationAgainstBaseline(baseline, candidateVerification);
     gateway.logger.log("mini_swe_attempt_verification", { subtaskId: subtask.id,
       worker_engine: result.engine, model, outcome: relative.status,
       changed_paths: result.changedPaths, trajectory_path: result.trajectoryPath });
-    if (relative.status === "VERIFIED_SUCCESS" || advisoryInfrastructureOnly(relative)) {
+    if (relative.status === "VERIFIED_SUCCESS" || advisoryInfrastructureOnly(relative) ||
+        (options.tinyDirect && options.finalVerificationOnly &&
+          candidateVerification.status !== "FAILED")) {
       if (pool) {
         if (attemptTier && attemptTier !== "frontier")
           pool.recordServed(features, subtask.id, eventStart, "VERIFIED_SUCCESS",
@@ -357,7 +466,11 @@ export async function implement(
         gateway.logger.log("model_attempt", { subtaskId: subtask.id,
           modelRequested: model, modelServed: result.model,
           verification: "VERIFIED_SUCCESS", escalated: attempt > 0,
-          reason: "focused_verification_passed" });
+          reason: options.tinyDirect ? "tiny_mutation_complete" : "focused_verification_passed" });
+      if (options.tinyDirect && options.finalVerificationOnly) {
+        gateway.logger.log("ready_for_final_verification", { subtaskId: subtask.id,
+          diffBytes: Buffer.byteLength(diff), reason: "tiny_mutation_complete" });
+      }
       return { verification: options.finalVerificationOnly ? verificationResult([]) : relative,
         role, evidence };
     }

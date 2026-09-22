@@ -134,6 +134,7 @@ export async function run(options: RunOptions) {
   let poolRouter: PoolRouter | undefined;
   let plannedSubtasks = 0;
   let coalescedSubtasks = 0;
+  let scheduledTaskParallelPeak = 0;
   let strategy: ExecutionStrategy = {
     execution_strategy: "planned",
     execution_effort: "complex",
@@ -367,6 +368,13 @@ export async function run(options: RunOptions) {
       );
       if (strategy.execution_effort === "tiny")
         directRepairContext = { subtask, context };
+      if (result.verification.checks.some((check) =>
+        check.outcome === "INFRA_FAILURE" || check.outcome === "CHECK_UNAVAILABLE")) {
+        status = "NOT_FULLY_VERIFIED";
+        const failed = result.verification.checks.find((check) =>
+          check.outcome === "INFRA_FAILURE" || check.outcome === "CHECK_UNAVAILABLE");
+        throw Error(`Verification infrastructure unavailable: ${failed?.command}: ${failed?.unavailable ?? failed?.stderr ?? "verification could not execute"}`);
+      }
       if (
         result.verification.status !== "VERIFIED_SUCCESS" &&
         !(
@@ -594,7 +602,7 @@ export async function run(options: RunOptions) {
         });
         await backend!.cleanupWorker(winner.wt);
       };
-      await schedule(plan.subtasks, options.config.maxParallel, execute, (t) =>
+      const { peak: scheduledParallelPeak } = await schedule(plan.subtasks, options.config.maxParallel, execute, (t) =>
         options.config.race &&
         !options.config.forceModel &&
         t.estimatedDifficulty === "high" &&
@@ -602,6 +610,7 @@ export async function run(options: RunOptions) {
           ? 2
           : 1,
       );
+      scheduledTaskParallelPeak = scheduledParallelPeak;
 
       taskVerificationCommands = plan.subtasks.flatMap((t) =>
         t.readOnly === true ? [] : t.verificationCommands,
@@ -1124,8 +1133,11 @@ export async function run(options: RunOptions) {
         `Final verification infrastructure unavailable: ${unavailable.command}: ${unavailable.unavailable ?? "verification could not execute"}`,
       );
   } catch (e) {
-    if (status === "VERIFIED_SUCCESS") status = "FAILED";
-    error = String(e);
+    const message = String(e);
+    if (/Verification infrastructure unavailable/i.test(message))
+      status = "NOT_FULLY_VERIFIED";
+    else if (status === "VERIFIED_SUCCESS") status = "FAILED";
+    error = message;
     logger.log("run_error", { error });
   }
   if (backend && integration) {
@@ -1184,6 +1196,7 @@ export async function run(options: RunOptions) {
       Date.now() - start,
       verification,
       changedFiles,
+      scheduledTaskParallelPeak,
     ),
     execution_strategy: strategy.execution_strategy,
     execution_effort: strategy.execution_effort,
