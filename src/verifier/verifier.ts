@@ -312,9 +312,27 @@ export async function verify(
           ? isolatedVerification(path, cmd, Math.max(1, limit - (Date.now() - started)), false, scope, strict,
               candidate.cwd)
           : command(path, cmd, Math.max(1, limit - (Date.now() - started)), false, scope, undefined, strict);
-        c = await execute(false);
-        const environmentFailure = c.exitCode !== 0 && runtimeInfrastructureFailure(c);
-        if (environmentFailure && environmentFailure !== "verification_network_environment" && /\b(?:python(?:\d+(?:\.\d+)?)?|pytest|tox)\b/i.test(cmd) &&
+        const pythonCommand =
+          /\b(?:python(?:\d+(?:\.\d+)?)?|pytest|tox)\b/i.test(cmd);
+        const candidateRequirement =
+          candidate?.requirement ??
+          (candidate?.origin === "inferred" || candidate?.origin === "generic"
+            ? "advisory"
+            : "required");
+        const strictDependencyEnvironment =
+          !!candidate?.requiresInstalledDependencies &&
+          pythonCommand &&
+          candidateRequirement === "required";
+
+        c = await execute(strictDependencyEnvironment);
+
+        const environmentFailure =
+          c.exitCode !== 0 && runtimeInfrastructureFailure(c);
+
+        if (!strictDependencyEnvironment &&
+            environmentFailure &&
+            environmentFailure !== "verification_network_environment" &&
+            pythonCommand &&
             limit - (Date.now() - started) > 100) {
           c = await execute(true);
           c.infrastructureRecoveryAttempts = 1;

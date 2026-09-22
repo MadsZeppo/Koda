@@ -41,7 +41,9 @@ class MockCodingWorker implements CodingWorker {
       input.writeScope.every((path) => /\.(?:md|mdx|txt|rst)$/i.test(path));
     const tinyTools = tinyDirect &&
       input.writeScope.every((path) => input.context?.completePaths?.includes(path))
-      ? toolDefinitions.filter((tool) => tool.function.name === "write_file")
+      ? toolDefinitions.filter(
+        (tool) => "function" in tool && tool.function.name === "write_file",
+      )
       : toolDefinitions;
     const start = this.gateway.logger.events.length;
     try {

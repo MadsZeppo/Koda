@@ -14,7 +14,6 @@ import { objectiveCanBeAlreadySatisfied, workerChecks,
   workerChecksAreTaskSpecific, tinyDocumentationChecks } from "../verifier/selection.js";
 import { optionalUnavailableCheck, focusedLocalReproduction,
   recoverPostMutationChecks } from "../verifier/recovery.js";
-import { implementStablePacket } from "./stableExecutor.js";
 import { advisoryInfrastructureOnly, verify, verificationAgainstBaseline,
   verificationRegressed, verificationResult } from "../verifier/verifier.js";
 import type { StableImplementationHandoff } from "./stable.js";
@@ -79,19 +78,6 @@ export async function implement(
   profile: RepoProfile,
   options: MiniSweImplementationOptions = {},
 ) {
-  if (options.finalVerificationOnly && options.stableHandoff && options.repairPacket &&
-      !options.stableRepair) {
-    return implementStablePacket(gateway, path, task, subtask, plan, profile, {
-      evidence: options.evidence,
-      compiledContext: options.compiledContext,
-      selectedCandidate: options.selectedCandidate,
-      model: options.model,
-      stableHandoff: options.stableHandoff,
-      repairPacket: options.repairPacket,
-      raceGroup: options.raceGroup,
-      stop: options.stop,
-    });
-  }
   const writeScope = new WriteScope(subtask.likelyWritePaths, gateway.logger, subtask.id);
   const context = options.compiledContext ?? await compileContext(path, subtask.objective,
     [...writeScope.paths, ...workerReadPaths(subtask, plan.subtasks)], profile,
@@ -152,8 +138,6 @@ export async function implement(
         source: discovered.map((candidate) => candidate.source),
       });
     }
-    if (options.finalVerificationOnly && !afterMutation)
-      return verificationResult([]);
     if (options.finalVerificationOnly && afterMutation && tinyDocs && !selected.length)
       return verificationResult([]);
     return verify(path, selected,
@@ -338,6 +322,7 @@ export async function implement(
         sourceFiles: context.files,
         completePaths: context.completePaths,
         diagnostics, previousFailedDiff, evidence,
+        repairPacket: options.repairPacket,
       } });
     gateway.logger.log("coding_worker_stop", { subtaskId: subtask.id,
       worker_engine: result.engine, mini_swe_version: result.engineVersion,
@@ -448,6 +433,17 @@ export async function implement(
       postCommands = [...new Set(subtask.likelyWritePaths.flatMap((file) =>
         tinyDocumentationChecks(profile, file)))];
     const candidateVerification = await runChecks(postCommands, true);
+
+    if (options.stableHandoff) {
+      gateway.logger.log("stable_focused_verification", {
+        subtaskId: subtask.id,
+        worker_engine: result.engine,
+        model,
+        status: candidateVerification.status,
+        checks: candidateVerification.checks,
+      });
+    }
+
     const relative = verificationAgainstBaseline(baseline, candidateVerification);
     gateway.logger.log("mini_swe_attempt_verification", { subtaskId: subtask.id,
       worker_engine: result.engine, model, outcome: relative.status,

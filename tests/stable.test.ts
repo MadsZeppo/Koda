@@ -1155,7 +1155,7 @@ test("stable mode locks scope, preserves work across transient fallback, and ver
     });
     assert.equal(result.execution_strategy, "stable");
     assert.equal(result.plannerModelCalls, 0);
-    assert.equal(result.coderExecutions, 1);
+    assert.equal(result.coderExecutions, 2);
     assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
     assert.equal(repairCodingCalls, 0);
     assert.equal(result.fallbacks, 1);
@@ -1169,84 +1169,60 @@ test("stable mode locks scope, preserves work across transient fallback, and ver
         .allowed_write_paths,
       ["src/calculator.cjs", "tests/calculator.test.cjs"],
     );
-    const firstCoderRequest = requests.find(
-      (request) =>
-        request.model === "cheap" &&
-        !request.messages[0].content.includes("read-only inspection phase") &&
-        !request.tools?.some((tool: any) => tool.function?.name === "lock_write_scope"),
+    const codingStarts = events.filter(
+      (event) =>
+        event.type === "coding_worker_start" &&
+        event.worker_engine === "mini-swe-agent",
     );
-    assert.match(
-      firstCoderRequest.messages[0].content,
-      /Inspection is complete\. Implement the change now/,
+    const codingStops = events.filter(
+      (event) =>
+        event.type === "coding_worker_stop" &&
+        event.worker_engine === "mini-swe-agent",
     );
-    assert.match(firstCoderRequest.messages[0].content, /The RepairPacket contains the locked file contents/);
-    assert.match(firstCoderRequest.messages[0].content, /Do not read, search, inspect, or run commands/);
-    const coderInput = JSON.parse(firstCoderRequest.messages[1].content);
-    assert.match(coderInput.inspectionHandoff.issue, /Inspect src\/calculator\.cjs/);
-    assert.match(coderInput.inspectionHandoff.requiredChange, /Inspect src\/calculator\.cjs/);
-    assert.deepEqual(coderInput.inspectionHandoff.evidence.relevantFiles,
-      ["src/calculator.cjs", "tests/calculator.test.cjs"]);
-    assert.deepEqual(coderInput.repairPacket.allowedWritePaths,
-      ["src/calculator.cjs", "tests/calculator.test.cjs"]);
-    assert.deepEqual(coderInput.repairPacket.files.map((file: any) => file.path),
-      coderInput.repairPacket.allowedWritePaths);
-    assert.deepEqual(firstCoderRequest.tools.map((tool: any) => tool.function.name),
-      ["apply_patch", "edit_file", "write_file"]);
-    assert.equal(firstCoderRequest.tool_choice, "required");
-    const lockedAt = events.findIndex(
-      (event) => event.type === "stable_scope_locked",
-    );
+
+    assert.equal(codingStarts.length, 2);
+    assert.equal(codingStops.length, 2);
     assert.deepEqual(
-      events
-        .slice(lockedAt + 1)
-        .filter((event) => event.type === "tool")
-        .slice(0, 2)
-        .map((event) => event.name),
-      ["apply_patch"],
+      codingStarts.map((event) => event.model),
+      ["cheap", "strong"],
     );
-    assert.equal(
-      events.filter((event) => event.type === "verification").length,
-      0,
-    );
-    assert.deepEqual(
-      events.find((event) => event.type === "verification_selection").commands,
-      ["npm run test", "npm run typecheck"],
-    );
-    assert.equal(
-      events.filter((event) => event.type === "final_verification").length,
-      2,
-    );
+
+    for (const event of codingStarts) {
+      assert.deepEqual(event.assigned_write_scope, [
+        "src/calculator.cjs",
+        "tests/calculator.test.cjs",
+      ]);
+    }
+
     assert.ok(
-      events
-        .filter((event) => event.type === "final_verification")
-        .slice(-2)
-        .every((event) => event.outcome === "CHECK_PASS"),
+      events.some(
+        (event) =>
+          event.type === "mini_swe_fallback" &&
+          event.from === "cheap" &&
+          event.to === "strong",
+      ),
+      "operational failure should fall back from cheap to strong through mini-SWE",
     );
-    assert.equal(events.filter((event) => event.type === "stable_repair_verification").length, 0);
-    assert.ok(events.some((event) => event.type === "stable_focused_verification" && event.outcome === "CHECK_PASS"));
-    assert.equal(
-      events.find((event) => event.type === "ready_for_final_verification")
-        .reason,
-      "focused_check_passed_final_verification_pending",
+
+    assert.ok(
+      events.some(
+        (event) =>
+          event.type === "mini_swe_attempt_verification" &&
+          event.model === "strong" &&
+          event.outcome === "VERIFIED_SUCCESS",
+      ),
+      "strong mini-SWE attempt should pass Koda verification",
     );
-    assert.equal(events.filter((event) => event.type === "stable_action_repair").length, 0);
-    assert.equal(events.filter((event) => event.type === "stable_mutation_repair").length, 0);
-    const focused = events.find(
-      (event) => event.type === "stable_context_focused",
+
+    assert.ok(
+      events.some(
+        (event) =>
+          event.type === "stable_focused_verification" &&
+          event.status === "VERIFIED_SUCCESS",
+      ),
+      "Stable handoff should still receive focused Koda verification",
     );
-    assert.deepEqual(focused.files, [
-      "src/calculator.cjs",
-      "tests/calculator.test.cjs",
-    ]);
-    const fallback = events.find((event) => event.type === "model_fallback");
-    assert.equal(fallback.previous_model, "cheap");
-    assert.equal(fallback.selected_model, "strong");
-    assert.ok(!events.some((event) => event.type === "specialist_outcome" &&
-      event.model === "cheap" && event.verification === "FAILED"));
-    assert.deepEqual(JSON.parse(requests.find((request) =>
-      request.model === "strong" && !request.tools?.some((tool: any) =>
-        tool.function?.name === "lock_write_scope")).messages[1].content)
-      .repairPacket.allowedWritePaths, ["src/calculator.cjs", "tests/calculator.test.cjs"]);
+
     assert.match(
       await readFile(
         join(result.integration!.path, "src/calculator.cjs"),

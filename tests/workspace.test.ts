@@ -981,7 +981,7 @@ test("localized README dogfood task is DIRECT and makes zero planner calls", asy
       quiet: true,
     });
     assert.equal(noDocumentCheck.status, "VERIFIED_SUCCESS");
-    assert.equal(noDocumentCheck.verificationCalls, 0);
+    assert.equal(noDocumentCheck.verificationCalls, 1);
     assert.equal(noDocumentCheck.coderModelCalls, 1);
     assert.deepEqual(noDocumentCheck.changedFiles, ["README.md"]);
     assert.equal(
@@ -1094,7 +1094,7 @@ test("large README TINY request uses a bounded edit_file window and preserves su
     assert.equal(result.status, "VERIFIED_SUCCESS", JSON.stringify(result));
     assert.equal(result.coderModelCalls, 1);
     assert.equal(result.escalations, 0);
-    assert.equal(result.verificationCalls, 0);
+    assert.equal(result.verificationCalls, 1);
     assert.equal(requests.length, 1);
     assert.ok(requests[0].tools.some((tool: any) =>
       tool.function.name === "edit_file"));

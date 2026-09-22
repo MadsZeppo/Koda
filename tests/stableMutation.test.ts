@@ -644,8 +644,12 @@ test("exact Stable CLI task mutates from a bounded RepairPacket before targeted 
     assert.equal(events.filter((event) => event.type === "stable_finalization_start").length, 0);
     assert.ok(events.findIndex((event) => event.type === "stable_context_focused") > lock);
     assert.equal(requests.length, 1, "local discovery avoids an inspection-model call");
-    const mutation = events.findIndex((event) => event.type === "write_success" && event.source === "apply_patch");
-    const focused = events.findIndex((event) => event.type === "stable_focused_verification");
+    const mutation = events.findIndex((event) =>
+      event.type === "coding_worker_stop" &&
+      event.worker_engine === "mini-swe-agent" &&
+      (event.actual_changed_paths?.length ?? 0) > 0);
+    const focused = events.findIndex((event) =>
+      event.type === "stable_focused_verification");
     const final = events.findIndex((event) => event.type === "final_verification");
     assert.ok(lock >= 0 && mutation > lock && focused > mutation && final > focused);
     assert.ok(!events.slice(lock, mutation).some((event) => event.type === "tool" &&

@@ -7,6 +7,8 @@ export interface CodingWorkerContext {
   previousFailedDiff?: string;
   /** Bounded, repository-derived evidence supporting the selected mutation scope. */
   evidence?: unknown;
+  /** Stable's bounded localization packet. mini-SWE may use it as implementation context. */
+  repairPacket?: unknown;
 }
 
 export interface CodingWorkerInput {

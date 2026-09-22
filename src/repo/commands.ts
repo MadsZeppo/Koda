@@ -168,7 +168,12 @@ export async function pythonSandboxEnvironment(
   };
   if (!selected && inherited.VIRTUAL_ENV && !inheritedLocal) {
     selected = await usableEnvironment(inherited.VIRTUAL_ENV, true);
-    if (!selected && unsafeSelectedEnvironment) unsafeSelectedEnvironment = false;
+
+    // An unsafe activated environment is fatal only when verification
+    // explicitly requires that dependency environment. Otherwise it must not
+    // poison an ordinary repository that can safely use system Python.
+    if (!selected && unsafeSelectedEnvironment && !strict)
+      unsafeSelectedEnvironment = false;
   }
   if (!selected) await probeSystemPython();
   const virtualEnv = selected?.environmentRoot;

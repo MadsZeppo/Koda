@@ -97,7 +97,11 @@ async function localStableScope(
   };
   const tests = await Promise.all(profile.files.filter(isTestPath).slice(0, 64)
     .map(async (file) => ({ file, text: await safeText(file) })));
-  const taskTargets = explicit.length ? explicit : named.length ? named : sources.length === 1 ? sources : [];
+  const taskTargets = explicit.length
+    ? explicit
+    : named.length
+      ? named
+      : [];
   const directlyTested = taskTargets.filter((candidate) => tests.some(({ file, text }) =>
     text !== undefined && resolveImports(file, text, known).includes(candidate)));
   const anchors = taskTargets.length > 1 && directlyTested.length === 1
@@ -339,6 +343,17 @@ export async function prepareStableWorker(
    * gathered or Stable fails closed.
    */
   const finalizationTools = [lockWriteScopeTool, reportNoScopeTool] as any;
+
+  // Progressive narrowing: after the first navigation turn Stable should gather
+  // concrete file contents, not repeatedly spend turns on list_files or shell ls.
+  const focusedInspectionTools = inspectionTools.filter((tool: any) =>
+    ["read_file", "search_code", "lock_write_scope", "report_no_scope"]
+      .includes(tool.function.name),
+  ) as any;
+  const readInspectionTools = inspectionTools.filter((tool: any) =>
+    ["read_file", "lock_write_scope", "report_no_scope"]
+      .includes(tool.function.name),
+  ) as any;
 
   const messages: ChatCompletionMessageParam[] = [
     {
@@ -782,7 +797,9 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
       const hits = termHits(snippet);
       const stem = posix.basename(file).replace(/\.[^.]+$/, "").toLowerCase();
       const explicit = task.includes(file);
-      return (explicit ? 30 : 0) + Math.min(18, hits.length * 3) +
+      return (explicit ? 30 : 0) +
+        (searchHits.has(file) ? 10 : 0) +
+        Math.min(18, hits.length * 3) +
         (significantTerms.includes(stem) ? 8 : 0) +
         (referencedByFocusedTest(file) ? 12 : 0);
     };
@@ -862,6 +879,7 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
     // not evidence, but an explicitly named path may seed one bounded read.
     const candidates = [...new Set([
       ...context.files.filter((entry) => meaningfulSnippet(entry.path)).map((entry) => entry.path),
+      ...searchHits,
       ...subtask.likelyReadPaths.filter((file) => task.includes(file)),
     ])].filter((file) => known.has(file) && isSourcePath(file) && !isTestPath(file))
       .map((file) => ({ file, score: preliminaryScore(file) }))
@@ -947,7 +965,22 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
       subtaskId: subtask.id, reason, attempt: 1,
       inspected_candidates: readCandidates, paths: paths ?? [],
     });
-    if (!paths) return undefined;
+    if (!paths) {
+      if (readCandidates.length) {
+        messages.push({
+          role: "user",
+          content: JSON.stringify({
+            runtimeInspectionEvidence: readCandidates.map((file) => ({
+              path: file,
+              snippet: sourceText(file).slice(0, 1800),
+            })),
+            instruction:
+              "Navigation/search evidence was converted into concrete file reads. Use these reads to narrow the implementation. Do not spend another turn relisting the repository.",
+          }),
+        });
+      }
+      return undefined;
+    }
     return acceptLock(JSON.stringify({
       paths,
       reason: `Focused repository evidence supports changes in ${paths.join(", ")}`,
@@ -1148,7 +1181,15 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
     }
 
     for (let iteration = 0; iteration < 3; iteration++) {
-      const message = await call(iteration, inspectionTools);
+      const hasInspectedSource = [...inspected].some((file) =>
+        known.has(file) && isSourcePath(file) && !isTestPath(file));
+      const availableInspectionTools = iteration === 0
+        ? inspectionTools
+        : searchHits.size && !hasInspectedSource
+          ? readInspectionTools
+          : focusedInspectionTools;
+
+      const message = await call(iteration, availableInspectionTools);
 
       const prepared = await processMessage(message, true);
 
@@ -1156,18 +1197,39 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
         return prepared;
       }
 
-      if (iteration === 0 && !tools.progressEvidence.length) {
+      const sourceReadAfterTurn = [...inspected].some((file) =>
+        known.has(file) && isSourcePath(file) && !isTestPath(file));
+
+      // Search/list output is navigation evidence, not sufficient mutation
+      // authority. Convert the first turn's search hits into bounded concrete
+      // reads before Stable is allowed to drift into more inventory commands.
+      if (iteration === 0 && !sourceReadAfterTurn) {
         const fallback = await acquireActionableScope(
-          lastScopeError || "Initial Stable inspection produced no repository evidence",
+          lastScopeError ||
+            (tools.progressEvidence.length
+              ? "Initial Stable inspection found navigation evidence but no implementation file was read"
+              : "Initial Stable inspection produced no repository evidence"),
         );
         if (fallback) return fallback;
-        throw Error("Stable inspection found no actionable evidence after its bounded fallback");
+
+        if (!tools.progressEvidence.length)
+          throw Error("Stable inspection found no actionable evidence after its bounded fallback");
+
+        messages.push({
+          role: "user",
+          content:
+            "You have navigation evidence but no justified write scope yet. Read the most relevant exact source/test files from the search results before finalization. Do not call list_files or use shell ls again.",
+        });
       }
 
+      const sourceReadNow = [...inspected].some((file) =>
+        known.has(file) && isSourcePath(file) && !isTestPath(file));
       const relevant = subtask.likelyReadPaths.filter((file) => profile.files.includes(file));
-      if (new Set(tools.progressEvidence).size &&
-          (relevant.length ? relevant.every((file) => inspected.has(file)) :
-            new Set(tools.progressEvidence).size >= 2)) break;
+      if (sourceReadNow && new Set(tools.progressEvidence).size &&
+          (relevant.length
+            ? relevant.filter((file) => isSourcePath(file) && !isTestPath(file))
+                .every((file) => inspected.has(file))
+            : new Set(tools.progressEvidence).size >= 2)) break;
 
       /**
        * If the model emitted plain text, remind it that text does not
@@ -1181,7 +1243,7 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
           role: "user",
 
           content:
-            "Stable inspection is not completed by text. If you already have enough concrete evidence, call lock_write_scope now. Otherwise use the remaining inspection budget efficiently.",
+            "Stable inspection is not completed by text. If you already have enough concrete evidence, call lock_write_scope now. Otherwise read/search the smallest relevant files; do not relist the repository.",
         });
       }
     }
@@ -1205,7 +1267,7 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
       subtaskId: subtask.id, model, evidence_count: tools.progressEvidence.length,
     });
     const summary = await scopeSummary();
-    const scopeDeadline = Date.now() + Math.min(10000, gateway.config.commandTimeoutMs);
+    const scopeDeadline = Date.now() + Math.min(15000, gateway.config.commandTimeoutMs);
     const compatible = (candidate: Candidate | undefined) =>
       candidate?.model.strengths.includes("tool_use") &&
       supportsParameters(candidate.metadata, ["tools", "tool_choice"]);
