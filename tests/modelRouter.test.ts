@@ -59,6 +59,23 @@ const rank = (
     1000,
     100,
   ).filter((c) => !c.rejected)[0];
+test("soft quality targets never remove the last compatible affordable pool model", () => {
+  const choose = (budgetUsd: number, excluded = new Set<string>()) => rankCandidates(
+    [{ ...cheap, qualityPrior: 0.6 }, frontier], metadata, [], features,
+    routingSchema.parse({ minimumQuality: 0.99 }), 1000, 100,
+    { budgetUsd, excluded },
+  );
+  const candidates = choose(0.001);
+  assert.equal(candidates[0]!.model.id, cheap.id);
+  assert.equal(candidates[0]!.hardRejection, undefined);
+  assert.equal(candidates[0]!.rejected, undefined);
+  assert.deepEqual(candidates[0]!.softPenalties, ["below preferred quality target"]);
+  assert.equal(candidates.find((candidate) => candidate.model.id === frontier.id)?.hardRejection,
+    "remaining budget");
+  assert.equal(choose(1, new Set([frontier.id])).find((candidate) => !candidate.hardRejection)?.model.id,
+    cheap.id, "excluded stronger candidates cannot prevent the remaining route");
+  assert.ok(choose(0).every((candidate) => candidate.hardRejection === "remaining budget"));
+});
 test("quality gate precedes cost; latency breaks similar-cost ties", () => {
   assert.equal(rank()?.model.id, "cheap");
   assert.equal(

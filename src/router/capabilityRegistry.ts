@@ -25,6 +25,11 @@ export interface SpecialistModel {
   configured: boolean;
 }
 export interface ModelSnapshot { models: any[]; benchmarks: any[]; classifications: any[]; retrievedAt: number; baseUrl: string }
+interface ExternalPriorCache {
+  benchmarks: any[];
+  unmatched: string[];
+  retrievedAt: number;
+}
 /** Discovery is independent of the OpenAI-compatible inference transport. */
 export interface ModelDiscoveryAdapter { discover(): Promise<ModelSnapshot> }
 const clamp = (n: number) => Math.max(0, Math.min(1, n));
@@ -34,6 +39,12 @@ const price = (raw: any, key: "prompt" | "completion") => {
   const values = [raw?.pricing, ...(raw?.pricing?.overrides ?? [])].map((p: any) => p?.[key]).filter((v: unknown) => v !== undefined);
   if (!values.length || values.some((v: unknown) => !Number.isFinite(Number(v)) || Number(v) < 0 || (typeof v === "string" && !v.trim()))) return undefined;
   return Math.max(...values.map(Number)) * 1e6;
+};
+const endpointParameterSets = (raw: any): string[][] | undefined => {
+  const endpoints = Array.isArray(raw?.endpoints) ? raw.endpoints : undefined;
+  return endpoints?.map((endpoint: any) => endpoint?.supported_parameters)
+    .filter((parameters: unknown): parameters is string[] =>
+      Array.isArray(parameters) && parameters.every((item) => typeof item === "string"));
 };
 const marketPattern = (primary: TaskFingerprint["primary"]) => ({
   frontend_ui: /front|ui|design|web/, fullstack: /code|web|agent/,
@@ -101,7 +112,10 @@ export class CapabilityRegistry {
     const data = (index: number) => settled[index]?.status === "fulfilled" ? (settled[index] as PromiseFulfilledResult<any>).value?.data : undefined;
     const models = Array.isArray(data(0)) ? data(0) : cached?.models ?? [];
     const classifications = Array.isArray(data(1)?.classifications) ? data(1).classifications : cached?.classifications ?? [];
-    const benchmarks = Array.isArray(data(2)) ? data(2) : cached?.benchmarks ?? [];
+    const providerBenchmarks = (Array.isArray(data(2)) ? data(2) : cached?.benchmarks ?? [])
+      .filter((row: any) => row?.source !== "artificial-analysis");
+    const externalBenchmarks = await this.artificialAnalysisBenchmarks(force);
+    const benchmarks = [...externalBenchmarks, ...providerBenchmarks];
     const snapshot = { models, classifications, benchmarks, retrievedAt: Date.now(), baseUrl: this.config.baseUrl };
     if (settled.some((result) => result.status === "fulfilled")) {
       try {
@@ -113,8 +127,63 @@ export class CapabilityRegistry {
     }
     return snapshot;
   }
+  private async artificialAnalysisBenchmarks(force: boolean): Promise<any[]> {
+    const file = join(this.catalog.directory, "artificial-analysis.json");
+    let cached: ExternalPriorCache | undefined;
+    try {
+      const parsed = JSON.parse(await readFile(file, "utf8"));
+      if (Array.isArray(parsed.benchmarks) && Array.isArray(parsed.unmatched) &&
+          typeof parsed.retrievedAt === "number") cached = parsed;
+    } catch {}
+    const key = process.env.ARTIFICIAL_ANALYSIS_API_KEY;
+    if (!key) return cached?.benchmarks ?? [];
+    if (!force && cached && Date.now() - cached.retrievedAt < this.config.routing.cacheTtlMs)
+      return cached.benchmarks;
+    try {
+      const endpoint = process.env.KODA_ARTIFICIAL_ANALYSIS_URL ??
+        "https://artificialanalysis.ai/api/v2/language/models";
+      const response = await fetch(endpoint, {
+        headers: { "x-api-key": key }, signal: AbortSignal.timeout(3000),
+      });
+      if (!response.ok) throw Error(`Artificial Analysis metadata HTTP ${response.status}`);
+      const payload = await response.json() as any;
+      const rows = Array.isArray(payload?.data) ? payload.data : [];
+      const benchmarks: any[] = [];
+      const unmatched: string[] = [];
+      for (const row of rows) {
+        // Artificial Analysis documents openrouter_api_id as the explicit
+        // provider mapping. Never guess from display names or mutable slugs.
+        const id = row?.openrouter_api_id ?? row?.api_ids?.openrouter;
+        if (typeof id !== "string" || !id.includes("/")) {
+          if (typeof row?.id === "string") unmatched.push(row.id);
+          continue;
+        }
+        const evaluations = row.evaluations ?? {};
+        benchmarks.push({
+          model_permaslug: id,
+          coding_index: finite(evaluations.artificial_analysis_coding_index),
+          reasoning_index: finite(evaluations.artificial_analysis_intelligence_index),
+          intelligence_index: finite(evaluations.artificial_analysis_intelligence_index),
+          throughput_tokens_per_second: finite(row.median_output_tokens_per_second),
+          latency_seconds: finite(row.median_time_to_first_token_seconds),
+          source: "artificial-analysis",
+        });
+      }
+      const value: ExternalPriorCache = { benchmarks, unmatched, retrievedAt: Date.now() };
+      try {
+        await mkdir(this.catalog.directory, { recursive: true });
+        const temp = file + "." + randomUUID();
+        await writeFile(temp, JSON.stringify(value));
+        await rename(temp, file);
+      } catch {}
+      return benchmarks;
+    } catch {
+      return cached?.benchmarks ?? [];
+    }
+  }
   private async load(): Promise<SpecialistModel[]> {
-    if (!this.pending) this.pending = this.cachedSnapshot().then((snapshot) => this.build(snapshot));
+    if (!this.pending) this.pending = (this.adapter ? this.cachedSnapshot() : this.fetchSnapshot(false))
+      .then((snapshot) => this.build(snapshot));
     return this.pending;
   }
   private async build(snapshot: ModelSnapshot) {
@@ -132,6 +201,13 @@ export class CapabilityRegistry {
     // routing rejection, not a reason to hide a model from the candidate set.
     const ids = new Set([...configured.map((m) => m.id), ...raw.keys(), ...benchmarks.keys()]);
     const catalog = this.adapter ? new Map<string, Metadata>() : await this.catalog.getCached();
+    const endpointProofRequired = !this.adapter && (() => {
+      try {
+        return /(?:^|\.)openrouter\.ai$/i.test(new URL(this.config.baseUrl).hostname);
+      } catch {
+        return false;
+      }
+    })();
     const result: SpecialistModel[] = [];
     const dynamic: [string, Metadata][] = [];
     for (const id of ids) {
@@ -145,11 +221,14 @@ export class CapabilityRegistry {
       const terminal = rows.map((row) => finite(row.terminal_index)).find((n) => n !== undefined);
       const designs = rows.filter((row) => row.source === "design-arena" && /ui|design|component|web/i.test(String(row.category ?? row.benchmark_type ?? "")));
       const design = designs.map((row) => finite(row.elo) ?? finite(row.rating) ?? finite(row.score)).find((n) => n !== undefined);
+      const cachedMetadata = catalog.get(id) ?? existing?.fallback ?? {};
       const metadata: Metadata = source ? {
         inputPrice: price(source, "prompt"), outputPrice: price(source, "completion"),
         contextLength: finite(source.context_length), available: true,
         supportedParameters: Array.isArray(source.supported_parameters) ? source.supported_parameters : undefined,
-      } : catalog.get(id) ?? existing?.fallback ?? {};
+        routableParameterSets: endpointParameterSets(source) ??
+          cachedMetadata.routableParameterSets ?? (endpointProofRequired ? [] : undefined),
+      } : cachedMetadata;
       const vision = (source?.architecture?.input_modalities ?? []).includes("image") || /image/.test(source?.architecture?.modality ?? "") || !!existing?.strengths.includes("vision");
       const evidence: SpecialistEvidence[] = [];
       const capabilityEvidence: NormalizedCapabilityEvidence[] = [
@@ -165,8 +244,9 @@ export class CapabilityRegistry {
         ...(metadata.supportedParameters?.includes("tools") ? [{ capability: "tool_use", quality: 1, source: "metadata" as const }] : []),
       ];
       if (existing) evidence.push({ source: "configured_prior", value: existing.qualityPrior, detail: "Koda configured quality prior" });
-      if (coding !== undefined) evidence.push({ source: "coding_benchmark", value: clamp(coding / 100), detail: "OpenRouter coding index" });
-      if (agentic !== undefined) evidence.push({ source: "agentic_benchmark", value: clamp(agentic / 100), detail: "OpenRouter agentic index" });
+      const external = rows.some((row) => row.source === "artificial-analysis");
+      if (coding !== undefined) evidence.push({ source: "coding_benchmark", value: clamp(coding / 100), detail: external ? "Artificial Analysis coding index" : "OpenRouter coding index" });
+      if (agentic !== undefined) evidence.push({ source: "agentic_benchmark", value: clamp(agentic / 100), detail: external ? "Artificial Analysis agentic index" : "OpenRouter agentic index" });
       if (reasoning !== undefined) evidence.push({ source: "reasoning_benchmark", value: clamp(reasoning / 100), detail: "Cached reasoning index" });
       if (terminal !== undefined) evidence.push({ source: "terminal_benchmark", value: clamp(terminal / 100), detail: "Cached terminal index" });
       if (design !== undefined) evidence.push({ source: "design_benchmark", value: design, detail: "OpenRouter Design Arena UI/category evidence" });

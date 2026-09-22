@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import { delimiter, join, posix } from "node:path";
 import { parse } from "smol-toml";
 import { safePath } from "../agent/tools.js";
-import { dependencyPathAvailable } from "./dependencies.js";
+import { dependencyPathAvailable, pythonEnvironmentForWorkspace } from "./dependencies.js";
 
 export type Ecosystem = "javascript" | "python" | "generic";
 export type CheckKind = "test" | "typecheck" | "lint" | "build" | "check";
@@ -732,11 +732,15 @@ export async function detectEcosystem(
         )
           unit.taskRunners.push(runner);
       let environment: string | undefined;
+      let environmentRoot: string | undefined;
       for (const env of [".venv", "venv"])
         if (await exists(at(dir, env + "/pyvenv.cfg"))) {
           environment = env;
+          environmentRoot = join(root, at(dir, env));
           break;
         }
+      const bridgedPython = !environment ? await pythonEnvironmentForWorkspace(root) : undefined;
+      if (bridgedPython) environmentRoot = bridgedPython;
       const pybin = environment
         ? at(
             environment,
@@ -746,24 +750,24 @@ export async function detectEcosystem(
       const python =
         pybin && (await exists(at(dir, pybin)))
           ? quote("./" + pybin)
-          : undefined;
+          : bridgedPython ? "python" : undefined;
       const installed = async (module: string) => {
-        if (!environment || !python) return false;
-        const envroot = at(dir, environment);
+        if (!environmentRoot || !python) return false;
         const candidates =
           process.platform === "win32"
-            ? [at(envroot, "Lib/site-packages")]
-            : await readdir(join(root, envroot, "lib"))
+            ? [join(environmentRoot, "Lib/site-packages")]
+            : await readdir(join(environmentRoot, "lib"))
                 .then((ds) =>
                   ds
                     .filter((d) => /^python\d/.test(d))
                     .slice(0, 4)
-                    .map((d) => at(envroot, `lib/${d}/site-packages`)),
+                    .map((d) => join(environmentRoot!, `lib/${d}/site-packages`)),
                 )
                 .catch(() => []);
         return (
           await Promise.all(
-            candidates.map((p) => exists(at(p, module.replaceAll("-", "_")))),
+            candidates.map((p) => access(join(p, module.replaceAll("-", "_")))
+              .then(() => true).catch(() => false)),
           )
         ).some(Boolean);
       };

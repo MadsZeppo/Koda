@@ -20,7 +20,7 @@ import { schedule } from "../src/orchestrator/scheduler.js";
 import { Gateway } from "../src/openrouter/client.js";
 import { Budget } from "../src/openrouter/usage.js";
 import { Logger } from "../src/telemetry/logger.js";
-import { run } from "../src/run.js";
+import { run } from "./helpers/run.js";
 import { extractFeatures } from "../src/router/features.js";
 import { rankCandidates } from "../src/router/modelRouter.js";
 import type { Attempt } from "../src/router/history.js";

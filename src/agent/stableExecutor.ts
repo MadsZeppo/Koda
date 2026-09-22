@@ -4,12 +4,13 @@ import type { ChatCompletionMessageParam } from "openai/resources/chat/completio
 import type { Gateway } from "../openrouter/client.js";
 import { canFallback } from "../openrouter/client.js";
 import type { Candidate } from "../router/modelRouter.js";
+import { supportsParameters } from "../router/pool.js";
 import { extractFeatures } from "../router/features.js";
 import { taskFingerprint } from "../router/taskFingerprint.js";
 import type { Role } from "../router/modelRegistry.js";
 import type { Subtask, Plan, EvidencePacket } from "../planner/schemas.js";
 import type { RepoProfile, VerificationResult } from "../types.js";
-import type { WorkerContext } from "../context/compiler.js";
+import { isTestPath, type WorkerContext } from "../context/compiler.js";
 import { boundMessages, truncateBytes } from "../context/bounds.js";
 import { advisoryInfrastructureOnly, verify, verificationResult, verificationRegressed, verificationAgainstBaseline } from "../verifier/verifier.js";
 import { workerChecks, workerChecksAreTaskSpecific } from "../verifier/selection.js";
@@ -29,6 +30,8 @@ import type { StableImplementationHandoff } from "./stable.js";
 import type { RepairPacket } from "./repairPacket.js";
 import { STABLE_EVENTS } from "./executionEvents.js";
 import { AttemptCheckpoint } from "./attemptCheckpoint.js";
+import { taskRelevantMutationPaths, testRequirementAlreadyCovered } from "./mutationInvariant.js";
+import { retrieveSourceGrounding } from "../context/sourceGrounding.js";
 
 export interface StablePacketOptions {
   evidence?: EvidencePacket;
@@ -125,18 +128,94 @@ export async function implementStablePacket(
       .filter((candidate) => focusedCommands.includes(candidate.command)),
   });
 
+  // An explicit test-only request can already be present in the repository.
+  // Prove that from assertion code plus its passing focused check before model
+  // selection; a green suite alone or matching filenames are insufficient.
+  const lockedTestFiles = await Promise.all(writeScope.paths.filter(isTestPath).map(async (file) => ({
+    path: file,
+    content: await readFile(await safePath(path, file), "utf8").catch(() => ""),
+  })));
+  const coveredTestRequirement = testRequirementAlreadyCovered(task, lockedTestFiles);
+  const baselineCommands = focusedCommands.length
+    ? focusedCommands
+    : coveredTestRequirement ? selectionCommands.slice(0, 1) : [];
+  const baselineFocused = baselineCommands.length
+    ? await verify(path, baselineCommands,
+        () => Math.min(gateway.config.commandTimeoutMs, gateway.budget.remainingMs()),
+        (check) => gateway.logger.log("stable_focused_baseline", { subtaskId: subtask.id, ...check }),
+        writeScope, profile.ecosystem?.projectUnits.flatMap((unit) => unit.verification))
+    : verificationResult([]);
+  const baselineInfra = infrastructureError(baselineFocused);
+  if (baselineInfra) throw Error(`Verification infrastructure unavailable: ${baselineInfra}`);
+  if (baselineFocused.status === "VERIFIED_SUCCESS" &&
+      coveredTestRequirement) {
+    gateway.logger.log("worker_scope", {
+      subtaskId: subtask.id, phase: "implementation", read_only: false,
+      allowed_write_paths: writeScope.paths,
+      context_files: [...new Set([
+        ...(options.compiledContext?.files.map((file) => file.path) ?? []),
+        ...options.repairPacket.definitions.map((definition) => definition.path),
+      ])],
+    });
+    gateway.logger.log("no_changes_required", {
+      subtaskId: subtask.id, status: "VERIFIED_SUCCESS",
+      reason: "requested_test_assertions_already_pass",
+      diffBytes: 0, verificationCommands: baselineFocused.checks.map((check) => check.command),
+    });
+    return { verification: baselineFocused, role: "CHEAP_CODER_A" as Role,
+      evidence, noChangesRequired: true };
+  }
+
+  const contextPaths = [
+    ...new Set([
+      ...options.repairPacket.importLinks.map(([, dependency]) => dependency),
+      ...options.repairPacket.definitions.map((definition) => definition.path),
+    ].filter((file) => !writeScope.paths.includes(file))),
+  ];
+  const baseSystem =
+    coderPrompt +
+    "\nInspection is complete. Implement the change now." +
+    "\nThe RepairPacket contains the locked file contents needed for implementation." +
+    "\nDo not read, search, inspect, or run commands." +
+    "\nYOUR ONLY TASK: " + subtask.objective +
+    "\nWRITE RESPONSIBILITY: " + JSON.stringify(writeScope.paths);
+  let messages: ChatCompletionMessageParam[] = [
+    { role: "system", content: baseSystem },
+    {
+      role: "user",
+      content: JSON.stringify({
+        task,
+        repairPacket: options.repairPacket,
+        inspectionHandoff: options.stableHandoff,
+        allowed_write_paths: writeScope.paths,
+        instruction:
+          "Use the supplied grounded definitions before calling unfamiliar APIs. request_context may retrieve one listed definition if its bounded excerpt is insufficient; otherwise mutate with apply_patch, edit_file, or write_file.",
+      }),
+    },
+  ];
+  const initialTools = orderedTools([
+    "apply_patch", "edit_file", "write_file",
+    ...(contextPaths.length ? ["request_context"] : []),
+  ]);
   const features = extractFeatures(
     subtask,
     profile,
-    Buffer.byteLength(JSON.stringify(options.compiledContext ?? options.repairPacket)),
-    verificationResult([]),
+    Buffer.byteLength(JSON.stringify({
+      messages: boundMessages(messages, gateway.config.context.maxPromptBytes),
+      tools: initialTools,
+    })),
+    baselineFocused,
     "stable",
   );
+  const effort = gateway.logger.events.findLast((event) => event.type === "execution_strategy")
+    ?.execution_effort ?? (subtask.estimatedDifficulty === "high" ? "complex"
+      : subtask.estimatedDifficulty === "low" ? "tiny" : "normal");
   const fingerprint = taskFingerprint(
     subtask,
     profile,
     features,
-    "normal",
+    effort,
+    baselineFocused,
   );
   gateway.logger.log("task_fingerprint", {
     subtaskId: subtask.id,
@@ -151,7 +230,7 @@ export async function implementStablePacket(
         gateway.budget.remainingUsd(), options.raceGroup)
     : [];
   if (universalSelection && !specialistCascade.length)
-    throw Error("No discovered model has sufficient priced capability and quality evidence for this task");
+    throw Error("No compatible priced model fits the required protocol, context, and remaining budget");
   let specialistIndex = 0;
   let selected = specialistCascade[0] ?? options.selectedCandidate;
   let explicitModel = options.model;
@@ -163,9 +242,32 @@ export async function implementStablePacket(
         : "CHEAP_CODER_A";
   const excluded: string[] = [];
   const requiresToolChoice = (candidate: Candidate | undefined) =>
-    !candidate?.metadata.supportedParameters ||
-    (candidate.metadata.supportedParameters.includes("tools") &&
-      candidate.metadata.supportedParameters.includes("tool_choice"));
+    !!candidate && supportsParameters(candidate.metadata, ["tools", "tool_choice"]);
+
+  const selectFallbackCandidate = async (
+    previous: Candidate["model"],
+  ): Promise<Candidate | undefined> => {
+    if (!pool) return undefined;
+    if (universalSelection) {
+      while (specialistIndex + 1 < specialistCascade.length) {
+        const specialist = specialistCascade[++specialistIndex]!;
+        if (excluded.includes(specialist.model.id)) continue;
+        if (requiresToolChoice(specialist)) return specialist;
+        excluded.push(specialist.model.id);
+      }
+    }
+    const fallback = await pool.select(
+      features,
+      subtask.id,
+      excluded,
+      previous,
+      true,
+      options.raceGroup,
+    );
+    if (!fallback || excluded.includes(fallback.model.id) || !requiresToolChoice(fallback))
+      return undefined;
+    return fallback;
+  };
 
   if (!selected && !explicitModel && pool && !universalSelection) {
     selected = await pool.select(features, subtask.id);
@@ -174,16 +276,7 @@ export async function implementStablePacket(
     while (selected && !requiresToolChoice(selected)) {
       const previous: Candidate["model"] = selected.model;
       if (!excluded.includes(previous.id)) excluded.push(previous.id);
-      const nextSelected: Candidate | undefined = universalSelection
-        ? specialistCascade[++specialistIndex]
-        : await pool.select(
-        features,
-        subtask.id,
-        excluded,
-        previous,
-        true,
-        options.raceGroup,
-      );
+      const nextSelected = await selectFallbackCandidate(previous);
       if (!nextSelected) throw Error("No tool_choice-compatible Stable coding model available");
       if (excluded.includes(nextSelected.model.id))
         throw Error("No tool_choice-compatible Stable coding model available");
@@ -236,9 +329,11 @@ export async function implementStablePacket(
     return false;
   };
 
-  const contextPaths = [
-    ...new Set([...writeScope.paths, ...options.repairPacket.importLinks.map(([, dependency]) => dependency)]),
-  ];
+  const packetImplementationFiles = options.repairPacket.files.filter((file) =>
+    writeScope.paths.includes(file.path) && !isTestPath(file.path));
+  if (writeScope.paths.some((file) => !isTestPath(file)) &&
+      (!packetImplementationFiles.length || packetImplementationFiles.some((file) => !file.content.trim())))
+    throw Error("Stable implementation context is missing locked source content");
   const tools = new AgentTools(
     path,
     false,
@@ -249,6 +344,16 @@ export async function implementStablePacket(
     writeScope,
     contextPaths,
   );
+  gateway.logger.log("worker_scope", {
+    subtaskId: subtask.id,
+    phase: "implementation",
+    read_only: false,
+    allowed_write_paths: writeScope.paths,
+    context_files: [...new Set([
+      ...(options.compiledContext?.files.map((file) => file.path) ?? []),
+      ...contextPaths,
+    ])],
+  });
   let acceptedCheckpoint = await AttemptCheckpoint.capture(path, writeScope);
   gateway.logger.log("attempt_checkpoint_created", { subtaskId: subtask.id });
 
@@ -270,33 +375,12 @@ export async function implementStablePacket(
       }),
     );
 
-  const baseSystem =
-    coderPrompt +
-    "\nInspection is complete. Implement the change now." +
-    "\nThe RepairPacket contains the locked file contents needed for implementation." +
-    "\nDo not read, search, inspect, or run commands." +
-    "\nYOUR ONLY TASK: " + subtask.objective +
-    "\nWRITE RESPONSIBILITY: " + JSON.stringify(writeScope.paths);
-
-  let messages: ChatCompletionMessageParam[] = [
-    { role: "system", content: baseSystem },
-    {
-      role: "user",
-      content: JSON.stringify({
-        task,
-        repairPacket: options.repairPacket,
-        inspectionHandoff: options.stableHandoff,
-        allowed_write_paths: writeScope.paths,
-        instruction:
-          "Your first action MUST call apply_patch, edit_file, or write_file and mutate the locked workspace.",
-      }),
-    },
-  ];
-
   let noMutationTurns = 0;
-  let contextRecoveryAvailable = false;
+  let contextRecoveryAvailable = contextPaths.length > 0;
   let contextRecoveryConsumed = false;
   let sameModelRepairUsed = false;
+  let sameModelToolRecoveryUsed = false;
+  let lastFailedDiff = "";
   let attemptStart = gateway.logger.events.length;
 
   const recordVerifiedQualityFailure = (reason: string) => {
@@ -323,16 +407,7 @@ export async function implementStablePacket(
       if (!excluded.includes(selected.model.id)) excluded.push(selected.model.id);
       try {
         const prior = selected.model;
-        const nextSelected = universalSelection
-          ? specialistCascade[++specialistIndex]
-          : await pool.select(
-          features,
-          subtask.id,
-          excluded,
-          prior,
-          true,
-          options.raceGroup,
-        );
+        const nextSelected = await selectFallbackCandidate(prior);
         if (!nextSelected) return false;
         // A pool implementation must honor exclusions, but defend the executor
         // against a stale/buggy selector returning the same exhausted model.
@@ -380,21 +455,31 @@ export async function implementStablePacket(
       "Continue from the CURRENT modified workspace. Mutate before any further verification.",
     rejectedDiff = "",
   ) => {
+    const relevantDefinitions = failed
+      ? await retrieveSourceGrounding(path, writeScope.paths, profile, 4200, failed.checks, task)
+      : [];
     messages = [
       { role: "system", content: baseSystem },
       {
         role: "user",
         content: JSON.stringify({
           task,
-          repairPacket: options.repairPacket,
-          inspectionHandoff: options.stableHandoff,
+          ...(!failed ? {
+            repairPacket: options.repairPacket,
+            inspectionHandoff: options.stableHandoff,
+          } : {}),
           allowed_write_paths: writeScope.paths,
           currentLockedFiles: await lockedFiles(),
           currentDiff: truncateBytes(await currentDiff(path), gateway.config.context.maxBytes),
           rejectedAttemptDiff: rejectedDiff,
           failedChecks: failed
-            ? failed.checks.filter((check) => check.exitCode !== 0)
+            ? failed.checks.filter((check) => check.exitCode !== 0).map((check) => ({
+                command: check.command, exitCode: check.exitCode,
+                stdout: truncateBytes(check.stdout, 6000),
+                stderr: truncateBytes(check.stderr, 6000),
+              }))
             : [],
+          relevantDefinitions,
           reason,
           instruction,
         }),
@@ -403,11 +488,21 @@ export async function implementStablePacket(
   };
 
   const runFocusedVerification = async () => {
-    if (!focusedCommands.length && !selectionCommands.length && !recoveryAttempted) {
+    // selectionCommands describe checks that were useful for routing/context,
+    // but they are not necessarily safe, focused checks. For a source-only
+    // mutation, use one structural check rather than sending an invalid patch
+    // straight to broad final verification. Coupled source-and-test work keeps
+    // its existing final acceptance/repair lifecycle.
+    const sourceOnlyMutation = writeScope.paths.every((file) => !isTestPath(file));
+    if (!focusedCommands.length && !recoveryAttempted &&
+        (!selectionCommands.length || sourceOnlyMutation)) {
       recoveryAttempted = true;
       gateway.logger.log("verification_recovery_attempt", { subtaskId: subtask.id,
         paths: writeScope.paths });
-      recoveredCandidates.push(...await recoverPostMutationChecks(path, task, writeScope.paths));
+      recoveredCandidates.push(...await recoverPostMutationChecks(
+        path, task, writeScope.paths,
+        { structuralOnly: selectionCommands.length > 0 },
+      ));
       focusedCommands = recoveredCandidates.map((candidate) => candidate.command);
       gateway.logger.log(focusedCommands.length ? "verification_recovery" : "verification_recovery_exhausted", {
         subtaskId: subtask.id, commands: focusedCommands,
@@ -449,14 +544,6 @@ export async function implementStablePacket(
     return result;
   };
 
-  const baselineFocused = focusedCommands.length
-    ? await verify(path, focusedCommands,
-        () => Math.min(gateway.config.commandTimeoutMs, gateway.budget.remainingMs()),
-        (check) => gateway.logger.log("stable_focused_baseline", { subtaskId: subtask.id, ...check }),
-        writeScope, profile.ecosystem?.projectUnits.flatMap((unit) => unit.verification))
-    : verificationResult([]);
-  const baselineInfra = infrastructureError(baselineFocused);
-  if (baselineInfra) throw Error(`Verification infrastructure unavailable: ${baselineInfra}`);
   let lastFocusedFailure: VerificationResult | undefined;
   const rejectCurrentAttempt = async (reason: string) => {
     const rejectedDiff = truncateBytes(await currentDiff(path), gateway.config.context.maxBytes);
@@ -495,24 +582,29 @@ export async function implementStablePacket(
         );
       } catch (error) {
         if (!canFallback(error, gateway) || gateway.config.forceModel) throw error;
+        const failedModel = activeModel();
         const rejectedDiff = await rejectCurrentAttempt("provider_failure_after_mutation");
-        // Provider/protocol failures are infrastructure outcomes: expose them in
-        // telemetry without writing them into verified quality history.
-        gateway.logger.log("model_attempt", {
-          subtaskId: subtask.id,
-          modelRequested: activeModel(),
-          modelServed: null,
-          verification: "FAILED",
-          escalated: true,
-          reason: `infrastructure fallback: ${String(error)}`,
-        });
         // Move to the next compatible model immediately and give that model its
         // own bounded mutation budget.
         const moved = await moveToFallback(
           `provider_or_protocol_failure: ${String(error)}`,
           false,
         );
+        // Provider/protocol failures are infrastructure outcomes: expose them in
+        // telemetry without writing them into verified quality history.
+        gateway.logger.log("model_attempt", {
+          subtaskId: subtask.id,
+          modelRequested: failedModel,
+          modelServed: null,
+          verification: "FAILED",
+          escalated: moved,
+          reason: moved
+            ? `infrastructure fallback succeeded: ${String(error)}`
+            : `infrastructure fallback exhausted: ${String(error)}`,
+        });
         if (!moved) throw error;
+        sameModelRepairUsed = false;
+        sameModelToolRecoveryUsed = false;
         noMutationTurns = 0;
         contextRecoveryAvailable = false;
         contextRecoveryConsumed = false;
@@ -562,6 +654,21 @@ export async function implementStablePacket(
       const afterDiff = await currentDiff(path);
       if (afterDiff === beforeDiff) {
         if (sameModelRepairUsed && !requestedContext) {
+          const deterministicToolError = toolResults.some((result) =>
+            /^Tool error:/.test(result) && /oldText|no change|not found|exactly once/i.test(result));
+          if (deterministicToolError && !sameModelToolRecoveryUsed) {
+            sameModelToolRecoveryUsed = true;
+            gateway.logger.log(STABLE_EVENTS.contextRecovery, {
+              subtaskId: subtask.id, model: activeModel(),
+              reason: "repair_tool_state_refreshed",
+            });
+            await resetToCurrentWorkspace(
+              "repair_tool_state_refreshed",
+              lastFocusedFailure,
+              "The repair tool could not match stale target text. The current locked files below were re-read locally and are authoritative. Retry once with an exact unique span from this current state.",
+            );
+            continue;
+          }
           const rejectedDiff = await rejectCurrentAttempt("same_model_repair_no_mutation");
           const moved = await moveToFallback(
             "same-model repair produced no mutation after focused failure",
@@ -569,6 +676,7 @@ export async function implementStablePacket(
           );
           if (!moved) throw Error("Stable mutation protocol exhausted without a diff");
           sameModelRepairUsed = false;
+          sameModelToolRecoveryUsed = false;
           noMutationTurns = 0;
           contextRecoveryConsumed = false;
           await resetToCurrentWorkspace("same_model_repair_no_mutation_model_fallback",
@@ -589,7 +697,7 @@ export async function implementStablePacket(
         if (noMutationTurns >= 2) {
           const moved = await moveToFallback(
             "bounded no-mutation protocol exhausted for current model",
-            false,
+            true,
           );
           if (!moved) throw Error("Stable mutation protocol exhausted without a diff");
           noMutationTurns = 0;
@@ -598,22 +706,29 @@ export async function implementStablePacket(
           await resetToCurrentWorkspace("no_mutation_model_fallback");
           continue;
         }
-        contextRecoveryAvailable = true;
+        // A stale/no-op mutation is a target-file state problem. Re-read the
+        // locked file locally and replace the conversation with one compact
+        // retry packet; do not offer repository context or resend the original
+        // unchanged RepairPacket.
+        contextRecoveryAvailable = false;
+        contextRecoveryConsumed = true;
         gateway.logger.log(STABLE_EVENTS.contextRecovery, {
           subtaskId: subtask.id,
           model: activeModel(),
           reason: "mutation_produced_no_diff",
         });
-        messages.push({
+        messages = [{ role: "system", content: baseSystem }, {
           role: "user",
           content: JSON.stringify({
+            task,
+            allowed_write_paths: writeScope.paths,
             currentLockedFiles: await lockedFiles(),
             currentDiff: truncateBytes(await currentDiff(path), gateway.config.context.maxBytes),
             previousToolResults: toolResults,
             instruction:
-              "No mutation was produced. Correct the exact tool error. request_context is available once if an exact trusted dependency is missing; otherwise mutate now.",
+              "No filesystem diff was produced. currentLockedFiles was re-read from disk and is authoritative. Do not reuse stale oldText unless it appears there. Correct the exact tool error and mutate now; no further context request is available for this target-state retry.",
           }),
-        });
+        }];
         continue;
       }
 
@@ -629,9 +744,56 @@ export async function implementStablePacket(
       const focused = verificationAgainstBaseline(baselineFocused, await runFocusedVerification());
       if (focused.status === "VERIFIED_SUCCESS" ||
           advisoryInfrastructureOnly(focused) || !focusedCommands.length) {
+        const attemptChanges = await acceptedCheckpoint.changed(path, writeScope);
+        const relevantMutation = taskRelevantMutationPaths(
+          task, writeScope.paths, attemptChanges,
+        );
+        if (!relevantMutation.length) {
+          gateway.logger.log("stable_mutation_invariant_rejected", {
+            subtaskId: subtask.id,
+            model: activeModel(),
+            reason: attemptChanges.length ? "test_only_mutation" : "repair_returned_to_baseline",
+            changedPaths: attemptChanges.map((change) => change.path),
+          });
+          if (!sameModelRepairUsed) {
+            sameModelRepairUsed = true;
+            sameModelToolRecoveryUsed = false;
+            gateway.logger.log(STABLE_EVENTS.sameModelRepair, {
+              subtaskId: subtask.id,
+              model: activeModel(),
+              reason: "missing_task_relevant_implementation_mutation",
+            });
+            await resetToCurrentWorkspace(
+              "missing_task_relevant_implementation_mutation",
+              undefined,
+              "Focused checks pass, but this implementation task still has no implementation-file mutation. Modify a locked non-test file now; changing tests alone cannot complete the task.",
+            );
+            continue;
+          }
+          const rejectedDiff = await rejectCurrentAttempt("repair_returned_to_baseline");
+          const moved = await moveToFallback(
+            "same-model repair returned to baseline without solving the task",
+            true,
+          );
+          if (!moved)
+            throw Error("Stable mutation protocol exhausted without a task-relevant implementation diff");
+          sameModelRepairUsed = false;
+          sameModelToolRecoveryUsed = false;
+          noMutationTurns = 0;
+          contextRecoveryConsumed = false;
+          await resetToCurrentWorkspace(
+            "repair_to_baseline_model_fallback",
+            lastFocusedFailure,
+            "The previous model restored baseline without solving the task. Produce a real implementation-file mutation from the clean source.",
+            rejectedDiff || lastFailedDiff,
+          );
+          continue;
+        }
         if (focused.status === "VERIFIED_SUCCESS") {
           acceptedCheckpoint = await AttemptCheckpoint.capture(path, writeScope);
-          gateway.logger.log("attempt_checkpoint_promoted", { subtaskId: subtask.id, model: activeModel() });
+          gateway.logger.log("attempt_checkpoint_promoted", {
+            subtaskId: subtask.id, model: activeModel(), relevantMutation,
+          });
         }
         gateway.logger.log(STABLE_EVENTS.readyForFinal, {
           subtaskId: subtask.id,
@@ -643,7 +805,9 @@ export async function implementStablePacket(
 
       if (!sameModelRepairUsed) {
         lastFocusedFailure = focused;
+        lastFailedDiff = afterDiff;
         sameModelRepairUsed = true;
+        sameModelToolRecoveryUsed = false;
         gateway.logger.log(STABLE_EVENTS.sameModelRepair, {
           subtaskId: subtask.id,
           model: activeModel(),
@@ -664,6 +828,7 @@ export async function implementStablePacket(
       );
       if (!moved) return { verification: focused, role, evidence };
       sameModelRepairUsed = false;
+      sameModelToolRecoveryUsed = false;
       await resetToCurrentWorkspace(
         "focused_verification_failed_model_fallback",
         focused,

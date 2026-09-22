@@ -1,7 +1,7 @@
-import { dirname, extname } from "node:path";
+import { extname } from "node:path";
 import type { Subtask } from "../planner/schemas.js";
 import type { RepoProfile, VerificationResult } from "../types.js";
-import type { Features } from "./features.js";
+import { routingTaskText, type Features } from "./features.js";
 
 export type TaskKind =
   | "implementation" | "debugging" | "frontend_ui" | "backend" | "fullstack"
@@ -33,6 +33,12 @@ export interface TaskFingerprint {
   toolsRequired: boolean;
   visionRequired: boolean;
   verificationStrength: "strong" | "medium" | "weak";
+  taskType?: Features["taskType"];
+  localizationConfidence?: Features["localizationConfidence"];
+  expectedFiles?: number;
+  repoComplexity?: Features["repoSizeBucket"];
+  contextRequirementTokens?: number;
+  observedCheckFailures?: number;
   difficulty: TaskDifficulty;
   confidence: "high" | "medium";
   reasons: string[];
@@ -46,7 +52,7 @@ export function taskFingerprint(
   effort: "tiny" | "normal" | "complex",
   verification?: VerificationResult,
 ): TaskFingerprint {
-  const text = `${subtask.title} ${subtask.objective}`.toLowerCase();
+  const text = routingTaskText(subtask);
   const paths = [...subtask.likelyReadPaths, ...subtask.likelyWritePaths];
   const kinds: TaskKind[] = [];
   const add = (kind: TaskKind, yes: boolean) => { if (yes) kinds.push(kind); };
@@ -68,15 +74,16 @@ export function taskFingerprint(
     /\bfind\b.{0,40}\b(?:files?|modules?|references?|usages?)\b/.test(text));
   add("shell", /\b(?:shell|command|script|bash)\b/.test(text));
   add("documentation", paths.some((p) => /\.(?:md|mdx|rst|txt)$/i.test(p)) || /\b(?:readme|documentation|docs)\b/.test(text));
-  const primary: TaskKind = kinds.includes("debugging") ? "debugging"
+  const primary: TaskKind = features.isTestWork ? "testing"
+    : kinds.includes("debugging") ? "debugging"
     : kinds.includes("refactor") ? "refactor"
     : /\b(?:implement|add|build|create|introduce)\b/i.test(text) &&
         !/^\s*(?:add|create|write)\s+(?:focused\s+)?(?:tests?|regression\s+tests?)\b/i.test(text)
       ? "implementation"
       : kinds[0] ?? "implementation";
-  const directories = new Set(subtask.likelyWritePaths.map(dirname));
-  const scope = features.requiresCrossModuleReasoning || directories.size > 1
+  const scope = features.requiresCrossModuleReasoning
     ? "cross-component"
+    : features.implementationFiles === 1 && subtask.likelyWritePaths.length > 1 && subtask.likelyWritePaths.length <= 3 ? "localized"
     : subtask.likelyWritePaths.length > 1 ? "multi-file"
     : subtask.likelyWritePaths.length === 1 ? "single" : "localized";
   const visualRelevant = /\b(?:visual|design|screenshot|image|pixel|layout|spacing|styling|responsive|appearance|color)\b/.test(text);
@@ -87,7 +94,7 @@ export function taskFingerprint(
   const focusedCheck = [...subtask.verificationCommands, ...checks.filter((check) =>
     check.outcome === "CHECK_PASS" || check.outcome === "CHECK_FAIL",
   ).map((check) => check.command)].some((command) =>
-    /(?:^|\s)(?:tests?\/|[^\s]+\.test\.[cm]?[jt]s|[^\s]+\.spec\.[cm]?[jt]s)/.test(command) &&
+    /(?:^|\s)(?:[^\s]*\btests?\/|[^\s]+\.(?:test|spec)\.[cm]?[jt]sx?|(?:[^\s]*\/)?test_[^\s]+\.py|[^\s]+_test\.(?:py|go|rs|rb)|[^\s]+\.py::[^\s]+|[^\s]+\.spec\.rb)/.test(command) &&
     !/[\*?]/.test(command));
   const verificationStrength = subjective && !focusedCheck ? "weak"
     : focusedCheck && checks.some((c) => c.outcome === "CHECK_PASS" || c.outcome === "CHECK_FAIL") ? "strong"
@@ -105,9 +112,10 @@ export function taskFingerprint(
     interactionComplexity: interactions && architecture ? "high" : interactions || stateFlow ? "medium" : "low",
     repoReasoningComplexity: scope === "cross-component" ? "high" : scope === "multi-file" || kinds.includes("repo_scanning") ? "medium" : "low",
     changeRisk: high(/\b(?:security|auth|payment|database|migration|production|breaking)\b/) ? "high" : scope === "cross-component" ? "medium" : "low",
-    contextUncertainty: subtask.likelyWritePaths.length === 0 ? "high" : kinds.includes("repo_scanning") || features.contextBytes < 256 ? "medium" : "low",
+    contextUncertainty: features.localizationConfidence === "low" ? "high"
+      : features.localizationConfidence === "medium" || kinds.includes("repo_scanning") ? "medium" : "low",
   };
-  const reasons = [`${primary} from worker objective`, `${scope} write scope`, `${verificationStrength} executable verification evidence`];
+  const reasons = [`${primary} from worker objective`, `${scope} write scope`, `${features.localizationConfidence} localization confidence`, `${verificationStrength} executable verification evidence`];
   return {
     primary, secondary: kinds.filter((kind) => kind !== primary),
     languages: [...new Set([...features.languages, ...paths.map(extname).filter((ext) => ext === ".sql").map(() => "sql")])],
@@ -119,7 +127,13 @@ export function taskFingerprint(
     architectureHeavy: kinds.includes("architecture") || features.requiresArchitectureReasoning,
     toolsRequired: !subtask.readOnly,
     visionRequired, verificationStrength, difficulty,
-    confidence: subtask.likelyWritePaths.length ? "high" : "medium",
+    taskType: features.taskType,
+    localizationConfidence: features.localizationConfidence,
+    expectedFiles: features.estimatedFiles,
+    repoComplexity: features.repoSizeBucket,
+    contextRequirementTokens: Math.ceil(features.contextBytes / 4),
+    observedCheckFailures: checks.filter((check) => check.outcome === "CHECK_FAIL").length,
+    confidence: features.localizationConfidence === "high" ? "high" : "medium",
     reasons,
   };
 }

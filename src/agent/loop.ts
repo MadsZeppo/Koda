@@ -51,6 +51,7 @@ import type { StableImplementationHandoff } from "./stable.js";
 import type { RepairPacket } from "./repairPacket.js";
 import { implementStablePacket } from "./stableExecutor.js";
 import { AttemptCheckpoint } from "./attemptCheckpoint.js";
+import { retrieveSourceGrounding } from "../context/sourceGrounding.js";
 async function applyCalls(
   message: any,
   messages: ChatCompletionMessageParam[],
@@ -426,7 +427,7 @@ export async function implement(
         gateway.budget.remainingUsd(), options.raceGroup)
     : [];
   if (universalSelection && !specialistCascade.length)
-    throw Error("No discovered model has sufficient priced capability and quality evidence for this task");
+    throw Error("No compatible priced model fits the required protocol, context, and remaining budget");
   let specialistIndex = 0;
   let adaptiveTier: CodingTier | undefined = demand && !gateway.config.specialistRouting && !specialistCascade.length
     ? (options.adaptiveStartTier ?? demand.tier)
@@ -529,9 +530,9 @@ export async function implement(
     const allowed = new Set(["write_file", "edit_file", "apply_patch"]);
     const repairStart = gateway.logger.events.length;
     let lastRepairError = "";
+    let rejectedAttemptDiff = "";
     const repairCheckpoint = await AttemptCheckpoint.capture(path, writeScope);
     const failedModels = new Set<string>();
-    const repairEvidence: unknown[] = [];
     const moveToRepairFallback = async (
       classification: "VERIFIED_REGRESSION" | "NO_PROGRESS" | "OPERATIONAL_FAILURE",
       error: unknown,
@@ -539,6 +540,7 @@ export async function implement(
     ) => {
       const previous = activeModel();
       const rolledBack = await repairCheckpoint.restore(path, writeScope);
+      rejectedAttemptDiff = truncateBytes(rejectedDiff, 4000);
       gateway.logger.log("stable_final_repair_model_exhausted", {
         subtaskId: subtask.id, model: previous, error: String(error),
         outcome: classification,
@@ -549,9 +551,6 @@ export async function implement(
           subtaskId: subtask.id, model: previous, error: String(error),
           outcome: classification, changedPaths: rolledBack.map((change) => change.path),
         });
-      repairEvidence.push({ model: previous, classification,
-        rejectedDiff: truncateBytes(rejectedDiff, gateway.config.context.maxBytes),
-        diagnostic: truncateBytes(String(error), 4000) });
       failedModels.add(previous);
       let next: Candidate | undefined;
       if (adaptiveTier) {
@@ -591,6 +590,9 @@ export async function implement(
       subtaskId: subtask.id,
       worktree: path,
     });
+    const relevantDefinitions = await retrieveSourceGrounding(
+      path, writeScope.paths, profile, 4200, options.stableRepair.failedChecks, task,
+    );
     try {
       // Final repair is a separate, two-turn state, never the general coder
       // loop. Refresh locked files each turn so an exact-text mismatch can be
@@ -622,31 +624,25 @@ export async function implement(
           {
             role: "user",
             content: JSON.stringify({
-              inspectionHandoff: options.stableHandoff,
+              task: subtask.objective,
               lockedWritePaths: writeScope.paths,
               currentLockedFiles: lockedFiles,
-              changedFiles: options.stableRepair.changedFiles,
               currentDiff: truncateBytes(
-                before,
-                gateway.config.context.maxBytes,
+                before || options.stableRepair.failedDiff || "",
+                Math.min(6000, gateway.config.context.maxBytes),
               ),
-              failedDiff: truncateBytes(options.stableRepair.failedDiff ?? before,
-                gateway.config.context.maxBytes),
-              implicatedFiles: options.stableRepair.changedFiles,
-              implicatedSymbols: options.stableRepair.implicatedSymbols ?? options.evidence?.symbols ?? [],
-              repairPacket: options.repairPacket,
+              rejectedAttemptDiff: rejectedAttemptDiff || undefined,
               failedChecks: options.stableRepair.failedChecks.map((check) => ({
                 command: check.command,
                 exitCode: check.exitCode,
-                stdout: truncateBytes(check.stdout, 12000),
-                stderr: truncateBytes(check.stderr, 12000),
+                stdout: truncateBytes(check.stdout, 6000),
+                stderr: truncateBytes(check.stderr, 6000),
               })),
               newRegressionDiagnostics: options.stableRepair.regressionDiagnostics ?? [],
-              focusedFailureContext: options.stableRepair.failureContext ?? [],
+              relevantDefinitions,
               repairAttempt: options.stableRepair.attempt,
               turn: modelTurn,
               previousToolError: lastRepairError,
-              priorRepairAttempts: repairEvidence,
               instruction:
                 modelTurn === 1
                   ? "Fix the exact reported failure. Do not repeat inspection."

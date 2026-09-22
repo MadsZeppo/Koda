@@ -8,6 +8,7 @@ import type { Gateway } from "../openrouter/client.js";
 import { canFallback } from "../openrouter/client.js";
 
 import type { Candidate } from "../router/modelRouter.js";
+import { supportsParameters } from "../router/pool.js";
 import type { RepoProfile } from "../types.js";
 import type { Subtask } from "../planner/schemas.js";
 import { evidenceSchema } from "../planner/schemas.js";
@@ -23,6 +24,7 @@ import { WriteScope } from "../repo/writeScope.js";
 
 import { AgentTools, currentDiff, safePath, toolDefinitions } from "./tools.js";
 import { stableInspectionPrompt } from "./prompts.js";
+import { isExplicitTestOnlyTask } from "./mutationInvariant.js";
 
 const actionableText = z
   .string()
@@ -287,7 +289,7 @@ export async function prepareStableWorker(
         gateway.availableUsd("inspect"))
     : [];
   if (universalSelection && !specialistCascade.length)
-    throw Error("No discovered model has sufficient priced capability and quality evidence for Stable inspection");
+    throw Error("No compatible priced model fits Stable inspection protocol, context, and remaining budget");
   let specialistIndex = 0;
 
   let selected: Candidate | undefined = specialistCascade[0] ?? (pool && !universalSelection
@@ -530,6 +532,7 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
   const searchHits = new Set<string>();
   const fallbackAnchors = new Set<string>();
   let actionableFallbackUsed = false;
+  const testOnlyTask = isExplicitTestOnlyTask(task);
   const significantTerms = (task.toLowerCase().match(/[a-z]{3,}/g) ?? [])
     .filter((term) => !/^(?:the|and|for|that|with|when|from|new|add|keep|about|after|before|check|files|small|tests|there|these|using|would|write|focus|focused|change|changes|issue|implementation|regression|please|should)$/.test(term));
   const explicitlyNamed = (file: string) =>
@@ -709,7 +712,9 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
       if (!await safeExistingFile(file))
         throw new StableDeclarationError(`Unsafe or missing write path: ${file}`);
       const allowed = isTestPath(file)
-        ? await matchingTest(file, sources)
+        ? testOnlyTask
+          ? inspected.has(file) && sourceRelevant(file)
+          : await matchingTest(file, sources)
         : sources.has(file);
       if (!allowed)
         throw new StableDeclarationError(`Write path lacks trusted task-specific evidence: ${file}`);
@@ -754,7 +759,21 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
     };
     const termHits = (text: string) => significantTerms
       .filter((term, index, terms) => terms.indexOf(term) === index && text.toLowerCase().includes(term));
-    const contentTests = context.files.filter((entry) =>
+    const taskWords = task.toLowerCase().match(/[a-z][a-z0-9]*/g) ?? [];
+    const identifierAnchors = new Set<string>();
+    for (const width of [2, 3]) for (let index = 0; index + width <= taskWords.length; index++) {
+      const words = taskWords.slice(index, index + width);
+      if (words.some((word) => /^(?:add|the|and|that|with|test|unit|deterministic|verifies|includes)$/.test(word)))
+        continue;
+      identifierAnchors.add(words.join("_"));
+      identifierAnchors.add(words[0]! + words.slice(1)
+        .map((word) => word[0]!.toUpperCase() + word.slice(1)).join(""));
+    }
+    const codeAnchorHits = (text: string) => {
+      const code = text.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*|#[^\n]*|`(?:\\.|[^`])*`|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g, " ");
+      return [...identifierAnchors].filter((anchor) => code.includes(anchor));
+    };
+    let contentTests = context.files.filter((entry) =>
       known.has(entry.path) && isTestPath(entry.path) && meaningfulSnippet(entry.path));
     const referencedByFocusedTest = (file: string) => contentTests.some((entry) =>
       resolveImports(entry.path, entry.snippet, known).includes(file));
@@ -767,6 +786,77 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
         (significantTerms.includes(stem) ? 8 : 0) +
         (referencedByFocusedTest(file) ? 12 : 0);
     };
+
+    if (testOnlyTask) {
+      // The focused context can omit tests in a large repository because its
+      // file cap is shared with implementation candidates. Search test content
+      // locally once, then expose only the uniquely relevant test and its
+      // direct implementation imports. Filenames alone never authorize it.
+      const locallyRanked: { path: string; snippet: string; score: number }[] = [];
+      for (const file of profile.files.filter(isTestPath).slice(0, 120)) {
+        try {
+          const target = await safePath(path, file);
+          const info = await lstat(target);
+          if (!info.isFile() || info.nlink !== 1 || info.size > 1024 * 1024) continue;
+          const snippet = (await readFile(target, "utf8")).slice(0, 32000);
+          const hits = termHits(snippet);
+          const anchors = codeAnchorHits(snippet);
+          const stem = posix.basename(file).replace(/\.[^.]+$/, "").toLowerCase();
+          const score = Math.min(18, hits.length * 2) + anchors.length * 12 +
+            (significantTerms.some((term) => term !== "test" && stem.includes(term)) ? 6 : 0);
+          if (anchors.length || hits.length >= 3) locallyRanked.push({ path: file, snippet, score });
+        } catch {}
+      }
+      locallyRanked.sort((left, right) => right.score - left.score ||
+        left.path.localeCompare(right.path));
+      contentTests = [...locallyRanked.map(({ path, snippet }) => ({ path, snippet })),
+        ...contentTests.filter((entry) => !locallyRanked.some((local) =>
+          local.path === entry.path))];
+      const rankedTests = contentTests.map((entry) => {
+        const hits = termHits(entry.snippet);
+        const anchors = codeAnchorHits(entry.snippet);
+        const stem = posix.basename(entry.path).replace(/\.[^.]+$/, "").toLowerCase();
+        return { file: entry.path, score: Math.min(18, hits.length * 2) + anchors.length * 12 +
+          (significantTerms.some((term) => term !== "test" && stem.includes(term)) ? 6 : 0) };
+      }).filter((entry) => entry.score >= 6)
+        .sort((left, right) => right.score - left.score || left.file.localeCompare(right.file));
+      if (rankedTests.length &&
+          (rankedTests.length === 1 || rankedTests[0]!.score > rankedTests[1]!.score)) {
+        const test = rankedTests[0]!.file;
+        try {
+          const content = await tools.execute("read_file", {
+            path: test, startLine: 1, endLine: 240,
+          });
+          if (tools.progressEvidence.some((item) => item.startsWith(`read_file:${test}:`))) {
+            inspected.add(test);
+            inspectedText.set(test, `${inspectedText.get(test) ?? ""}\n${content}`);
+            const dependencies = resolveImports(test, String(content), known)
+              .filter((file) => isSourcePath(file) && !isTestPath(file)).slice(0, 3);
+            for (const dependency of dependencies) {
+              try {
+                const source = await tools.execute("read_file", {
+                  path: dependency, startLine: 1, endLine: 240,
+                });
+                if (tools.progressEvidence.some((item) =>
+                  item.startsWith(`read_file:${dependency}:`))) {
+                  inspected.add(dependency);
+                  inspectedText.set(dependency,
+                    `${inspectedText.get(dependency) ?? ""}\n${source}`);
+                }
+              } catch {}
+            }
+            gateway.logger.log("stable_actionable_scope_fallback", {
+              subtaskId: subtask.id, reason, attempt: 1,
+              inspected_candidates: [test, ...dependencies], paths: [test],
+            });
+            return acceptLock(JSON.stringify({ paths: [test],
+              reason: `Focused repository evidence supports the requested test change in ${test}` }), true);
+          }
+        } catch {
+          // Fall through to the bounded general discovery path.
+        }
+      }
+    }
 
     // Context entries carry ranked excerpts. A bare repository-map filename is
     // not evidence, but an explicitly named path may seed one bounded read.
@@ -813,12 +903,19 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
     let paths: string[] | undefined;
     if (ranked.length && (ranked.length === 1 || ranked[0]!.score > ranked[1]!.score)) {
       const source = ranked[0]!.file;
-      paths = [source];
-      fallbackAnchors.add(source);
+      const linkedSources = [source, ...ranked.slice(1)
+        .map((entry) => entry.file)
+        .filter((file) => imports(source).includes(file) || imports(file).includes(source))]
+        .sort((left, right) => (contextIndex.get(left) ?? 999) -
+          (contextIndex.get(right) ?? 999) || left.localeCompare(right));
+      if (linkedSources.length > 3) return undefined;
+      paths = linkedSources;
+      for (const file of linkedSources) fallbackAnchors.add(file);
 
       if (requestsTestMutation(task)) {
         const tests = contentTests.map((entry) => {
-          const importsSource = resolveImports(entry.path, entry.snippet, known).includes(source);
+          const importsSource = linkedSources.some((candidate) =>
+            resolveImports(entry.path, entry.snippet, known).includes(candidate));
           const sourceStem = posix.basename(source).replace(/\.[^.]+$/, "").toLowerCase();
           const name = posix.basename(entry.path).toLowerCase();
           return { file: entry.path, linked: importsSource || name.startsWith(`${sourceStem}.`) ||
@@ -1034,6 +1131,22 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
      * Critically, we do NOT let the model consume the fourth and final
      * turn doing another read/search operation.
      */
+    // Give the bounded local index/context evidence the first opportunity to
+    // establish a write scope. Waiting for an inspection-model failure here
+    // lets a model repeatedly explore files that compileContext has already
+    // ranked and read, consuming the discovery budget before coding starts.
+    const hasRankedSourceContext = context.files.some((entry) =>
+      known.has(entry.path) && isSourcePath(entry.path) && !isTestPath(entry.path) &&
+      entry.snippet.trim().length >= 16);
+    const hasExplicitSourcePath = profile.files.some((file) =>
+      isSourcePath(file) && !isTestPath(file) && task.includes(file));
+    if ((hasRankedSourceContext || testOnlyTask) && !hasExplicitSourcePath) {
+      const localScope = await acquireActionableScope(
+        "Initial mutation scope was empty; acquiring deterministic repository evidence",
+      );
+      if (localScope) return localScope;
+    }
+
     for (let iteration = 0; iteration < 3; iteration++) {
       const message = await call(iteration, inspectionTools);
 
@@ -1095,8 +1208,7 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
     const scopeDeadline = Date.now() + Math.min(10000, gateway.config.commandTimeoutMs);
     const compatible = (candidate: Candidate | undefined) =>
       candidate?.model.strengths.includes("tool_use") &&
-      candidate.metadata.supportedParameters?.includes("tools") &&
-      candidate.metadata.supportedParameters?.includes("tool_choice");
+      supportsParameters(candidate.metadata, ["tools", "tool_choice"]);
     if (pool) {
       while (!compatible(selected)) {
         if (gateway.config.forceModel || !selected)

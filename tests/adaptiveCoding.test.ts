@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { resolve } from "node:path";
 import { execa } from "execa";
 import { config } from "../src/config.js";
-import { run } from "../src/run.js";
+import { run } from "./helpers/run.js";
 import { Gateway } from "../src/openrouter/client.js";
 import { Budget } from "../src/openrouter/usage.js";
 import { Logger } from "../src/telemetry/logger.js";
@@ -397,7 +397,7 @@ for (const cheapFails of [false, true])
       res.setHeader("content-type", "application/json");
       if (req.url?.endsWith("/models")) {
         res.end(JSON.stringify({ data: ["cheap", "strong"].map((id) => ({
-          id, context_length: 100000, supported_parameters: ["tools"],
+          id, context_length: 100000, supported_parameters: ["tools", "tool_choice"],
           pricing: { prompt: id === "cheap" ? "0.0000001" : "0.00001",
             completion: id === "cheap" ? "0.0000002" : "0.00002" },
         })) }));

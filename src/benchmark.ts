@@ -2,7 +2,7 @@ import { readFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { resolve, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { z } from "zod";
-import { run } from "./run.js";
+import { run, type RunOptions } from "./run.js";
 import type { Config } from "./config.js";
 import { git } from "./repo/commands.js";
 const manifestSchema = z
@@ -20,6 +20,7 @@ export async function benchmark(
   manifest: string,
   config: Config,
   output: string,
+  runOverrides: Pick<RunOptions, "codingWorkerFactory"> = {},
 ) {
   const tasks = manifestSchema.parse(
     JSON.parse(await readFile(manifest, "utf8")),
@@ -44,6 +45,7 @@ export async function benchmark(
         verify: entry.verify,
         config,
         output: join(output, String(index)),
+        ...runOverrides,
       });
     } catch (error) {
       result = {

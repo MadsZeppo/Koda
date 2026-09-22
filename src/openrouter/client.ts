@@ -7,7 +7,7 @@ import type {
 } from "openai/resources/chat/completions";
 import type { Config } from "../config.js";
 import type { Logger } from "../telemetry/logger.js";
-import { Budget, parseUsage } from "./usage.js";
+import { Budget, estimateUsageCost, parseUsage } from "./usage.js";
 import {
   PARETO_CODE_MODEL,
   codingScore,
@@ -55,7 +55,7 @@ export class Gateway {
     readonly budget: Budget,
     adapter?: ModelDiscoveryAdapter,
   ) {
-    if (config.modelPool) this.modelRouter = new PoolRouter(config, logger, adapter);
+    if (config.modelPool) this.modelRouter = new PoolRouter(config, logger, adapter, () => budget.remainingUsd());
     this.sdk = new OpenAI({
       apiKey: ((config.modelPool?.provider ?? "openrouter") === "openrouter"
         ? process.env.OPENROUTER_API_KEY : process.env.KODA_MODEL_API_KEY) || "missing",
@@ -159,7 +159,8 @@ export class Gateway {
       session_id: openrouter ? sessionId : null, provider: openrouter ? providerPolicy : null,
       reasoning_effort: reasoningEffort ?? null });
     const operation = (outcome: "response" | "error", served: string | null,
-      provider: unknown, wallClockMs: number, costUsd: number | null) => {
+      provider: unknown, wallClockMs: number, costUsd: number | null,
+      costSource?: "provider_reported" | "estimated_from_tokens") => {
       if (!this.modelRouter) return;
       const providerName = typeof provider === "string" ? provider
         : provider && typeof provider === "object"
@@ -170,7 +171,7 @@ export class Gateway {
         taskBucket: route?.task_bucket ??
           (fingerprint?.primary ? `${fingerprint.primary}_${fingerprint.scope}` : "general"),
         modelRequested: model, modelServed: served, provider: providerName,
-        wallClockMs, outcome, costUsd,
+        wallClockMs, outcome, costUsd, costSource,
         classification: outcome === "error" ? "OPERATIONAL_FAILURE" : undefined,
       });
     };
@@ -243,7 +244,20 @@ export class Gateway {
           signal: AbortSignal.timeout(timeoutMs),
         },
       );
-      const usage = parseUsage(response.usage);
+      const providerUsage = parseUsage(response.usage);
+      const estimatedUsageCost = providerUsage.costUsd === null
+        ? estimateUsageCost(providerUsage, promptPrice, completionPrice)
+        : null;
+      if (providerUsage.costUsd === null && estimatedUsageCost === null)
+        throw Error(
+          "Provider omitted charged cost and usable token counts; stopping to avoid untracked spend",
+        );
+      const costSource = providerUsage.costUsd === null
+        ? "estimated_from_tokens" as const
+        : "provider_reported" as const;
+      const usage = providerUsage.costUsd === null
+        ? { ...providerUsage, costUsd: estimatedUsageCost! }
+        : providerUsage;
       release(usage);
       releasePhase(usage.costUsd, usage.promptTokens + usage.completionTokens);
       this.logger.log("model_call", {
@@ -275,17 +289,15 @@ export class Gateway {
         timestampEnd: new Date().toISOString(),
         wallClockMs: Date.now() - start,
         ...usage,
+        providerReportedCostUsd: providerUsage.costUsd,
+        costSource,
         attempt,
         outcome: "response",
         responseId: response.id,
       });
       responseLogged = true;
       operation("response", response.model ?? null, (response as any).provider,
-        Date.now() - start, usage.costUsd);
-      if (usage.costUsd === null)
-        throw Error(
-          "OpenRouter omitted charged cost; stopping to avoid untracked spend",
-        );
+        Date.now() - start, usage.costUsd, costSource);
       if (pareto && (!response.model || response.model === PARETO_CODE_MODEL))
         throw Error("Pareto response omitted concrete served model");
       const message = response.choices[0]?.message;

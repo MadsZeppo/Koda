@@ -9,11 +9,60 @@ import { Gateway, canFallback } from "../src/openrouter/client.js";
 import { Budget } from "../src/openrouter/usage.js";
 import { Logger } from "../src/telemetry/logger.js";
 
-const response = (model: string, cost: number) => ({
+const response = (model: string, cost?: number) => ({
   id: `response-${model}`, model,
   choices: [{ index: 0, finish_reason: "stop", message: { role: "assistant", content: "done" } }],
-  usage: { prompt_tokens: 4, completion_tokens: 2, cost },
+  usage: { prompt_tokens: 4, completion_tokens: 2,
+    ...(cost === undefined ? {} : { cost }) },
 });
+
+const usageGateway = async (
+  usage: Record<string, unknown>,
+  budgetUsd = 1,
+  prices = { prompt: 2, completion: 4 },
+) => {
+  const directory = await mkdtemp(join(tmpdir(), "koda-provider-cost-"));
+  let requests = 0;
+  const server = createServer(async (request, reply) => {
+    reply.setHeader("content-type", "application/json");
+    if (request.method === "GET") {
+      reply.end(JSON.stringify({ data: [{
+        id: "coder", context_length: 100000, supported_parameters: ["tools"],
+        pricing: {
+          prompt: String(prices.prompt / 1e6),
+          completion: String(prices.completion / 1e6),
+        },
+      }] }));
+      return;
+    }
+    for await (const _chunk of request) { /* consume request */ }
+    requests++;
+    reply.end(JSON.stringify({ id: "cost-response", model: "coder",
+      choices: [{ index: 0, finish_reason: "stop",
+        message: { role: "assistant", content: "done" } }], usage }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const cfg = await config(undefined, {
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    modelPool: { provider: "local-compatible", models: [{
+      id: "coder", enabled: true, tier: "fast", qualityPrior: 0.95,
+      latencyPriorMs: 100, strengths: ["coding", "tool_use"],
+      fallback: { inputPrice: prices.prompt, outputPrice: prices.completion },
+    }] },
+    routing: { stateDirectory: directory }, maxOutputTokens: 20,
+  });
+  const logger = new Logger(directory, "cost", true);
+  const budget = new Budget(budgetUsd, 10000, 60000);
+  const gateway = new Gateway(cfg, logger, budget);
+  return { directory, server, logger, budget, gateway,
+    requests: () => requests,
+    close: async () => {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { recursive: true, force: true });
+    } };
+};
 
 test("omitted model timeout uses the central stage deadline, aborts, and permits operational fallback", async () => {
   const directory = await mkdtemp(join(tmpdir(), "koda-provider-timeout-"));
@@ -78,6 +127,84 @@ test("omitted model timeout uses the central stage deadline, aborts, and permits
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("provider-reported model cost remains authoritative", async () => {
+  const fixture = await usageGateway({
+    prompt_tokens: 4, completion_tokens: 2, cost: 0.000001,
+  });
+  try {
+    const message = await fixture.gateway.call("coder", [{ role: "user", content: "code" }],
+      "cost", "implement", 0, undefined, { maxOutputTokens: 20 });
+    assert.equal(message.content, "done");
+    assert.equal(fixture.budget.spent, 0.000001);
+    const call = fixture.logger.events.find((event) => event.type === "model_call");
+    assert.equal(call?.costUsd, 0.000001);
+    assert.equal(call?.costSource, "provider_reported");
+    assert.equal(call?.providerReportedCostUsd, 0.000001);
+  } finally { await fixture.close(); }
+});
+
+test("missing charged cost settles once from known token prices without becoming operational failure", async () => {
+  const fixture = await usageGateway({ prompt_tokens: 4, completion_tokens: 2 });
+  let releases = 0;
+  const reserve = fixture.budget.reserve.bind(fixture.budget);
+  (fixture.budget as any).reserve = (cost: number, tokens: number) => {
+    const release = reserve(cost, tokens);
+    return (usage: unknown) => { releases++; release(usage as any); };
+  };
+  try {
+    const message = await fixture.gateway.call("coder", [{ role: "user", content: "code" }],
+      "cost", "implement", 0, undefined, { maxOutputTokens: 20 });
+    const expected = (4 * 2 + 2 * 4) / 1e6;
+    assert.equal(message.content, "done");
+    assert.equal(fixture.budget.spent, expected);
+    assert.equal(fixture.budget.tokens, 6);
+    assert.equal(fixture.budget.unknown, false);
+    assert.equal(releases, 1, "the reservation is settled exactly once");
+    const call = fixture.logger.events.find((event) => event.type === "model_call");
+    assert.equal(call?.costUsd, expected);
+    assert.equal(call?.providerReportedCostUsd, null);
+    assert.equal(call?.costSource, "estimated_from_tokens");
+    assert.equal(fixture.logger.events.some((event) => event.type === "model_error"), false);
+    const operation = fixture.gateway.modelRouter!.history.readOperations().at(-1);
+    assert.equal(operation?.outcome, "response");
+    assert.equal(operation?.costUsd, expected);
+    assert.equal(operation?.costSource, "estimated_from_tokens");
+    assert.equal(operation?.classification, undefined);
+  } finally { await fixture.close(); }
+});
+
+test("missing cost without complete token usage fails closed", async () => {
+  const fixture = await usageGateway({ prompt_tokens: 4 });
+  try {
+    await assert.rejects(fixture.gateway.call("coder", [{ role: "user", content: "code" }],
+      "cost", "implement", 0, undefined, { maxOutputTokens: 20 }),
+    /omitted charged cost and usable token counts/);
+    assert.equal(fixture.budget.spent, 0);
+    assert.equal(fixture.budget.unknown, true);
+    const call = fixture.logger.events.find((event) => event.type === "model_call");
+    assert.equal(call?.outcome, "error");
+    assert.equal(call?.costUsd, null);
+    assert.ok(fixture.logger.events.some((event) =>
+      event.type === "model_error" && event.classification === "OPERATIONAL_FAILURE"));
+  } finally { await fixture.close(); }
+});
+
+test("estimated settlement consumes the real remaining USD budget", async () => {
+  const fixture = await usageGateway(
+    { prompt_tokens: 4000, completion_tokens: 0 }, 0.00042,
+    { prompt: 0.1, completion: 0.2 });
+  try {
+    const message = await fixture.gateway.call("coder", [{ role: "user", content: "code" }],
+      "cost", "implement", 0, undefined, { maxOutputTokens: 20 });
+    assert.equal(message.content, "done");
+    assert.equal(fixture.budget.spent, 0.0004);
+    assert.equal(fixture.budget.unknown, false);
+    await assert.rejects(fixture.gateway.call("coder", [{ role: "user", content: "more" }],
+      "cost", "implement", 1, undefined, { maxOutputTokens: 20 }), /budget exhausted/);
+    assert.equal(fixture.requests(), 1, "the next request is rejected before provider spend");
+  } finally { await fixture.close(); }
 });
 
 test("discovery spend cannot consume the protected implementation reserve", async () => {

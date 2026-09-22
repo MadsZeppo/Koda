@@ -2,6 +2,11 @@
 
 A local TypeScript CLI for measuring whether explicit model routing and isolated parallel execution can reduce coding-agent cost and latency while preserving executable task success. No server, dashboard, accounts, database, or billing system.
 
+Production coding attempts use the official `mini-swe-agent==2.4.6` package.
+Koda provisions it in a reusable isolated runtime cache; target repositories do
+not receive Koda's Python dependencies. Koda still owns routing, budgets,
+worktrees, write-scope validation, verification, rollback, and integration.
+
 ## Run
 
 Requires Node.js 22+, pnpm, ripgrep, and **macOS `sandbox-exec` or Linux `bubblewrap` (`bwrap`)**. Git is optional for non-Git and dirty-workspace runs. The macOS execution path is tested; Linux support requires a host that permits unprivileged namespaces.

@@ -6,7 +6,7 @@ import type { Logger } from "../telemetry/logger.js";
 import { Catalog } from "../openrouter/catalog.js";
 import { History, attributableCodingFailure } from "./history.js";
 import { historyMatches, taskBucket, type Features } from "./features.js";
-import { type PoolModel, type Metadata } from "./pool.js";
+import { type PoolModel, type Metadata, supportsParameters } from "./pool.js";
 import { CapabilityRegistry, type ModelDiscoveryAdapter } from "./capabilityRegistry.js";
 import { optimizeSpecialists } from "./routeOptimizer.js";
 import type { TaskFingerprint } from "./taskFingerprint.js";
@@ -17,6 +17,10 @@ export interface Candidate {
   cost: number;
   latency: number;
   score: number;
+  /** Only execution incompatibilities belong here; quality targets are soft. */
+  hardRejection?: string;
+  softPenalties?: string[];
+  qualityTargetMet?: boolean;
   rejected?: string;
 }
 export function rankCandidates(
@@ -27,9 +31,11 @@ export function rankCandidates(
   routing: Config["routing"],
   inputTokens: number,
   outputTokens: number,
+  limits: { budgetUsd?: number; excluded?: ReadonlySet<string> } = {},
 ): Candidate[] {
   const candidates = models.map((model) => {
     const md = metadata.get(model.id) ?? {};
+    const protocolKnown = md.routableParameterSets !== undefined || md.supportedParameters !== undefined;
     const rows = history.filter(
       (r) =>
         r.modelRequested === model.id &&
@@ -74,11 +80,9 @@ export function rankCandidates(
         : (inputTokens * md.inputPrice + outputTokens * md.outputPrice) / 1e6;
     const plannerUnsupported =
       features.taskKind === "planning" &&
-      (!model.strengths.includes("structured_output") ||
-        (md.supportedParameters &&
-          !md.supportedParameters.some((p) =>
-            ["structured_outputs", "response_format"].includes(p),
-          )));
+      (protocolKnown
+        ? !["structured_outputs", "response_format"].some((parameter) => supportsParameters(md, [parameter]))
+        : !model.strengths.includes("structured_output"));
     const rejected = plannerUnsupported
       ? "structured planning unsupported"
       : !model.enabled
@@ -90,14 +94,20 @@ export function rankCandidates(
             : md.contextLength && inputTokens + outputTokens > md.contextLength
               ? "context limit"
               : features.taskKind !== "planning" &&
-                  (!model.strengths.includes("tool_use") ||
-                    (md.supportedParameters &&
-                      !md.supportedParameters.includes("tools")))
+                  (protocolKnown
+                    ? !supportsParameters(md, features.executionStrategy === "stable"
+                        ? ["tools", "tool_choice"] : ["tools"])
+                    : !model.strengths.includes("tool_use"))
                 ? "tools unsupported"
-                : quality < routing.minimumQuality
-                  ? "below quality threshold"
-                  : undefined;
-    return { model, metadata: md, quality, cost, latency, score: 0, rejected };
+                : cost > (limits.budgetUsd ?? Infinity)
+                  ? "remaining budget"
+                  : limits.excluded?.has(model.id)
+                    ? "already attempted or reserved for race"
+                    : undefined;
+    const qualityTargetMet = quality >= routing.minimumQuality;
+    return { model, metadata: md, quality, cost, latency, score: 0,
+      rejected, hardRejection: rejected, qualityTargetMet,
+      softPenalties: qualityTargetMet ? [] : ["below preferred quality target"] };
   });
   const eligible = candidates.filter((c) => !c.rejected);
   const costScale = Math.max(1e-9, ...eligible.map((c) => c.cost)),
@@ -106,9 +116,11 @@ export function rankCandidates(
     c.score =
       (routing.costWeight * c.cost) / costScale +
       (routing.latencyWeight * c.latency) / timeScale;
-  return candidates.sort(
-    (a, b) => a.score - b.score || a.model.id.localeCompare(b.model.id),
-  );
+  const targetAvailable = eligible.some((candidate) => candidate.qualityTargetMet);
+  return candidates.sort((a, b) => Number(!!a.hardRejection) - Number(!!b.hardRejection) ||
+    (targetAvailable
+      ? Number(b.qualityTargetMet) - Number(a.qualityTargetMet) || a.score - b.score
+      : b.quality - a.quality || a.score - b.score) || a.model.id.localeCompare(b.model.id));
 }
 export class PoolRouter {
   readonly catalog: Catalog;
@@ -120,6 +132,7 @@ export class PoolRouter {
     readonly config: Config,
     readonly logger: Logger,
     adapter?: ModelDiscoveryAdapter,
+    private readonly remainingBudget: () => number = () => config.budgetUsd,
   ) {
     const dir =
       config.routing.stateDirectory ??
@@ -145,6 +158,10 @@ export class PoolRouter {
     budgetUsd: number,
     raceGroup?: string,
   ) {
+    // Load the cached/free provider catalog before building specialist
+    // candidates so Stable never routes from a model-level parameter union
+    // when concrete endpoint protocol evidence is available or required.
+    await this.catalog.get();
     const models = (await this.capabilities.forTask(fingerprint)).filter(
       (item) => !this.disabled.has(item.model.id),
     );
@@ -181,6 +198,9 @@ export class PoolRouter {
       candidates: result.considered.map((candidate) => ({
         id: candidate.model.id,
         rejected: candidate.rejected,
+        hard_rejection: candidate.hardRejection ?? null,
+        soft_penalties: candidate.softPenalties ?? [],
+        reservation_cost_usd: Number.isFinite(candidate.reservationCost) ? candidate.reservationCost : null,
         success: candidate.quality,
         expected_final_success: candidate.expectedFinalSuccess,
         conservative_success: candidate.conservativeQuality,
@@ -251,6 +271,11 @@ export class PoolRouter {
       models = models.filter((m) =>
         this.config.routing.plannerCandidates!.includes(m.id),
       );
+    const force = this.config.forceModel;
+    if (raceGroup)
+      excluded = [...excluded, ...(this.raceSelections.get(raceGroup) ?? [])];
+    const blocked = new Set([...excluded.filter((id) => id !== force), ...this.disabled]);
+    if (previous && !fallback && previous.id !== force) blocked.add(previous.id);
     const considered = rankCandidates(
       models,
       metadata,
@@ -259,27 +284,11 @@ export class PoolRouter {
       this.config.routing,
       features.contextBytes + 256,
       this.config.maxOutputTokens,
+      { budgetUsd: this.remainingBudget(), excluded: blocked },
     );
-    const force = this.config.forceModel;
-    if (raceGroup)
-      excluded = [...excluded, ...(this.raceSelections.get(raceGroup) ?? [])];
-    const eligible = considered.filter(
-      (c) =>
-        !excluded.includes(c.model.id) &&
-        !this.disabled.has(c.model.id) &&
-        (!previous || fallback || c.model.id !== previous.id),
-    );
-    // A pinned evaluation model may be used for successive turns of the same
-    // task. Run-local exclusion is for fallback candidates, not the pin.
-    // Capability, availability, pricing and provider rejection still apply.
-    const selected = force
-      ? considered.find(
-          (c) =>
-            c.model.id === force &&
-            !this.disabled.has(c.model.id) &&
-            (!c.rejected || c.rejected === "below quality threshold"),
-        )
-      : eligible.find((c) => !c.rejected);
+    // Forced evaluations still respect execution constraints, including budget.
+    const selected = considered.find((candidate) => !candidate.hardRejection &&
+      (!force || candidate.model.id === force));
     this.logger.log("model_router", {
       subtaskId,
       selected_model: selected?.model.id ?? null,
@@ -287,13 +296,17 @@ export class PoolRouter {
         ? "no eligible candidate"
         : force
           ? "forced evaluation"
-          : `meets ${this.config.routing.minimumQuality} quality threshold; lowest weighted cost/latency`,
+          : !selected.qualityTargetMet
+            ? "safe cold-start fallback: strongest technically compatible priced model"
+            : `meets ${this.config.routing.minimumQuality} quality threshold; lowest weighted cost/latency`,
       estimated_quality: selected?.quality ?? null,
       task_bucket: taskBucket(features),
       features,
       candidates: considered.map((c) => ({
         id: c.model.id,
         quality: c.quality,
+        hard_rejection: c.hardRejection ?? null,
+        soft_penalties: c.softPenalties ?? [],
         cost_est: Number.isFinite(c.cost) ? c.cost : null,
         latency_est: c.latency,
         metadata: c.metadata,
@@ -312,7 +325,7 @@ export class PoolRouter {
       throw Error(
         force
           ? "Forced model unavailable, unsupported, or unpriced"
-          : "No untried model meets quality, capability, availability and pricing requirements",
+          : "No untried compatible priced model fits the remaining budget",
       );
     if (raceGroup) {
       const ids = this.raceSelections.get(raceGroup) ?? new Set<string>();
@@ -332,11 +345,14 @@ export class PoolRouter {
       this.config.routing,
       features.contextBytes + 256,
       this.config.maxOutputTokens,
+      { budgetUsd: this.remainingBudget(), excluded: this.disabled },
     );
-    const selected = considered.find(
+    const available = considered.filter(
       (candidate) =>
-        !candidate.rejected && !this.disabled.has(candidate.model.id),
+        !this.disabled.has(candidate.model.id) &&
+        !candidate.hardRejection,
     );
+    const selected = available[0];
     this.logger.log("frontier_rescue_route", {
       subtaskId,
       selected_model: selected?.model.id ?? null,

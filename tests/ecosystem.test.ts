@@ -555,13 +555,13 @@ test("unavailable external Python environment is infrastructure, never a fallbac
   const previous = { PATH: process.env.PATH, VIRTUAL_ENV: process.env.VIRTUAL_ENV,
     PYTHONHOME: process.env.PYTHONHOME };
   try {
-    process.env.PATH = `${join(external, "bin")}:${previous.PATH ?? ""}`;
+    process.env.PATH = join(external, "bin");
     process.env.VIRTUAL_ENV = external;
     process.env.PYTHONHOME = external;
     const sanitized = await pythonSandboxEnvironment(f.root);
     assert.ok(!sanitized.PATH.includes(join(external, "bin")));
     assert.equal(sanitized.VIRTUAL_ENV, undefined);
-    assert.equal(sanitized.PYTHONHOME, undefined);
+    assert.equal("PYTHONHOME" in sanitized, false);
     const candidate = { kind: "test" as const, command: "python3 -B -c 'print(42)'",
       cwd: ".", source: "test:python-environment", confidence: 1, available: true,
       mutatesSource: false as const, requiresInstalledDependencies: false };
@@ -601,15 +601,16 @@ test("an unrelated unsafe virtualenv later in PATH does not poison system Python
 test("valid worktree-local Python environment remains available", async () => {
   const f = await fixture({ "module.py": "value = 1\n" });
   try {
-    await mkdir(join(f.root, ".local-env", "bin"), { recursive: true });
-    await writeFile(join(f.root, ".local-env", "pyvenv.cfg"), "home = /usr/bin\n");
     const local = join(f.root, ".local-env");
+    const host = await pythonSandboxEnvironment(f.root, { PATH: process.env.PATH });
+    assert.ok(host.interpreter);
+    await execa(host.interpreter, ["-m", "venv", "--without-pip", local]);
     const sanitized = await pythonSandboxEnvironment(f.root, {
       PATH: `${join(local, "bin")}:/usr/bin:/bin`, VIRTUAL_ENV: local,
       PYTHONHOME: local,
     });
     assert.equal(sanitized.VIRTUAL_ENV, await realpath(local));
-    assert.equal(sanitized.PYTHONHOME, await realpath(local));
+    assert.equal("PYTHONHOME" in sanitized, false);
     assert.ok(sanitized.PATH.startsWith(await realpath(join(local, "bin"))));
   } finally { await f.close(); }
 });
@@ -662,7 +663,7 @@ test("without a concrete safe reproduction, empty verification remains unverifie
 
 test("DIRECT source edit with no discovered runner executes recovered final verification", async () => {
   const { createServer } = await import("node:http");
-  const { run } = await import("../src/run.js");
+  const { run } = await import("./helpers/run.js");
   const f = await fixture({ "calculator.py": "def add(a, b):\n    return a - b\n" });
   const output = await mkdtemp(join(tmpdir(), "koda-python-recovery-"));
   let calls = 0;
@@ -954,7 +955,7 @@ test("filesystem workspace executes pnpm test and typecheck with bridged depende
 for (const baselineFails of [true, false])
 test(`workspace DIRECT final verification: ${baselineFails ? "unchanged baseline is neutral" : "new root failure is a regression"}`, async () => {
   const { createServer } = await import("node:http");
-  const { run } = await import("../src/run.js");
+  const { run } = await import("./helpers/run.js");
   const f = await fixture({
     "package.json": pkg(
       { check: "node final.cjs" },

@@ -44,10 +44,22 @@ export async function focusedLocalReproduction(
 }
 
 /** Reinspect the mutated workspace once; the pre-edit profile may be stale or incomplete. */
-export async function recoverPostMutationChecks(root: string, task: string, paths: readonly string[]) {
+export async function recoverPostMutationChecks(root: string, task: string, paths: readonly string[],
+  options: { structuralOnly?: boolean } = {}) {
   const updated = await profileRepo(root);
-  const discovered = verificationPlan(updated, [...paths]).filter((candidate) => candidate.available);
+  let discovered = verificationPlan(updated, [...paths], options.structuralOnly)
+    .filter((candidate) => candidate.available);
+  if (options.structuralOnly) {
+    const priority = new Map([
+      ["typecheck", 0], ["build", 1], ["lint", 2], ["check", 3],
+    ]);
+    discovered = discovered
+      .filter((candidate) => candidate.kind !== "test")
+      .sort((a, b) => (priority.get(a.kind) ?? 9) - (priority.get(b.kind) ?? 9))
+      .slice(0, 1);
+  }
   if (discovered.length) return discovered;
+  if (options.structuralOnly) return [];
   const focused = await focusedLocalReproduction(updated, task, paths);
   return focused ? [focused] : [];
 }

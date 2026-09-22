@@ -57,9 +57,16 @@ export class Catalog {
         cached = c;
       }
     } catch {}
+    const officialOpenRouter = (() => {
+      try { return /(?:^|\.)openrouter\.ai$/i.test(new URL(this.baseUrl).hostname); }
+      catch { return false; }
+    })();
     if (
       cached &&
       this.models.every((m) => cached!.entries.some(([id]) => id === m.id)) &&
+      (!officialOpenRouter || this.models.filter((model) => model.enabled &&
+        model.strengths.includes("tool_use")).every((model) =>
+        cached!.entries.find(([id]) => id === model.id)?.[1].routableParameterSets !== undefined)) &&
       Date.now() - cached.retrievedAt < this.ttlMs
     )
       return new Map(cached.entries);
@@ -72,6 +79,35 @@ export class Catalog {
       if (!Array.isArray(data.data) || !data.data.length)
         throw Error("Invalid catalog");
       const retrievedAt = new Date().toISOString();
+      const embeddedSets = (raw: any) => {
+        const endpoints = Array.isArray(raw?.endpoints) ? raw.endpoints : undefined;
+        return endpoints?.map((endpoint: any) => endpoint?.supported_parameters)
+          .filter((parameters: unknown): parameters is string[] =>
+            Array.isArray(parameters) && parameters.every((item) => typeof item === "string"));
+      };
+      const endpointSets = new Map<string, string[][]>();
+      if (officialOpenRouter) {
+        const key = process.env.OPENROUTER_API_KEY;
+        const headers = key ? { Authorization: `Bearer ${key}` } : undefined;
+        for (const model of this.models.filter((item) => item.enabled &&
+          item.strengths.includes("tool_use"))) endpointSets.set(model.id, []);
+        await Promise.all(this.models.filter((model) => model.enabled &&
+          model.strengths.includes("tool_use")).map(async (model) => {
+          try {
+            const response = await fetch(this.baseUrl.replace(/\/$/, "") +
+              `/models/${model.id}/endpoints`, {
+                headers, signal: AbortSignal.timeout(3000),
+              });
+            if (!response.ok) return;
+            const body = await response.json() as any;
+            const endpoints = body?.data?.endpoints ?? body?.endpoints ?? body?.data;
+            if (!Array.isArray(endpoints)) return;
+            endpointSets.set(model.id, endpoints.map((endpoint: any) =>
+              endpoint?.supported_parameters).filter((parameters: unknown): parameters is string[] =>
+                Array.isArray(parameters) && parameters.every((item) => typeof item === "string")));
+          } catch {}
+        }));
+      }
       const entries: [string, Metadata][] = this.models.map((model) => {
         const raw = data.data.find((m: any) => m.id === model.id);
         if (!raw) return [model.id, { available: false, retrievedAt }];
@@ -106,6 +142,7 @@ export class Catalog {
             contextLength: raw.context_length,
             available: true,
             supportedParameters: raw.supported_parameters,
+            routableParameterSets: embeddedSets(raw) ?? endpointSets.get(model.id),
             retrievedAt,
           },
         ];

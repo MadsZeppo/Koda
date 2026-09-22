@@ -10,7 +10,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { Config } from "./config.js";
-import { run } from "./run.js";
+import { run, type RunOptions } from "./run.js";
 import {
   changesBetween,
   copySnapshot,
@@ -24,6 +24,8 @@ export interface CalibrationOptions {
   config: Config;
   output?: string;
   taskId?: string;
+  /** Deterministic test seam; production calibration uses MiniSweWorker. */
+  codingWorkerFactory?: RunOptions["codingWorkerFactory"];
 }
 
 export async function calibrateModels(options: CalibrationOptions) {
@@ -88,6 +90,7 @@ export async function calibrateModels(options: CalibrationOptions) {
         output: report,
         quiet: true,
         apply: false,
+        codingWorkerFactory: options.codingWorkerFactory,
       });
       if (changesBetween(baseline, await snapshotTree(frozen)).length)
         throw Error("Calibration run mutated the frozen baseline");
@@ -108,7 +111,7 @@ export async function calibrateModels(options: CalibrationOptions) {
         taskFeatureBucket:
           events.findLast(
             (event) =>
-              event.type === "model_router" &&
+              (event.type === "model_router" || event.type === "coding_route_decision") &&
               event.task_bucket !== "read_only_discovery",
           )?.task_bucket ?? null,
         executionStrategy: result.execution_strategy,

@@ -11,7 +11,7 @@ import type { VerificationCandidate, CheckKind } from "../repo/ecosystem.js";
 import type { WriteScope } from "../repo/writeScope.js";
 import { command } from "../repo/commands.js";
 import type { CommandResult, VerificationResult } from "../types.js";
-import { dependenciesForWorkspace } from "../repo/dependencies.js";
+import { dependenciesForWorkspace, inheritDependencyEnvironment } from "../repo/dependencies.js";
 export const runtimeInfrastructureFailure = (check: CommandResult) => {
   const output = `${check.stdout}\n${check.stderr}`;
   if (!/\b(?:AssertionError|assert\s|FAILED\s+\S+::)/i.test(output) &&
@@ -129,7 +129,9 @@ export function advisoryInfrastructureOnly(result: VerificationResult) {
 /** Return only failure identities introduced or changed by the candidate. */
 export function verificationRegressions(baseline: VerificationResult, after: VerificationResult) {
   return after.checks.filter((check) => {
-    if (check.outcome !== "CHECK_FAIL") return false;
+    // Infrastructure attribution is authoritative even when a legacy caller
+    // also left a non-zero exit code or CHECK_FAIL-shaped result behind.
+    if (check.unavailable || check.outcome !== "CHECK_FAIL") return false;
     const previous = baseline.checks.find((item) => item.command === check.command && item.cwd === check.cwd);
     if (previous?.unavailable || previous?.outcome === "INFRA_FAILURE" || previous?.outcome === "CHECK_UNAVAILABLE") return false;
     return !previous || previous.outcome !== "CHECK_FAIL" ||
@@ -173,13 +175,12 @@ export function verificationResult(
         ? "CHECK_PASS"
         : "CHECK_FAIL";
   }
-  const failedChecks = checks.filter(
-    (c) => !c.unavailable && c.exitCode !== 0,
-  ).length;
+  const failedChecks = checks.filter((check) => check.outcome === "CHECK_FAIL").length;
   const required = checks.filter((check) => (check.requirement ?? "required") === "required");
-  const requiredUnavailable = required.some((check) => !!check.unavailable);
+  const requiredUnavailable = required.some((check) => !!check.unavailable ||
+    check.outcome === "INFRA_FAILURE" || check.outcome === "CHECK_UNAVAILABLE");
   const executableEvidence = checks.some(
-    (check) => !check.unavailable && check.exitCode === 0,
+    (check) => check.outcome === "CHECK_PASS",
   );
   const output = checks.filter((c) => !c.source?.endsWith(":baseline_unchanged"))
     .map((c) => c.stdout + "\n" + c.stderr).join("\n");
@@ -203,9 +204,10 @@ export function verificationResult(
           const rows = checks.filter((c) => c.kind === kind);
           return [
             kind,
-            rows.some((c) => !c.unavailable && c.exitCode !== 0)
+            rows.some((c) => c.outcome === "CHECK_FAIL")
               ? "FAIL"
-              : rows.some((c) => c.unavailable)
+              : rows.some((c) => c.unavailable || c.outcome === "INFRA_FAILURE" ||
+                    c.outcome === "CHECK_UNAVAILABLE")
                 ? "UNAVAILABLE"
                 : rows.some((c) =>
                       /(?:#|ℹ) tests\s+0\b|Ran 0 tests\b|no tests found|no tests ran/i.test(
@@ -307,7 +309,8 @@ export async function verify(
         const limit = typeof timeout === "function" ? timeout() : timeout;
         const started = Date.now();
         const execute = (strict: boolean) => candidate
-          ? isolatedVerification(path, cmd, Math.max(1, limit - (Date.now() - started)), false, scope, strict)
+          ? isolatedVerification(path, cmd, Math.max(1, limit - (Date.now() - started)), false, scope, strict,
+              candidate.cwd)
           : command(path, cmd, Math.max(1, limit - (Date.now() - started)), false, scope, undefined, strict);
         c = await execute(false);
         const environmentFailure = c.exitCode !== 0 && runtimeInfrastructureFailure(c);
@@ -367,6 +370,7 @@ async function isolatedVerification(
   _readOnly?: boolean,
   _scope?: WriteScope,
   strictPythonEnvironment = false,
+  nodeProjectRoot = ".",
 ) {
   const start = Date.now();
   const staging = await mkdtemp(join(tmpdir(), "koda-verify-"));
@@ -426,6 +430,7 @@ async function isolatedVerification(
       return JSON.stringify([tracked, hashes]);
     };
     const before = await snapshot();
+    await inheritDependencyEnvironment(path, copy);
     const result = await command(
       copy,
       cmd,
@@ -435,6 +440,9 @@ async function isolatedVerification(
       await dependenciesForWorkspace(path),
       strictPythonEnvironment,
       path,
+      process.env,
+      false,
+      nodeProjectRoot,
     );
     if ((await snapshot()) !== before)
       return {

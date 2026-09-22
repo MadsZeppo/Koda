@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
@@ -58,7 +58,7 @@ const observed = (model: string, fp: TaskFingerprint, features: ReturnType<typeo
     ? "verified_patch_regression" : undefined,
 });
 
-test("universal selector considers every discovered model and chooses the cheapest qualified specialty", () => {
+test("universal selector considers every discovered model and chooses the cheapest quality-preserving plan", () => {
   const model = (id: string, strengths: string[], price: number): SpecialistModel => ({
     model: modelSchema.parse({ id, tier: "fast", qualityPrior: 0.95,
       latencyPriorMs: 1000, strengths: ["tool_use", ...strengths] }),
@@ -74,7 +74,10 @@ test("universal selector considers every discovered model and chooses the cheape
   const tiny = model("tiny-specialist", ["coding"], 0.005);
   const all = [...fillers, ui, database, refactor, tiny];
   const uiTask = scenario("Fix React UI layout", ["src/Dashboard.tsx"], ["node --test tests/dashboard.test.ts"]);
-  assert.equal(route(uiTask.fingerprint, uiTask.features, [], all).cascade[0]?.model.id, ui.model.id);
+  const uiRoute = route(uiTask.fingerprint, uiTask.features, [], all);
+  assert.equal(uiRoute.cascade[0]?.model.id, tiny.model.id);
+  assert.ok(uiRoute.cascade.slice(1).some((candidate) => candidate.model.id === ui.model.id),
+    "the economical first attempt retains the UI reference as verified rescue");
   const dbTask = scenario("Fix SQL database query", ["src/query.sql"], ["node --test tests/query.test.ts"]);
   assert.equal(route(dbTask.fingerprint, dbTask.features, [], all).cascade[0]?.model.id, database.model.id);
   const refactorTask = scenario("Refactor repository module", ["src/state.ts"], ["node --test tests/state.test.ts"]);
@@ -85,7 +88,7 @@ test("universal selector considers every discovered model and chooses the cheape
   assert.equal(tinyResult.cascade[0]?.model.id, tiny.model.id);
   const unknown = model("unknown-specialty", [], 0.0001);
   assert.match(route(dbTask.fingerprint, dbTask.features, [], [unknown, database]).considered
-    .find((candidate) => candidate.model.id === unknown.model.id)!.rejected!, /minimum quality|quality parity/);
+    .find((candidate) => candidate.model.id === unknown.model.id)!.rejected!, /quality|high-risk/);
 });
 
 test("missing soft domain tags remain eligible when benchmark evidence supports verified quality", () => {
@@ -280,9 +283,11 @@ test("repeated slow interactive calls demote a cheaper qualified model without c
   assert.ok(slow.latencyP90Ms! >= 70000);
   assert.equal(slow.latencySlaPassed, false);
   const fastUnqualified = { ...cheap, model: { ...cheap.model, qualityPrior: 0.1 } };
-  assert.equal(route(s.fingerprint, s.features, [], [fastUnqualified, strong],
-    Array.from({ length: 8 }, () => call(cheap.model.id, 100))).cascade[0]?.model.id,
-    strong.model.id);
+  const verifiedCascade = route(s.fingerprint, s.features, [], [fastUnqualified, strong],
+    Array.from({ length: 8 }, () => call(cheap.model.id, 100))).cascade;
+  assert.equal(verifiedCascade[0]?.model.id, cheap.model.id);
+  assert.equal(verifiedCascade[1]?.model.id, strong.model.id,
+    "a low-quality cheap trial is allowed only with strong focused detection and rescue");
   const infra = Array.from({ length: 8 }, () => call(cheap.model.id, 30000, "error"));
   const qualityBefore = route(s.fingerprint, s.features, [], [cheap, strong]).considered[0]!.quality;
   const qualityAfter = route(s.fingerprint, s.features, [], [cheap, strong], infra).considered[0]!.quality;
@@ -390,6 +395,51 @@ test("a 0.99 configured prior alone is weak evidence, while verified history tig
   assert.ok(warm.conservativeQuality > cold.conservativeQuality);
 });
 
+test("cold start always builds a safe relative plan when every quality estimate is below the legacy floor", () => {
+  const s = scenario("Debug a multi-file request flow", ["src/api.ts", "src/state.ts"], [], "stable");
+  const compatible = (id: string, prior: number, price: number): SpecialistModel => ({
+    model: modelSchema.parse({ id, tier: prior > 0.6 ? "frontier" : "fast",
+      qualityPrior: prior, latencyPriorMs: prior > 0.6 ? 5000 : 1000,
+      strengths: ["coding", "tool_use", "reasoning", "repo_scale"] }),
+    metadata: { available: true, inputPrice: price, outputPrice: price,
+      contextLength: 100000, supportedParameters: ["tools", "tool_choice"] },
+    vision: false, configured: false, evidence: [],
+  });
+  const economical = compatible("cold-economical", 0.55, 0.1);
+  const safest = compatible("cold-safest", 0.7, 2);
+  const result = route(s.fingerprint, s.features, [], [economical, safest]);
+  assert.ok(result.considered.every((candidate) => candidate.quality < settings.routing.minimumQuality));
+  assert.equal(result.reference?.model.id, safest.model.id);
+  assert.ok(result.selectedPlan, "sparse quality evidence cannot terminate routing");
+  assert.ok(result.cascade.length > 0);
+  assert.equal(result.selectedPlan!.qualityGap <= result.allowedRegret, true);
+});
+
+test("general pool falls back to the strongest compatible model when absolute quality evidence is sparse", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "koda-cold-pool-"));
+  try {
+    const low = modelSchema.parse({ id: "low-prior", tier: "fast", qualityPrior: 0.4,
+      latencyPriorMs: 500, strengths: ["coding", "tool_use"] });
+    const safer = modelSchema.parse({ id: "safe-prior", tier: "frontier", qualityPrior: 0.7,
+      latencyPriorMs: 1000, strengths: ["coding", "tool_use"] });
+    const cfg = await config(undefined, { baseUrl: "http://127.0.0.1:1",
+      specialistRouting: false, routing: { stateDirectory: dir, minimumQuality: 0.95 },
+      modelPool: { provider: "local-compatible", models: [low, safer] } });
+    const pool = new PoolRouter(cfg, new Logger(dir, "cold-pool", true));
+    (pool.catalog as any).get = async () => new Map([
+      [low.id, { available: true, inputPrice: 0.1, outputPrice: 0.1,
+        contextLength: 100000, supportedParameters: ["tools"] }],
+      [safer.id, { available: true, inputPrice: 1, outputPrice: 1,
+        contextLength: 100000, supportedParameters: ["tools"] }],
+    ]);
+    const s = scenario("Fix backend request", ["src/api.ts"]);
+    const selected = await pool.select(s.features, "cold");
+    assert.equal(selected.model.id, safer.id);
+    assert.equal(pool.logger.events.find((event) => event.type === "model_router")?.routing_reason,
+      "safe cold-start fallback: strongest technically compatible priced model");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test("cached capability evidence admits a newly listed priced model without code changes", async () => {
   const dir = await mkdtemp(join(tmpdir(), "koda-specialist-"));
   const raw = (id: string, prompt: string, completion: string) => ({
@@ -418,10 +468,69 @@ test("cached capability evidence admits a newly listed priced model without code
     await registry.refresh();
     const models = await registry.forTask(s.fingerprint);
     assert.equal(models.find((m) => m.model.id === "newly-listed")?.metadata.inputPrice, 0.3);
+    assert.equal(models.find((m) => m.model.id === "newly-listed")?.metadata.routableParameterSets, undefined,
+      "a local provider fixture may use its declared model-level protocol");
     assert.ok((await catalog.get()).has("newly-listed"));
     assert.equal(models.find((m) => m.model.id === "newly-listed")?.evidence.some((e) => e.source === "coding_benchmark"), true);
   } finally {
     server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Artificial Analysis exact IDs seed cached priors and degrade to cache without fuzzy matching", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "koda-aa-prior-"));
+  const priorKey = process.env.ARTIFICIAL_ANALYSIS_API_KEY;
+  const priorUrl = process.env.KODA_ARTIFICIAL_ANALYSIS_URL;
+  const server = createServer((request, response) => {
+    response.setHeader("content-type", "application/json");
+    if (request.url === "/aa") response.end(JSON.stringify({ data: [
+      { id: "aa-mapped", openrouter_api_id: "vendor/mapped",
+        evaluations: { artificial_analysis_coding_index: 94,
+          artificial_analysis_intelligence_index: 88 },
+        median_output_tokens_per_second: 120, median_time_to_first_token_seconds: 0.8 },
+      { id: "aa-unmapped", name: "Mapped", slug: "mapped",
+        evaluations: { artificial_analysis_coding_index: 99 } },
+    ] }));
+    else if (request.url === "/models") response.end(JSON.stringify({ data: [
+      { id: "vendor/mapped", context_length: 100000,
+        pricing: { prompt: "0.0000002", completion: "0.0000004" },
+        supported_parameters: ["tools"] },
+    ] }));
+    else if (request.url === "/benchmarks") response.end(JSON.stringify({ data: [] }));
+    else response.end(JSON.stringify({ data: { classifications: [] } }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address(); assert.ok(address && typeof address !== "string");
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    process.env.ARTIFICIAL_ANALYSIS_API_KEY = "test-key";
+    process.env.KODA_ARTIFICIAL_ANALYSIS_URL = `${baseUrl}/aa`;
+    const configured = modelSchema.parse({ id: "vendor/mapped", tier: "fast",
+      qualityPrior: 0.5, latencyPriorMs: 1000, strengths: ["coding", "tool_use"] });
+    const cfg = await config(undefined, { baseUrl, routing: { stateDirectory: dir },
+      modelPool: { provider: "openrouter", models: [configured] } });
+    const registry = new CapabilityRegistry(cfg, new Catalog(baseUrl, dir, 60000, [configured]));
+    const models = await registry.refresh();
+    const mapped = models.find((item) => item.model.id === "vendor/mapped");
+    assert.ok(mapped?.evidence.some((item) => item.source === "coding_benchmark" &&
+      item.detail === "Artificial Analysis coding index" && item.value === 0.94));
+    assert.equal(models.some((item) => item.model.id === "aa-unmapped" ||
+      item.model.id === "mapped"), false, "names and slugs never create fuzzy provider mappings");
+    const cache = JSON.parse(await readFile(join(dir, "artificial-analysis.json"), "utf8"));
+    assert.deepEqual(cache.unmatched, ["aa-unmapped"]);
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    process.env.KODA_ARTIFICIAL_ANALYSIS_URL = "http://127.0.0.1:1/unavailable";
+    const cached = await new CapabilityRegistry(cfg,
+      new Catalog(baseUrl, dir, 60000, [configured])).refresh();
+    assert.ok(cached.find((item) => item.model.id === "vendor/mapped")?.evidence
+      .some((item) => item.detail === "Artificial Analysis coding index"));
+  } finally {
+    if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (priorKey === undefined) delete process.env.ARTIFICIAL_ANALYSIS_API_KEY;
+    else process.env.ARTIFICIAL_ANALYSIS_API_KEY = priorKey;
+    if (priorUrl === undefined) delete process.env.KODA_ARTIFICIAL_ANALYSIS_URL;
+    else process.env.KODA_ARTIFICIAL_ANALYSIS_URL = priorUrl;
     await rm(dir, { recursive: true, force: true });
   }
 });
@@ -498,4 +607,19 @@ test("Stable plans exclude tools-only models that cannot force the required tool
     assert.equal(result.considered.find((candidate) => candidate.model.id === cheap.model.id)?.rejected, "tool_choice unsupported");
     assert.deepEqual(result.selectedPlan?.models, [strong.model.id]);
   }
+});
+
+test("Stable rejects a model-level tool union when no endpoint supports the full protocol", () => {
+  const task = scenario("Add a focused test", ["tests/api.test.ts"],
+    ["node --test tests/api.test.ts"], "stable");
+  const splitEndpoints = { ...cheap, metadata: { ...cheap.metadata,
+    supportedParameters: ["tools", "tool_choice"],
+    routableParameterSets: [["tools"], ["tool_choice"]] } };
+  const compatible = { ...strong, metadata: { ...strong.metadata,
+    supportedParameters: ["tools", "tool_choice"],
+    routableParameterSets: [["tools", "tool_choice"]] } };
+  const result = route(task.fingerprint, task.features, [], [splitEndpoints, compatible]);
+  assert.equal(result.considered.find((candidate) =>
+    candidate.model.id === splitEndpoints.model.id)?.rejected, "tool_choice unsupported");
+  assert.deepEqual(result.selectedPlan?.models, [compatible.model.id]);
 });

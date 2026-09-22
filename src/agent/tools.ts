@@ -19,6 +19,29 @@ import { filesystemDiff, workspaceChanges } from "../workspace/diff.js";
 import { changeCode, listWorkspaceFiles } from "../workspace/files.js";
 import { createHash } from "node:crypto";
 import { nearbyRepoPaths } from "../repo/navigation.js";
+
+/** Find one formatting-equivalent span while preserving current-file offsets. */
+function whitespaceEquivalentSpan(content: string, requested: string) {
+  if (requested.trim().length < 12) return undefined;
+  const needle = requested.trim().replace(/\s+/g, " ");
+  if (!needle) return undefined;
+  let normalized = "";
+  const starts: number[] = [];
+  const ends: number[] = [];
+  let whitespace = false;
+  for (let index = 0; index < content.length; index++) {
+    const character = content[index]!;
+    if (/\s/.test(character)) {
+      if (!normalized.length || whitespace) continue;
+      normalized += " "; starts.push(index); ends.push(index + 1); whitespace = true;
+    } else {
+      normalized += character; starts.push(index); ends.push(index + 1); whitespace = false;
+    }
+  }
+  const first = normalized.indexOf(needle);
+  if (first < 0 || normalized.indexOf(needle, first + 1) >= 0) return undefined;
+  return { start: starts[first]!, end: ends[first + needle.length - 1]! };
+}
 export const toolDefinitions: ChatCompletionTool[] = [
   [
     "search_code",
@@ -310,18 +333,31 @@ export class AgentTools {
         }
         if (content.includes("\0"))
           throw Error("edit_file requires text, not binary data");
-        const first = content.indexOf(args.oldText);
-        if (first < 0) throw Error("edit_file oldText was not found");
-        if (content.indexOf(args.oldText, first + 1) >= 0)
+        let first = content.indexOf(args.oldText);
+        let replacedLength = args.oldText.length;
+        let refreshed = false;
+        if (first < 0) {
+          const span = whitespaceEquivalentSpan(content, args.oldText);
+          refreshed = true;
+          this.logger.log("edit_file_context_refreshed", {
+            subtaskId: this.subtaskId, path: args.path,
+            recovered: !!span, reason: "oldText_not_found",
+          });
+          if (!span) throw Error("edit_file oldText was not found after local refresh");
+          first = span.start;
+          replacedLength = span.end - span.start;
+        } else if (content.indexOf(args.oldText, first + 1) >= 0)
           throw Error("edit_file oldText is ambiguous (multiple matches)");
-        await writeFile(
-          p,
-          content.slice(0, first) +
-            args.newText +
-            content.slice(first + args.oldText.length),
-        );
+        const updated = content.slice(0, first) +
+          args.newText +
+          content.slice(first + replacedLength);
+        if (updated === content)
+          throw Error("edit_file produced no change; re-read the current file before retrying");
+        await writeFile(p, updated);
         this.writeScope?.successful(args.path, "edit_file");
-        result = "edited";
+        result = refreshed
+          ? "edited after refreshing current file and matching formatting-equivalent text"
+          : "edited";
         break;
       }
       case "apply_patch": {
@@ -383,11 +419,21 @@ export class AgentTools {
             if (typeof hunk.oldText !== "string" || !hunk.oldText.length ||
                 typeof hunk.newText !== "string")
               throw Error("apply_patch requires non-empty oldText and text newText");
-            const first = content.indexOf(hunk.oldText);
-            if (first < 0 || content.indexOf(hunk.oldText, first + 1) >= 0)
+            let first = content.indexOf(hunk.oldText);
+            let replacedLength = hunk.oldText.length;
+            if (first < 0) {
+              const span = whitespaceEquivalentSpan(content, hunk.oldText);
+              this.logger.log("apply_patch_context_refreshed", {
+                subtaskId: this.subtaskId, path: edit.path,
+                recovered: !!span, reason: "oldText_not_found",
+              });
+              if (!span) throw Error("apply_patch oldText was not found after local refresh");
+              first = span.start;
+              replacedLength = span.end - span.start;
+            } else if (content.indexOf(hunk.oldText, first + 1) >= 0)
               throw Error("apply_patch oldText must occur exactly once");
             content = content.slice(0, first) + hunk.newText +
-              content.slice(first + hunk.oldText.length);
+              content.slice(first + replacedLength);
           }
           staged.push({ path: edit.path, target, before, after: content });
         }
@@ -428,9 +474,14 @@ export class AgentTools {
         if (args.symbol !== undefined && (typeof args.symbol !== "string" || !args.symbol.trim()))
           throw Error("request_context symbol must be nonempty text");
         const hit = args.symbol ? lines.findIndex((line) => line.includes(args.symbol)) : -1;
-        if (args.symbol && hit < 0) throw Error("request_context symbol not found");
-        const start = args.startLine ? args.startLine - 1 : Math.max(0, hit - 8);
-        result = truncateBytes(lines.slice(start, start + 100).join("\n"), 3200);
+        // `path` is authoritative: a stale or path-shaped symbol must not turn
+        // an existing trusted file request into a dead end. Exact symbol hits
+        // still center the excerpt as before.
+        const start = args.startLine ? args.startLine - 1 : hit >= 0 ? Math.max(0, hit - 8) : 0;
+        const excerpt = truncateBytes(lines.slice(start, start + 100).join("\n"), 3200);
+        result = args.symbol && hit < 0
+          ? `Symbol ${JSON.stringify(args.symbol)} was not found; returning trusted file context.\n${excerpt}`
+          : excerpt;
         break;
       }
       case "run_command": {

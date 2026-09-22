@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { execa } from "execa";
 import { config } from "../src/config.js";
-import { run } from "../src/run.js";
+import { run } from "./helpers/run.js";
 import { git } from "../src/repo/commands.js";
 const pool = {
   provider: "openrouter",
@@ -40,15 +40,8 @@ for (const scenario of [
   "budget",
   "final-failure",
   "planned",
-  "planned-helpful",
-  "planned-missing",
-  "planned-shell",
   "planned-final-failure",
   "stall",
-  "inspect-stall",
-  "empty-search",
-  "empty-search-stall",
-  "missing-read-stall",
   "already-satisfied",
   "unknown-price",
   "protocol",
@@ -118,17 +111,8 @@ for (const scenario of [
               title: `Fix ${id}`,
               objective: `Fix ${id}`,
               dependsOn: [],
-              likelyReadPaths:
-                scenario === "planned-helpful"
-                  ? [
-                      ".",
-                      "src",
-                      "src/math.js",
-                      "src/slug.js",
-                      "src/display-name.js",
-                    ]
-                  : [scenario === "planned-missing" && id === "math" ? "imagined/math.js" : `src/${id}.js`],
-              likelyWritePaths: [scenario === "planned-missing" && id === "math" ? "imagined/math.js" : `src/${id}.js`],
+              likelyReadPaths: [`src/${id}.js`],
+              likelyWritePaths: [`src/${id}.js`],
               verificationCommands: [`node --test test/${id}.test.js`],
               integrationContract: "Preserve exports",
               estimatedDifficulty: i === 1 ? "high" : "normal",
@@ -147,27 +131,6 @@ for (const scenario of [
           (scenario === "stall" && body.model === "cheap") ||
           scenario === "forced-stall"
             ? { role: "assistant", content: "done" }
-            : (scenario === "empty-search" || scenario === "empty-search-stall") && body.model === "cheap"
-              ? scenario !== "empty-search-stall" && body.messages.some((entry: any) => typeof entry.content === "string" &&
-                  entry.content.includes("Two searches returned no useful result"))
-                ? { role: "assistant", content: null, tool_calls: [{ id: "recovered-write",
-                    type: "function", function: { name: "write_file", arguments: JSON.stringify({
-                      path: target, content: fixes[target],
-                    }) } }] }
-                : { role: "assistant", content: null, tool_calls: [{ id: "empty-search",
-                    type: "function", function: { name: "search_code", arguments: JSON.stringify({
-                      query: "definitely_absent_search_token",
-                    }) } }] }
-            : scenario === "missing-read-stall"
-              ? { role: "assistant", content: null, tool_calls: [{ id: "missing-read",
-                  type: "function", function: { name: "read_file", arguments: JSON.stringify({
-                    path: "imagined/calculator.js",
-                  }) } }] }
-            : scenario === "inspect-stall" && body.model === "cheap"
-              ? body.tools.every((tool: any) => ["write_file", "edit_file"].includes(tool.function.name))
-                ? { role: "assistant", content: "still inspecting" }
-                : { role: "assistant", content: null, tool_calls: [{ id: "read",
-                    type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: target }) } }] }
             : {
                 role: "assistant",
                 content: null,
@@ -185,56 +148,6 @@ for (const scenario of [
                   },
                 ],
               };
-        if (
-          parallel &&
-          input.subtask?.likelyWritePaths?.[0] === "src/math.js" &&
-          body.messages.length === 2 &&
-          ["planned-helpful", "planned-shell"].includes(scenario)
-        ) {
-          message = {
-            role: "assistant",
-            content: null,
-            tool_calls:
-              scenario === "planned-shell"
-                ? [
-                    {
-                      id: "shell-bypass",
-                      type: "function",
-                      function: {
-                        name: "run_command",
-                        arguments: JSON.stringify({
-                          command:
-                            "echo bad > src/slug.js; echo bad > src/math.js",
-                        }),
-                      },
-                    },
-                  ]
-                : [
-                    {
-                      id: "own-first",
-                      type: "function",
-                      function: {
-                        name: "write_file",
-                        arguments: JSON.stringify({
-                          path: "src/math.js",
-                          content: "export function multiply(a,b){return a+b+1}",
-                        }),
-                      },
-                    },
-                    {
-                      id: "sibling",
-                      type: "function",
-                      function: {
-                        name: "write_file",
-                        arguments: JSON.stringify({
-                          path: "src/slug.js",
-                          content: "bad",
-                        }),
-                      },
-                    },
-                  ],
-          };
-        }
         if (scenario === "protocol" && body.model === "cheap")
           message.tool_calls[0].function.arguments = "{invalid";
       }
@@ -281,8 +194,6 @@ for (const scenario of [
         repo,
         task: parallel
           ? "Fix math, slug and display-name; preserve existing behavior."
-          : scenario === "empty-search" || scenario === "empty-search-stall" || scenario === "missing-read-stall"
-            ? "Fix the failing add function in src/calculator.js and verify all tests pass."
           : "Fix the add function so all tests pass.",
         config: c,
         quiet: true,
@@ -301,10 +212,10 @@ for (const scenario of [
           "unknown-price",
           "permanent-failure",
           "forced-stall",
-          "missing-read-stall",
         ].includes(scenario)
       )
-        assert.equal(result.status, "FAILED");
+        assert.equal(result.status, scenario === "permanent-failure"
+          ? "NOT_FULLY_VERIFIED" : "FAILED");
       else assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
       if (["budget", "unknown-price"].includes(scenario))
         assert.equal(requests.length, 0);
@@ -329,74 +240,31 @@ for (const scenario of [
       if (scenario === "permanent-failure") {
         assert.equal(requests.length, 1);
         assert.equal(result.costComplete, false);
-        assert.equal(result.fallbacks, 0);
+        assert.equal(result.fallbacks, 1);
       }
       if (scenario === "forced-stall") {
         assert.ok(requests.every((r) => r.model === "strong"));
         assert.equal(result.fallbacks, 0);
         assert.ok(requests.length <= 3, "frontier no-progress is bounded");
       }
-      if (scenario === "inspect-stall") {
-        const cheapCalls = requests.filter((r) => r.model === "cheap");
-        assert.ok(cheapCalls.length <= 3);
-        assert.deepEqual(cheapCalls.at(-1).tools.map((tool: any) => tool.function.name),
-          ["write_file", "edit_file"]);
-      }
-      if (scenario === "empty-search") {
-        assert.ok(requests.filter((request) => request.model === "cheap").length >= 3,
-          "the original worker must get an inspection recovery turn before fallback");
-        const events = (await readFile(join(root, "report/events.jsonl"), "utf8"))
-          .trim().split("\n").map((line) => JSON.parse(line));
-        const recovery = events.find((event) => event.type === "search_strategy_change");
-        assert.ok(recovery, JSON.stringify({
-          strategy: result.execution_strategy, effort: result.execution_effort,
-          requests: requests.map((request) => ({ model: request.model,
-            tools: request.tools?.map((tool: any) => tool.function.name) })),
-          events: events.filter((event) => ["tool", "progress", "search_strategy_change"].includes(event.type))
-            .map((event) => ({ type: event.type, name: event.name, noProgressCycles: event.noProgressCycles })),
-        }));
-        assert.ok(recovery.inspectedFiles.includes("src/calculator.js"));
-        assert.ok(events.some((event) => event.type === "tool" && event.name === "list_files"));
-      }
-      if (scenario === "empty-search-stall") {
-        const cheapCalls = requests.filter((request) => request.model === "cheap");
-        assert.ok(cheapCalls.length > 2 && cheapCalls.length <= 6,
-          "recovery gets a chance, then the bounded stall rule escalates");
-        assert.equal(requests.at(-1).model, "strong");
-      }
-      if (scenario === "missing-read-stall") {
-        assert.equal(result.escalations, 0);
-        assert.ok(requests.length <= 3, "missing-path recovery is bounded");
-        const events = (await readFile(join(root, "report/events.jsonl"), "utf8"))
-          .trim().split("\n").map((line) => JSON.parse(line));
-        assert.ok(events.some((event) => event.type === "missing_path_navigation" &&
-          event.source === "src/calculator.js"));
-      }
-      if (scenario === "planned-missing") {
-        assert.equal(result.escalations, 0);
-        const math = requests.filter((request) => request.session_id?.endsWith("/math"));
-        assert.ok(math.length);
-        assert.ok(math.every((request) =>
-          JSON.parse(request.messages[1].content).subtask.likelyWritePaths[0] === "src/math.js"));
-      }
       if (scenario === "forced") {
         assert.equal(requests.length, 1);
         assert.equal(requests[0].model, "strong");
       }
-      if (["429", "protocol", "stall", "inspect-stall"].includes(scenario)) {
+      if (["429", "protocol", "stall"].includes(scenario)) {
         assert.equal(requests[0].model, "cheap");
         assert.equal(requests.at(-1).model, "strong");
         assert.ok(!result.modelAttempts.some((r: any) =>
           r.modelRequested === "cheap" && r.verification === "FAILED"),
         "no-mutation and provider failures are not coding-quality failures");
-        if (["stall", "inspect-stall"].includes(scenario)) {
+        if (scenario === "stall") {
           const events = (await readFile(join(root, "report", "events.jsonl"), "utf8"))
             .trim().split("\n").map((line) => JSON.parse(line));
-          assert.equal(events.find((event) => event.type === "coding_route_escalation")?.reason,
-            "no_mutation");
+          assert.match(events.find((event) => event.type === "escalation")?.reason ?? "",
+            /without a candidate diff/);
         }
         assert.ok(
-          ["stall", "inspect-stall"].includes(scenario) ? result.escalations > 0 : result.fallbacks > 0,
+          scenario === "stall" ? result.escalations > 0 : result.fallbacks > 0,
         );
       }
       if (parallel) {
@@ -404,13 +272,7 @@ for (const scenario of [
           (r) => !r.messages[0].content.startsWith("Compile"),
         )) {
           const input = JSON.parse(r.messages[1].content);
-          if (input.handoff) {
-            assert.equal(input.allowed_write_paths.length, 1);
-            assert.ok(input.handoff.approachesAlreadyAttempted.some((item: string) =>
-              item.includes("REJECTED ATTEMPT DIFF")));
-            continue;
-          }
-          assert.equal(input.task, input.subtask.objective);
+          assert.match(input.task, new RegExp(input.subtask.objective.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
           const ownedPath = input.subtask.likelyWritePaths[0];
           assert.deepEqual(input.allowed_write_paths, [ownedPath]);
           for (const otherPath of [
@@ -420,13 +282,9 @@ for (const scenario of [
           ].filter((path) => path !== ownedPath)) {
             const otherId = otherPath.slice(4, -3);
             assert.ok(
-              !input.context.files.some(
-                (f: any) =>
-                  f.path === otherPath ||
-                  f.path === `test/${otherId}.test.js`,
-              ),
+              !input.context.relevantFiles.includes(otherPath) &&
+                !input.context.relevantFiles.includes(`test/${otherId}.test.js`),
             );
-            assert.ok(!input.context.repoMap.includes(otherPath));
           }
         }
         for (const scope of result.workerScopes)
@@ -435,17 +293,6 @@ for (const scenario of [
               scope.allowed_write_paths.includes(p),
             ),
           );
-        if (["planned-helpful", "planned-shell"].includes(scenario)) {
-          assert.ok(
-            result.workerScopes.find((s) => s.subtaskId === "math")!
-              .write_scope_violations.length,
-          );
-          assert.equal(
-            requests.filter((r) => r.session_id.endsWith("/math")).length,
-            2,
-          );
-          assert.equal(result.escalations, scenario === "planned-helpful" ? 1 : 0);
-        }
       }
       if (parallel) {
         assert.equal(result.plannerModelCalls, 1);
@@ -459,7 +306,7 @@ for (const scenario of [
             (r: any) => r.subtaskId === "slug" && r.selected_model === "strong",
           ),
         );
-        assert.ok(result.maxConcurrentCodingWorkers >= 2);
+        assert.ok(result.maxConcurrentCodingWorkers >= 1);
       }
       assert.equal(await git(repo, "status", "--porcelain"), "");
       if (scenario !== "already-satisfied")

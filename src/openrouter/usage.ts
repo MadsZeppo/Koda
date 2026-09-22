@@ -15,6 +15,30 @@ export function parseUsage(u: any): Usage {
     raw: u ?? null,
   };
 }
+export function estimateUsageCost(
+  usage: Usage,
+  promptPrice: number,
+  completionPrice: number,
+) {
+  const raw = usage.raw as Record<string, unknown> | null;
+  const promptTokens = raw?.prompt_tokens;
+  const completionTokens = raw?.completion_tokens;
+  if (
+    !Number.isSafeInteger(promptTokens) ||
+    (promptTokens as number) < 0 ||
+    !Number.isSafeInteger(completionTokens) ||
+    (completionTokens as number) < 0 ||
+    !Number.isFinite(promptPrice) ||
+    promptPrice < 0 ||
+    !Number.isFinite(completionPrice) ||
+    completionPrice < 0
+  ) return null;
+  const cost =
+    ((promptTokens as number) * promptPrice +
+      (completionTokens as number) * completionPrice) /
+    1e6;
+  return Number.isFinite(cost) && cost >= 0 ? cost : null;
+}
 export class Budget {
   spent = 0;
   tokens = 0;

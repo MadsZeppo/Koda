@@ -8,6 +8,10 @@ export function summarize(
   changedFiles: string[],
   _legacyParallelPeak?: number,
 ) {
+  const allScopeEvents = logger.events.filter((event) => event.type === "worker_scope");
+  const workerScopeEvents = allScopeEvents.filter((event) =>
+    event.read_only !== true || !allScopeEvents.some((candidate) =>
+      candidate.subtaskId === event.subtaskId && candidate.read_only !== true));
   const active = new Set<string>();
   let observedPeak = 0;
   for (const event of logger.events) {
@@ -114,7 +118,8 @@ export function summarize(
     plannerRoutes: logger.events.filter((e) => e.type === "planner_route"),
     routingDecisions: logger.events.filter((e) => e.type === "model_router"),
     modelAttempts: logger.events.filter((e) => e.type === "model_attempt"),
-    fallbacks: logger.events.filter((e) => e.type === "model_fallback" || e.type === "coding_route_fallback").length,
+    fallbacks: logger.events.filter((e) => e.type === "model_fallback" ||
+      e.type === "coding_route_fallback" || e.type === "mini_swe_fallback" && e.moved === true).length,
     plannerModels: [
       ...new Set(
         calls.filter((c) => c.stage === "plan").map((c) => c.modelRequested),
@@ -153,8 +158,7 @@ export function summarize(
         calls.filter((c) => (c.role ?? "unknown") === role).length,
       ]),
     ),
-    workerScopes: logger.events
-      .filter((e) => e.type === "worker_scope")
+    workerScopes: workerScopeEvents
       .map((e) => ({
         subtaskId: e.subtaskId,
         allowed_write_paths: e.allowed_write_paths,
@@ -195,7 +199,8 @@ export function summarize(
         context_limit_bytes: e.context_limit_bytes,
       })),
     finalVerificationStatus: verification.status,
-    escalations: logger.events.filter((e) => e.type === "escalation").length,
+    escalations: logger.events.filter((e) => e.type === "escalation" ||
+      e.type === "model_fallback" && e.verifiedQualityFailure === true).length,
     frontierCalls,
     mergeConflicts: logger.events.filter((e) => e.type === "merge_conflict")
       .length,

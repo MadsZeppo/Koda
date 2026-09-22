@@ -203,19 +203,19 @@ test("reference outcome is inferred from task-local quality rather than model na
   assert.equal(result.selectedPlan?.models[0], "economical-generalist");
 });
 
-test("a finite budget neither lowers the reference outcome nor credits an unaffordable rescue", () => {
+test("the reference is attainable within budget and an unaffordable rescue earns no credit", () => {
   const models = [efficient(), reference()];
   const unrestricted = route(models);
-  const referenceCost = unrestricted.reference!.cost;
-  const initialCost = unrestricted.considered.find((candidate) => candidate.model.id === "efficient")!.cost;
+  const referenceCost = unrestricted.reference!.reservationCost;
+  const initialCost = unrestricted.considered.find((candidate) => candidate.model.id === "efficient")!.reservationCost;
   const settings = { maxOutputTokens: 1000, routing: routingSchema.parse({}) } as Config;
   const belowReference = optimizeSpecialists(models, fingerprint(), features, [], settings,
     (initialCost + referenceCost) / 2);
-  assert.equal(belowReference.reference?.model.id, unrestricted.reference!.model.id);
-  assert.equal(belowReference.reference?.quality, unrestricted.reference!.quality);
-  assert.equal(belowReference.selectedPlan, undefined,
-    "running out of budget cannot make the materially weaker standalone model acceptable");
-  assert.deepEqual(belowReference.cascade, []);
+  assert.equal(belowReference.reference?.model.id, "efficient",
+    "an unaffordable model must not define an impossible quality target");
+  assert.deepEqual(belowReference.selectedPlan?.models, ["efficient"]);
+  assert.equal(belowReference.considered.find((candidate) => candidate.model.id === "reference")?.rejected,
+    "completion budget");
 
   const onlyReferenceFits = optimizeSpecialists(models, fingerprint(), features, [], settings,
     referenceCost + initialCost / 2);
@@ -245,4 +245,65 @@ test("cost and latency weights choose different winners only within the quality 
     assert.ok(weakerPlans.length > 0);
     assert.ok(weakerPlans.every((candidate) => !candidate.eligible && candidate.qualityGap > result.allowedRegret));
   }
+});
+
+
+test("latency preferences cannot eliminate the reference or every compatible plan", () => {
+  const operations = (id: string, ms: number): OperationalCall[] => Array.from({ length: 8 }, () => ({
+    type: "operational_call", timestamp: "2026-01-01", runId: "slow", subtaskId: "change",
+    stage: "implement", taskBucket: taskBucket(features), modelRequested: id, modelServed: id,
+    provider: "mock", wallClockMs: ms, outcome: "response", costUsd: 0.001,
+  }));
+  const models = [model("fast-weaker", 0.1, 0.01, 1000), reference()];
+  const slowReference = route(models, fingerprint("weak"), [], operations("reference", 70000));
+  assert.deepEqual(slowReference.selectedPlan?.models, ["reference"],
+    "a fast candidate outside the quality plateau cannot remove the slow reference");
+  assert.equal(slowReference.referencePlan?.eligible, true);
+
+  const allSlow = route(models, fingerprint("weak"), [],
+    [...operations("fast-weaker", 40000), ...operations("reference", 70000)]);
+  assert.ok(allSlow.considered.every((candidate) => !candidate.latencySlaPassed));
+  assert.deepEqual(allSlow.selectedPlan?.models, ["reference"]);
+});
+
+test("race-reserved models cannot define the reference or be selected as the initial model", () => {
+  const settings = { maxOutputTokens: 1000, routing: routingSchema.parse({}) } as Config;
+  const result = optimizeSpecialists([efficient(), reference()], fingerprint(), features, [], settings,
+    10, [], new Set(["reference"]));
+  assert.equal(result.reference?.model.id, "efficient");
+  assert.equal(result.selectedPlan?.models[0], "efficient");
+  assert.ok(result.plans.filter((candidate) => candidate.models[0] === "reference")
+    .every((candidate) => !candidate.eligible && candidate.hardRejection === "already reserved for race"));
+});
+
+test("historical retry cost is a forecast, not a veto on the only affordable model call", () => {
+  const available = efficient();
+  const prior = route([available]);
+  const settings = { maxOutputTokens: 1000, routing: routingSchema.parse({}) } as Config;
+  const history = [observation("efficient", fingerprint(), { inputTokens: 10000000, outputTokens: 10000000 })];
+  const result = optimizeSpecialists([available], fingerprint(), features, history, settings,
+    prior.considered[0]!.reservationCost * 1.5);
+  assert.deepEqual(result.selectedPlan?.models, ["efficient"]);
+  assert.equal(result.referencePlan?.eligible, true);
+});
+
+test("insufficient hard budget still returns no executable route", () => {
+  const settings = { maxOutputTokens: 1000, routing: routingSchema.parse({}) } as Config;
+  const result = optimizeSpecialists([efficient(), reference()], fingerprint(), features, [], settings, 0);
+  assert.equal(result.selectedPlan, undefined);
+  assert.equal(result.reference, undefined);
+  assert.deepEqual(result.cascade, []);
+  assert.ok(result.considered.every((candidate) => candidate.rejected === "completion budget"));
+});
+
+test("an estimated cheap call cannot bypass the conservative reservation budget", () => {
+  const settings = { maxOutputTokens: 1000, routing: routingSchema.parse({}) } as Config;
+  const available = efficient();
+  const unrestricted = route([available]);
+  const candidate = unrestricted.considered[0]!;
+  assert.ok(candidate.reservationCost > candidate.cost);
+  const result = optimizeSpecialists([available], fingerprint(), features, [], settings,
+    (candidate.reservationCost + candidate.cost) / 2);
+  assert.equal(result.selectedPlan, undefined);
+  assert.equal(result.considered[0]!.hardRejection, "completion budget");
 });

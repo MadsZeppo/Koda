@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { tmpdir, homedir } from "node:os";
 import type { Config } from "./config.js";
-import { bridgeDependencies } from "./repo/dependencies.js";
+import { bootstrapDependencies, bridgeDependencies, inheritDependencyEnvironment } from "./repo/dependencies.js";
 import { raceVerified } from "./orchestrator/race.js";
 import { profileRepo } from "./repo/profiler.js";
 import { git, command } from "./repo/commands.js";
@@ -27,7 +27,7 @@ import {
 import { normalizePlan } from "./orchestrator/coalesce.js";
 import { compileTask } from "./planner/taskCompiler.js";
 import { schedule } from "./orchestrator/scheduler.js";
-import { implement } from "./agent/loop.js";
+import { implement } from "./agent/miniSweExecutor.js";
 import { currentDiff, safePath } from "./agent/tools.js";
 import { truncateBytes } from "./context/bounds.js";
 import { AttemptCheckpoint } from "./agent/attemptCheckpoint.js";
@@ -53,6 +53,8 @@ import {
 } from "./workspace/backend.js";
 import { changeCode } from "./workspace/files.js";
 import { nextCodingTier, type CodingTier } from "./router/codingDemand.js";
+import { taskRelevantMutationPaths } from "./agent/mutationInvariant.js";
+import type { CodingWorker } from "./agent/codingWorker.js";
 export interface RunOptions {
   repo: string;
   /** Calibration may freeze source separately while reusing original installed dependencies. */
@@ -64,6 +66,8 @@ export interface RunOptions {
   output?: string;
   quiet?: boolean;
   apply?: boolean;
+  /** Deterministic test seam. CLI/production never supplies a worker factory. */
+  codingWorkerFactory?: (gateway: Gateway) => CodingWorker;
 }
 async function assertWriteResponsibility(path: string, subtask: Subtask) {
   const changed =
@@ -163,13 +167,11 @@ export async function run(options: RunOptions) {
       throw Error(`Sandbox preflight failed: ${sandboxCheck.stderr}`);
     integration = await backend.initialize();
     let profile = await profileRepo(integration.path);
-    if (
-      await bridgeDependencies(
-        options.dependencyRoot ?? repo,
-        integration.path,
-        profile.ecosystem,
-      )
-    )
+    if (await bridgeDependencies(
+      options.dependencyRoot ?? repo, integration.path, profile.ecosystem))
+      profile = await profileRepo(integration.path);
+    if (profile.ecosystem && await bootstrapDependencies(
+      integration.path, integration.path, profile.ecosystem, logger))
       profile = await profileRepo(integration.path);
     logger.log("worktree", {
       stage: "integration",
@@ -184,6 +186,7 @@ export async function run(options: RunOptions) {
       options.config.maxMinutes * 60000 - (Date.now() - start),
     );
     const gateway = new Gateway(options.config, logger, budget);
+    const codingWorker = options.codingWorkerFactory?.(gateway);
     poolRouter = gateway.modelRouter;
     strategy = chooseExecutionStrategy(options.task, profile);
     logger.log("execution_strategy", {
@@ -280,6 +283,7 @@ export async function run(options: RunOptions) {
         { acceptanceCriteria: [options.task] },
         profile,
         {
+          codingWorker,
           compiledContext: implementationContext,
           evidence: prepared.evidence,
           finalVerificationOnly: true,
@@ -290,20 +294,26 @@ export async function run(options: RunOptions) {
       if (result.verification.status === "FAILED")
         throw Error("stable: worker failed before final verification");
       await assertWriteResponsibility(integration.path, subtask);
-      const revision = await backend.finalizeWorker(
-        integration,
-        `agent: ${options.task}`,
-      );
-      if (!revision.changes.length)
-        throw Error("stable: worker produced no changes");
-      logger.log("integrated", {
-        subtaskId: subtask.id,
-        commit: revision.commit,
-        changes: revision.changes.map((change) => change.path),
-      });
+      const alreadySatisfied = "noChangesRequired" in result && result.noChangesRequired;
+      if (!alreadySatisfied) {
+        const pendingChanges = await backend.changes(integration.path);
+        if (!taskRelevantMutationPaths(options.task, prepared.writePaths, pendingChanges).length)
+          throw Error("stable: worker produced no task-relevant implementation changes");
+        const revision = await backend.finalizeWorker(
+          integration,
+          `agent: ${options.task}`,
+        );
+        if (!revision.changes.length)
+          throw Error("stable: worker produced no changes");
+        logger.log("integrated", {
+          subtaskId: subtask.id,
+          commit: revision.commit,
+          changes: revision.changes.map((change) => change.path),
+        });
+      }
       logger.log("task_complete", {
         subtaskId: subtask.id,
-        verification: "AWAITING_FINAL_VERIFICATION",
+        verification: alreadySatisfied ? "VERIFIED_SUCCESS" : "AWAITING_FINAL_VERIFICATION",
       });
     } else if (strategy.execution_strategy === "direct") {
       const context =
@@ -349,6 +359,7 @@ export async function run(options: RunOptions) {
         { acceptanceCriteria: [options.task] },
         profile,
         {
+          codingWorker,
           compiledContext: context,
           tinyDirect: strategy.execution_effort === "tiny",
           finalVerificationOnly: strategy.execution_effort === "tiny",
@@ -420,7 +431,7 @@ export async function run(options: RunOptions) {
             branch: wt.branch,
           });
           try {
-            await bridgeDependencies(repo, wt.path, profile.ecosystem);
+            await inheritDependencyEnvironment(integration!.path, wt.path);
             let evidence: EvidencePacket;
             try {
               evidence = await discover(
@@ -475,7 +486,7 @@ export async function run(options: RunOptions) {
             branch: wt.branch,
           });
           try {
-            await bridgeDependencies(repo, wt.path, profile.ecosystem);
+            await inheritDependencyEnvironment(integration!.path, wt.path);
             const candidateTask = { ...subtask, id: subtask.id + suffix };
             const result = await implement(
               gateway,
@@ -485,6 +496,7 @@ export async function run(options: RunOptions) {
               plan,
               profile,
               {
+                codingWorker,
                 initialRole,
                 stop,
                 raceGroup: suffix ? subtask.id : undefined,
@@ -569,7 +581,7 @@ export async function run(options: RunOptions) {
                 conflictTask,
                 plan,
                 profile,
-                { initialRole: "STRONG_MODEL", extra },
+                { codingWorker, initialRole: "STRONG_MODEL", extra },
               );
               if (result.verification.status !== "VERIFIED_SUCCESS")
                 throw Error("Conflict resolution not verified");
@@ -727,6 +739,7 @@ export async function run(options: RunOptions) {
     verification = await runFinalVerification();
     if (
       stableRepairContext &&
+      changed.length > 0 &&
       verification.status === "FAILED" &&
       finalBaseline &&
       verificationRegressions(finalBaseline, verification).length > 0
@@ -833,6 +846,7 @@ export async function run(options: RunOptions) {
             { acceptanceCriteria: [options.task] },
             await profileRepo(integration.path),
             {
+              codingWorker,
               compiledContext: stableRepairContext.context,
               evidence: stableRepairContext.prepared.evidence,
               finalVerificationOnly: true,
@@ -1018,6 +1032,7 @@ export async function run(options: RunOptions) {
     }
     if (
       directRepairContext &&
+      changed.length > 0 &&
       options.config.adaptiveCoding &&
       !options.config.forceModel &&
       verification.status === "FAILED" &&
@@ -1057,6 +1072,7 @@ export async function run(options: RunOptions) {
             { acceptanceCriteria: [options.task] },
             await profileRepo(integration.path),
             {
+              codingWorker,
               compiledContext: repairContext,
               tinyDirect: true,
               finalVerificationOnly: true,

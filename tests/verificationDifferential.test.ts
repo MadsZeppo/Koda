@@ -5,6 +5,13 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { verify, verificationAgainstBaseline, verificationRegressions,
   verificationResult } from "../src/verifier/verifier.js";
+import { pythonSandboxEnvironment } from "../src/repo/commands.js";
+
+async function concreteSystemPython(root: string) {
+  const resolved = await pythonSandboxEnvironment(root, { PATH: process.env.PATH });
+  assert.ok(resolved.interpreter, "controlled system Python is required by this Python fixture");
+  return resolved.interpreter;
+}
 
 const result = (stdout: string, exitCode = 1, command = "pytest -q") => verificationResult([{
   command, stdout, stderr: "", exitCode, wallClockMs: 1, timedOut: false, kind: "test" as const,
@@ -67,10 +74,11 @@ test("safe external Python environment is reused read-only with candidate source
   const saved = { PATH: process.env.PATH, VIRTUAL_ENV: process.env.VIRTUAL_ENV };
   try {
     // No pip, package installation, or network is involved.
-    await execa("python3", ["-m", "venv", "--without-pip", external]);
+    await execa(await concreteSystemPython(root), ["-m", "venv", "--without-pip", external]);
     const python = join(external, "bin", "python");
     const site = (await execa(python, ["-c", "import site; print(site.getsitepackages()[0])"])).stdout;
     await writeFile(join(site, "existing_dependency.py"), "value = 7\n");
+    await writeFile(join(site, "candidate_module.py"), "value = -1\n");
     await writeFile(join(site, "bootstrap.pth"),
       "import os; os.environ.setdefault('SAFE_VENV_BOOTSTRAP', '1')\n");
     await mkdir(join(root, "src"));
@@ -84,16 +92,18 @@ test("safe external Python environment is reused read-only with candidate source
     ].join("\n"));
     process.env.VIRTUAL_ENV = external;
     process.env.PATH = `${join(external, "bin")}:${saved.PATH}`;
-    const command = "python -B check.py";
-    const candidate = { command, kind: "test" as const, cwd: ".", source: "test:external",
-      confidence: 1, available: true, mutatesSource: false as const, requiresInstalledDependencies: true };
-    const actual = await verify(root, [command], 10000, undefined, undefined, [candidate]);
+    const commands = ["python -B check.py", "python3 -B check.py"];
+    const candidates = commands.map((command) => ({ command, kind: "test" as const,
+      cwd: ".", source: "test:external", confidence: 1, available: true,
+      mutatesSource: false as const, requiresInstalledDependencies: true }));
+    const actual = await verify(root, commands, 10000, undefined, undefined, candidates);
     assert.equal(actual.status, "VERIFIED_SUCCESS", JSON.stringify(actual));
+    assert.equal(actual.checks.length, 2);
     // Editable startup hooks could import the original source instead of the copy.
     await writeFile(join(site, "editable.pth"), `import sys; sys.path.insert(0, ${JSON.stringify(root)})\n`);
-    const unsafe = await verify(root, [command], 10000, undefined, undefined, [candidate]);
+    const unsafe = await verify(root, commands, 10000, undefined, undefined, candidates);
     assert.equal(unsafe.status, "NOT_FULLY_VERIFIED");
-    assert.equal(unsafe.checks[0]!.outcome, "INFRA_FAILURE");
+    assert.ok(unsafe.checks.every((check) => check.outcome === "INFRA_FAILURE"));
   } finally {
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
@@ -106,23 +116,30 @@ test("safe external Python environment is reused read-only with candidate source
 test("inherited repo-local Python environment is remapped to the isolated copy", async () => {
   const { execa } = await import("execa");
   const root = await mkdtemp(join(tmpdir(), "koda-python-local-"));
+  const unrelated = await mkdtemp(join(tmpdir(), "koda-python-unrelated-"));
   const saved = { PATH: process.env.PATH, VIRTUAL_ENV: process.env.VIRTUAL_ENV };
   try {
     const env = join(root, ".venv");
-    await execa("python3", ["-m", "venv", "--without-pip", env]);
-    await writeFile(join(root, "check.py"), "import sys\nassert 'koda-verify-' in sys.prefix\n");
-    process.env.VIRTUAL_ENV = env;
-    process.env.PATH = `${join(env, "bin")}:${saved.PATH}`;
-    const command = "python -B check.py";
-    const candidate = { command, kind: "test" as const, cwd: ".", source: "test:local-env",
-      confidence: 1, available: true, mutatesSource: false as const, requiresInstalledDependencies: false };
-    const actual = await verify(root, [command], 10000, undefined, undefined, [candidate]);
+    const hostPython = await concreteSystemPython(root);
+    await execa(hostPython, ["-m", "venv", "--without-pip", env]);
+    await execa(hostPython, ["-m", "venv", "--without-pip", unrelated]);
+    await writeFile(join(root, "check.py"),
+      "import sys\nassert 'koda-verify-' in sys.prefix\nassert '.venv' in sys.prefix\n");
+    process.env.VIRTUAL_ENV = unrelated;
+    process.env.PATH = `${join(unrelated, "bin")}:${saved.PATH}`;
+    const commands = ["python -B check.py", "python3 -B check.py"];
+    const candidates = commands.map((command) => ({ command, kind: "test" as const,
+      cwd: ".", source: "test:local-env", confidence: 1, available: true,
+      mutatesSource: false as const, requiresInstalledDependencies: false }));
+    const actual = await verify(root, commands, 10000, undefined, undefined, candidates);
     assert.equal(actual.status, "VERIFIED_SUCCESS", JSON.stringify(actual));
+    assert.equal(actual.checks.length, 2);
   } finally {
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
     }
     await rm(root, { recursive: true, force: true });
+    await rm(unrelated, { recursive: true, force: true });
   }
 });
 
@@ -202,4 +219,30 @@ test("differential attribution keeps coding regressions strict and infrastructur
   assert.equal(mixed.status, "FAILED");
   assert.deepEqual(verificationRegressions(mixedBaseline, mixed).map((check) => check.command),
     ["pnpm typecheck"]);
+});
+
+test("successful candidate evidence plus unrelated Python infrastructure is not repairable regression", () => {
+  const pass = (command: string, kind: "test" | "typecheck" = "test") => ({
+    command, kind, outcome: "CHECK_PASS" as const, exitCode: 0, stdout: "ok", stderr: "",
+    wallClockMs: 1, timedOut: false, requirement: "required" as const,
+  });
+  const pythonInfrastructure = {
+    ...pass("python3 -m pytest"), exitCode: 1, outcome: "INFRA_FAILURE" as const,
+    stderr: "python_environment_inaccessible",
+  };
+  const baseline = verificationResult([
+    pass("pnpm typecheck", "typecheck"), pass("python3 -m pytest"),
+  ]);
+  const candidate = verificationAgainstBaseline(baseline, verificationResult([
+    pass("pnpm typecheck", "typecheck"), pythonInfrastructure,
+  ]));
+  const attributable = verificationRegressions(baseline, candidate);
+  let repairCalls = 0;
+  if (candidate.status === "FAILED" && attributable.length) repairCalls++;
+
+  assert.equal(candidate.status, "NOT_FULLY_VERIFIED");
+  assert.equal(candidate.checks[1]!.outcome, "INFRA_FAILURE");
+  assert.equal(candidate.failedChecks, 0);
+  assert.deepEqual(attributable, []);
+  assert.equal(repairCalls, 0);
 });

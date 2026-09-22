@@ -4,6 +4,7 @@ import { isTestPath, resolveImports } from "../context/compiler.js";
 import type { RepoProfile } from "../types.js";
 import type { EvidencePacket } from "../planner/schemas.js";
 import { safePath } from "./tools.js";
+import { retrieveSourceGrounding, type GroundedDefinition } from "../context/sourceGrounding.js";
 
 export interface RepairPacket {
   objective: string;
@@ -15,6 +16,7 @@ export interface RepairPacket {
   focusedTestPaths: string[];
   verificationCommands: string[];
   evidenceSummary: string[];
+  definitions: GroundedDefinition[];
 }
 
 /** Local, bounded context for every locked file; never trust a model's file inventory. */
@@ -79,14 +81,24 @@ export async function buildRepairPacket(
     focusedTestPaths: contextPaths.filter(isTestPath),
     verificationCommands,
     evidenceSummary: (inspectionEvidence?.evidence ?? []).slice(0, 8),
+    definitions: await retrieveSourceGrounding(
+      root, contextPaths, profile, Math.min(5000, Math.floor(maxPromptBytes * 0.28)),
+      [], objective,
+    ),
   };
+  while (packet.definitions.length && Buffer.byteLength(JSON.stringify(packet)) > maxPromptBytes)
+    packet.definitions.pop();
   if (Buffer.byteLength(JSON.stringify(packet)) > maxPromptBytes)
     throw Error("Stable RepairPacket exceeds prompt budget");
   return {
     packet,
     context: {
-      files: files.map((file) => ({ path: file.path, snippet: file.content })),
-      repoMap: [...contextPaths],
+      files: [...files.map((file) => ({ path: file.path, snippet: file.content })),
+        ...packet.definitions.filter((definition) =>
+          !files.some((file) => file.path === definition.path)).map((definition) => ({
+          path: definition.path, snippet: definition.content,
+        }))],
+      repoMap: [...new Set([...contextPaths, ...packet.definitions.map((item) => item.path)])],
       localDependencies: [...new Set(importLinks.map(([, dependency]) => dependency))]
         .filter((file) => !paths.includes(file)),
     },

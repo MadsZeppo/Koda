@@ -44,6 +44,7 @@ export interface OperationalCall {
   wallClockMs: number;
   outcome: "response" | "error";
   costUsd: number | null;
+  costSource?: "provider_reported" | "estimated_from_tokens";
   classification?: "OPERATIONAL_FAILURE";
 }
 /** One append syscall per record (O_APPEND); no read/modify/write race between workers. */

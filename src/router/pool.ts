@@ -5,6 +5,8 @@ export const metadataSchema = z.object({
   contextLength: z.number().positive().optional(),
   available: z.boolean().optional(),
   supportedParameters: z.array(z.string()).optional(),
+  /** Parameters supported together by each concrete provider endpoint. */
+  routableParameterSets: z.array(z.array(z.string())).optional(),
   retrievedAt: z.string().optional(),
 });
 export const modelSchema = z.object({
@@ -50,3 +52,12 @@ export type PoolModel = z.infer<typeof modelSchema>;
 export type Metadata = z.infer<typeof metadataSchema>;
 export type Pool = z.infer<typeof poolSchema>;
 export const tierRank = { cheap: 0, fast: 1, strong: 2, frontier: 3 };
+
+/** Model-level parameter lists are unions; endpoint sets prove co-support. */
+export function supportsParameters(metadata: Metadata, required: readonly string[]) {
+  if (metadata.routableParameterSets !== undefined)
+    return metadata.routableParameterSets.some((set) =>
+      required.every((parameter) => set.includes(parameter)));
+  return metadata.supportedParameters === undefined ||
+    required.every((parameter) => metadata.supportedParameters!.includes(parameter));
+}

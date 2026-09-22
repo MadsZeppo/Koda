@@ -5,7 +5,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { config } from "../src/config.js";
-import { run } from "../src/run.js";
+import { run } from "./helpers/run.js";
 import { git } from "../src/repo/commands.js";
 import { profileRepo } from "../src/repo/profiler.js";
 import { Gateway } from "../src/openrouter/client.js";
@@ -209,7 +209,7 @@ test("no-scope fallback ranks inspected content and locks only the evidence-back
       ], repoMap: ["src/agent/prompts.ts", "src/run.ts", "tests/prompts.test.ts"], localDependencies: [] });
     assert.deepEqual(prepared.writePaths, ["src/agent/prompts.ts", "tests/prompts.test.ts"]);
     assert.ok(!prepared.writePaths.includes("src/run.ts"));
-    assert.equal(calls, 1);
+    assert.equal(calls, 0, "ranked local context locks scope before model discovery");
     assert.equal(logger.events.filter((event) => event.type === "stable_actionable_scope_fallback").length, 1);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
