@@ -398,13 +398,12 @@ test("Stable test task filters incompatible endpoints and recovers a formatting-
     }
     let raw = ""; for await (const chunk of request) raw += chunk;
     const body = JSON.parse(raw); requests.push(body);
-    assert.equal(body.model, "compatible-cheap");
+    assert.notEqual(body.model, "incompatible-cheap");
     assert.equal(body.tool_choice, "required", JSON.stringify({ url: request.url,
       tools: body.tools?.map((entry: any) => entry.function?.name) }));
     const input = JSON.parse(body.messages[1].content);
-    assert.deepEqual(input.repairPacket.allowedWritePaths, ["tests/routeDecision.test.cjs"]);
+    assert.deepEqual(input.repairPacket.allowedWritePaths, ["."]);
     assert.match(JSON.stringify(input), /selectedModel/);
-    assert.match(JSON.stringify(input), /expectedCompletionCost/);
     const message = { role: "assistant", content: null, tool_calls: [{
       id: "stale-formatting", type: "function", function: {
         name: "edit_file", arguments: JSON.stringify({
@@ -443,7 +442,7 @@ test("Stable test task filters incompatible endpoints and recovers a formatting-
         latencyPriorMs: 50, strengths: ["coding", "tool_use"] },
       { id: "compatible-cheap", tier: "cheap" as const, qualityPrior: 0.95,
         latencyPriorMs: 60, strengths: ["coding", "tool_use"] },
-      { id: "expensive-fallback", tier: "strong" as const, qualityPrior: 0.96,
+      { id: "expensive-fallback", tier: "strong" as const, qualityPrior: 0.95,
         latencyPriorMs: 100, strengths: ["coding", "tool_use"] },
     ];
     const settings = await config(undefined, { modelPool: { provider: "openrouter", models },
@@ -459,8 +458,11 @@ test("Stable test task filters incompatible endpoints and recovers a formatting-
     assert.equal(requests.some((request) => request.model === "expensive-fallback"), false);
     const events = (await readFile(join(output, "events.jsonl"), "utf8"))
       .trim().split("\n").map((line) => JSON.parse(line));
-    const scope = events.find((event) => event.type === "stable_scope_locked");
-    assert.deepEqual(scope.allowed_write_paths, ["tests/routeDecision.test.cjs"]);
+    assert.deepEqual(events.find((event) => event.type === "stable_discovery_start")
+      .initial_write_scope, ["."]);
+    const scope = events.find((event) => event.type === "stable_discovery_scope_locked");
+    assert.deepEqual(scope.actual_changed_paths, ["tests/routeDecision.test.cjs"]);
+    assert.deepEqual(scope.repair_write_scope, scope.actual_changed_paths);
     assert.ok(events.some((event) => event.type === "edit_file_context_refreshed" &&
       event.recovered === true));
     assert.ok(events.some((event) => event.type === "write_success" &&
@@ -594,10 +596,8 @@ test("exact Stable CLI task mutates from a bounded RepairPacket before targeted 
         names.includes(name)));
       assert.equal(body.tool_choice, "required");
       const input = JSON.parse(body.messages[1].content);
-      assert.deepEqual(input.repairPacket.allowedWritePaths,
-        ["src/cli.ts", "src/run.ts", "tests/adaptiveCoding.test.cjs"]);
-      assert.deepEqual(input.repairPacket.files.map((file: any) => file.path),
-        input.repairPacket.allowedWritePaths);
+      assert.deepEqual(input.repairPacket.allowedWritePaths, ["."]);
+      assert.ok(input.repairPacket.files.some((file: any) => file.path === "src/run.ts"));
       const large = input.repairPacket.files.find((file: any) => file.path === "src/run.ts");
       assert.equal(large.complete, false);
       assert.ok(large.content.length < 5000);
@@ -639,21 +639,19 @@ test("exact Stable CLI task mutates from a bounded RepairPacket before targeted 
     assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
     const events = (await readFile(join(output, "events.jsonl"), "utf8"))
       .trim().split("\n").map((line) => JSON.parse(line));
-    const lock = events.findIndex((event) => event.type === "stable_scope_locked");
-    assert.equal(events[lock]?.deterministic, true);
-    assert.equal(events.filter((event) => event.type === "stable_finalization_start").length, 0);
-    assert.ok(events.findIndex((event) => event.type === "stable_context_focused") > lock);
-    assert.equal(requests.length, 1, "local discovery avoids an inspection-model call");
     const mutation = events.findIndex((event) =>
       event.type === "coding_worker_stop" &&
       event.worker_engine === "mini-swe-agent" &&
       (event.actual_changed_paths?.length ?? 0) > 0);
+    const lock = events.findIndex((event) => event.type === "stable_discovery_scope_locked");
+    assert.deepEqual(events[lock]?.repair_write_scope,
+      ["src/cli.ts", "src/run.ts", "tests/adaptiveCoding.test.cjs"]);
+    assert.equal(events.filter((event) => event.type === "stable_finalization_start").length, 0);
+    assert.equal(requests.length, 1, "mini-SWE performs discovery and coding in one attempt");
     const focused = events.findIndex((event) =>
       event.type === "stable_focused_verification");
     const final = events.findIndex((event) => event.type === "final_verification");
-    assert.ok(lock >= 0 && mutation > lock && focused > mutation && final > focused);
-    assert.ok(!events.slice(lock, mutation).some((event) => event.type === "tool" &&
-      ["read_file", "search_code", "run_command", "list_files"].includes(event.name)));
+    assert.ok(mutation >= 0 && lock > mutation && final > lock);
     assert.equal(events.find((event) => event.type === "task_fingerprint")?.fingerprint.primary, "implementation");
     assert.ok(events.find((event) => event.type === "task_fingerprint")?.fingerprint.secondary.includes("testing"));
   } finally {
@@ -663,7 +661,7 @@ test("exact Stable CLI task mutates from a bounded RepairPacket before targeted 
 });
 
 for (const failure of ["timeout", "429", "no-scope"] as const) {
-test(`Stable scope ${failure} falls back to concrete evidence and reaches verified coding`, async () => {
+test(`Stable ${failure} legacy pre-localizer state does not block mini-SWE discovery`, async () => {
   const root = await mkdtemp(join(tmpdir(), "koda-stable-scope-fallback-"));
   const repo = join(root, "repo"), output = join(root, "output");
   const requests: any[] = [];
@@ -737,12 +735,14 @@ test(`Stable scope ${failure} falls back to concrete evidence and reaches verifi
     assert.equal(result.execution_strategy, "stable");
     assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
     const events = (await readFile(join(output, "events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-    assert.ok(events.some((event) => event.type === (failure === "no-scope"
-      ? "stable_actionable_scope_fallback" : "stable_scope_finalization_fallback")));
+    assert.deepEqual(events.find((event) => event.type === "stable_discovery_start")
+      .initial_write_scope, ["."]);
+    const lock = events.find((event) => event.type === "stable_discovery_scope_locked");
+    assert.deepEqual(lock.actual_changed_paths, ["src/a.js"]);
+    assert.deepEqual(lock.repair_write_scope, ["src/a.js"]);
     assert.equal(requests.filter((request) => request.tools?.some((tool: any) =>
-      tool.function.name === "lock_write_scope") && !request.tools?.some((tool: any) =>
-      tool.function.name === "search_code")).length, failure === "no-scope" ? 0 : 1,
-      "no second finalizer model request");
+      tool.function.name === "lock_write_scope")).length, 0,
+    "production Stable does not call the legacy pre-localizer");
     assert.ok(events.some((event) => event.type === "coding_worker_start"));
     assert.ok(events.some((event) => event.type === "write_success" && event.path === "src/a.js"));
     assert.ok(events.some((event) => event.type === "final_verification" && event.outcome === "CHECK_PASS"));

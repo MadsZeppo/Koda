@@ -78,8 +78,8 @@ export async function implement(
   profile: RepoProfile,
   options: MiniSweImplementationOptions = {},
 ) {
-  const writeScope = new WriteScope(subtask.likelyWritePaths, gateway.logger, subtask.id);
-  const context = options.compiledContext ?? await compileContext(path, subtask.objective,
+  let writeScope = new WriteScope(subtask.likelyWritePaths, gateway.logger, subtask.id);
+  let context = options.compiledContext ?? await compileContext(path, subtask.objective,
     [...writeScope.paths, ...workerReadPaths(subtask, plan.subtasks)], profile,
     gateway.config.context, true);
   const evidence: EvidencePacket = options.evidence ?? {
@@ -483,7 +483,17 @@ export async function implement(
       else pool.record(selected?.model ?? ({ id: model } as any), features,
         subtask.id, eventStart, "FAILED", true, "focused_verification_failed", fingerprint);
     }
+    const discoveredRepairPaths = subtask.id === "stable" && writeScope.paths.includes(".")
+      ? [...new Set(result.changedPaths)] : [];
     await checkpoint.restore(path, writeScope);
+    if (discoveredRepairPaths.length) {
+      writeScope = new WriteScope(discoveredRepairPaths, gateway.logger, subtask.id);
+      context = await compileContext(path, task, discoveredRepairPaths, profile,
+        gateway.config.context, true);
+      gateway.logger.log("stable_discovery_scope_locked", { subtaskId: subtask.id,
+        initial_write_scope: ["."], actual_changed_paths: discoveredRepairPaths,
+        repair_write_scope: discoveredRepairPaths, rejected_candidate: true });
+    }
     gateway.logger.log("attempt_rollback", { subtaskId: subtask.id, model,
       changedPaths: result.changedPaths, reason: attributable
         ? "candidate verification regression" : "candidate not verified" });

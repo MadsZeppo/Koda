@@ -53,6 +53,7 @@ import {
 import { changeCode } from "./workspace/files.js";
 import { nextCodingTier, type CodingTier } from "./router/codingDemand.js";
 import { taskRelevantMutationPaths } from "./agent/mutationInvariant.js";
+import { stableNoChangePreflight } from "./agent/stableNoChangePreflight.js";
 import type { CodingWorker } from "./agent/codingWorker.js";
 export interface RunOptions {
   repo: string;
@@ -239,19 +240,35 @@ export async function run(options: RunOptions) {
         context_files: context.files.map((file) => file.path),
       });
 
-      const result = await implement(
-        gateway,
+      const preflight = await stableNoChangePreflight(
         integration.path,
         options.task,
-        subtask,
-        { acceptanceCriteria: [options.task] },
         profile,
-        {
-          codingWorker,
-          compiledContext: context,
-          finalVerificationOnly: true,
-        },
+        () => Math.min(options.config.commandTimeoutMs, budget.remainingMs()),
+        (check) => logger.log("verification", { subtaskId: subtask.id, ...check }),
       );
+      if (preflight.satisfied)
+        logger.log("no_changes_required", { subtaskId: subtask.id,
+          status: "VERIFIED_SUCCESS", reason: "acceptance_checks_already_pass",
+          diffBytes: 0, verificationCommands: preflight.verification.checks.map((check) => check.command),
+          evidence_paths: preflight.evidencePaths });
+
+      const result = preflight.satisfied
+        ? { verification: preflight.verification, evidence: {
+            relevantFiles: preflight.evidencePaths, symbols: [], reproduction: "Passing repository test",
+            failingTests: [], likelyRootCause: "Already satisfied", dependencies: [],
+            uncertainty: "low" as const, suggestedApproach: "No mutation required",
+            evidence: preflight.evidencePaths.map((path) => `assertion_code:${path}`),
+          }, noChangesRequired: true, role: "CHEAP_CODER_A" as const }
+        : await implement(
+            gateway,
+            integration.path,
+            options.task,
+            subtask,
+            { acceptanceCriteria: [options.task] },
+            profile,
+            { codingWorker, compiledContext: context, finalVerificationOnly: true },
+          );
 
       const operationalFailure = result.verification.checks.find(
         (check) =>

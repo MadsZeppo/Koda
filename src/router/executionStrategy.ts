@@ -300,7 +300,7 @@ export function chooseExecutionStrategy(
 }
 
 export function requestsTestMutation(task: string): boolean {
-  return /\b(?:add|write|create|update|change|modify|fix|repair|remove|delete)\s+(?:(?:a|an|one|the|existing|focused|regression|unit|integration|failing|broken)\s+){0,5}tests?\b/i.test(task) ||
+  return /\b(?:add|write|create|update|change|modify|fix|repair|remove|delete)\s+(?:(?:a|an|one|the|new|existing|focused|regression|deterministic|missing|unit|integration|failing|broken)\s+){0,8}tests?\b/i.test(task) ||
     /\b(?:add|implement|create)\b[^\n]{0,160}\bwith\s+(?:focused|regression)\s+tests?\b/i.test(task) ||
     /\btests?\b[^.;\n]{0,80}\b(?:is|are)\s+(?:wrong|broken|incorrect)\b/i.test(task);
 }

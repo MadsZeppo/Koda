@@ -1164,11 +1164,14 @@ test("stable mode locks scope, preserves work across transient fallback, and ver
       .split("\n")
       .map((line) => JSON.parse(line));
     emitFixtureMetrics("stable-recovery-and-missing-test", result, events);
-    assert.deepEqual(
-      events.find((event) => event.type === "stable_scope_locked")
-        .allowed_write_paths,
-      ["src/calculator.cjs", "tests/calculator.test.cjs"],
-    );
+    const discoveryStart = events.find((event) => event.type === "stable_discovery_start");
+    assert.deepEqual(discoveryStart.initial_write_scope, ["."]);
+    const discoveryLock = events.find((event) =>
+      event.type === "stable_discovery_scope_locked");
+    assert.deepEqual(discoveryLock.actual_changed_paths,
+      ["src/calculator.cjs", "tests/calculator.test.cjs"]);
+    assert.deepEqual(discoveryLock.repair_write_scope,
+      discoveryLock.actual_changed_paths);
     const codingStarts = events.filter(
       (event) =>
         event.type === "coding_worker_start" &&
@@ -1188,10 +1191,8 @@ test("stable mode locks scope, preserves work across transient fallback, and ver
     );
 
     for (const event of codingStarts) {
-      assert.deepEqual(event.assigned_write_scope, [
-        "src/calculator.cjs",
-        "tests/calculator.test.cjs",
-      ]);
+      assert.deepEqual(event.assigned_write_scope, ["."],
+        "initial and fallback mini-SWE attempts own the isolated Stable workspace");
     }
 
     assert.ok(
@@ -1214,14 +1215,9 @@ test("stable mode locks scope, preserves work across transient fallback, and ver
       "strong mini-SWE attempt should pass Koda verification",
     );
 
-    assert.ok(
-      events.some(
-        (event) =>
-          event.type === "stable_focused_verification" &&
-          event.status === "VERIFIED_SUCCESS",
-      ),
-      "Stable handoff should still receive focused Koda verification",
-    );
+    assert.ok(events.some((event) =>
+      event.type === "final_verification" && event.outcome === "CHECK_PASS"),
+    "Koda final verification remains authoritative after mini-SWE discovery");
 
     assert.match(
       await readFile(

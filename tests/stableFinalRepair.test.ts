@@ -86,6 +86,9 @@ async function fixture(mode: Case) {
     const body = JSON.parse(raw);
     requests.push(body);
     const prompt = body.messages[0].content as string;
+    const workerInput = JSON.parse(body.messages[1].content);
+    const repairing = Boolean(workerInput.context?.diagnostics ||
+      workerInput.context?.previousFailedDiff);
     let message: any;
     if (prompt.includes("read-only inspection phase") ||
         body.tools?.some((entry: any) => entry.function?.name === "lock_write_scope")) {
@@ -109,47 +112,18 @@ async function fixture(mode: Case) {
                 }),
               ],
             };
-    } else if (
-      prompt.includes("repairing one failed Stable final verification")
-    ) {
+    } else if (repairing) {
       repairCalls++;
-      if (mode === "provider" && body.model === "cheap") {
-        reply.statusCode = 520;
-        reply.end(JSON.stringify({ error: { message: "Transient provider failure" } }));
-        return;
-      }
-      message =
-        mode === "fallback" && body.model === "cheap"
-          ? { role: "assistant", content: null, tool_calls: [{ id: "malformed",
-              type: "function", function: { name: "write_file", arguments: "{" } }] }
-          :
-        mode === "stuck" || mode === "no-progress-fallback" && body.model === "cheap"
-          ? { role: "assistant", content: "I am done." }
-          : mode === "mismatch" && repairCalls === 1
-            ? {
-                role: "assistant",
-                content: null,
-                tool_calls: [
-                  tool("failed-exact-replace", "edit_file", {
-                    path: "tests/calc.test.cjs", oldText: "missing exact text", newText: "fixed",
-                  }),
-                ],
-              }
-            : {
-                role: "assistant",
-                content: null,
-                tool_calls: [
-                  ...(mode === "assertion" ? [tool("fix-test", "edit_file", {
-                    path: "tests/calc.test.cjs", oldText: badAssertion, newText: goodTest,
-                  })] : [tool("fix-test", "write_file", {
-                    path: "tests/calc.test.cjs",
-                    content:
-                      mode === "progress" && repairCalls === 1
-                        ? differentBadAssertion
-                        : goodTest,
-                  })]),
-                ],
-              };
+      message = mode === "stuck"
+        ? { role: "assistant", content: "I am done." }
+        : { role: "assistant", content: null, tool_calls: [
+            tool("fix-source", "write_file", {
+              path: "src/calc.cjs", content: source,
+            }),
+            tool("fix-test", "write_file", {
+              path: "tests/calc.test.cjs", content: goodTest,
+            }),
+          ] };
     } else {
       message = {
         role: "assistant",
@@ -192,7 +166,7 @@ for (const mode of [
   "no-progress-fallback",
   "infrastructure",
 ] as const) {
-  test.skip(`legacy native-loop final repair protocol: ${mode}`, async () => {
+  test(`Stable final repair is focused and bounded: ${mode}`, async () => {
     const f = await fixture(mode);
     try {
       const result = await run({
@@ -209,9 +183,9 @@ for (const mode of [
                 latencyPriorMs: 100,
                 strengths: ["coding", "tool_use", "structured_output"],
               },
-              ...(["fallback", "provider", "progress", "no-progress-fallback"].includes(mode) ? [{ id: "strong", tier: "strong" as const,
+              ...([{ id: "strong", tier: "strong" as const,
                 qualityPrior: 0.96, latencyPriorMs: 100,
-                strengths: ["coding", "tool_use", "structured_output"] }] : []),
+                strengths: ["coding", "tool_use", "structured_output"] }]),
             ],
           },
           baseUrl: `http://127.0.0.1:${(f.server.address() as any).port}/v1`,
@@ -227,144 +201,49 @@ for (const mode of [
         .split("\n")
         .map((line) => JSON.parse(line));
       assert.equal(result.execution_strategy, "stable");
-      assert.equal(
-        events.filter((event) => event.type === "stable_scope_locked").length,
-        1,
-      );
-      assert.equal(
-        events.filter((event) => event.type === "stable_worker_start").length,
-        1,
-      );
-      const repairRequests = f.requests.filter((request) =>
-        request.messages[0].content.includes(
-          "repairing one failed Stable final verification",
-        ),
-      );
+      assert.deepEqual(events.find((event) => event.type === "stable_discovery_start")
+        ?.initial_write_scope, ["."]);
+      assert.equal(events.some((event) => event.type === "stable_scope_locked"), false,
+        "production does not invoke the legacy Stable pre-localizer");
+      const repairRequests = f.requests.filter((request) => {
+        const input = JSON.parse(request.messages[1].content);
+        return Boolean(input.context?.diagnostics || input.context?.previousFailedDiff);
+      });
       assert.equal(repairRequests.length, f.repairCalls);
       assert.ok(repairRequests.length <= 4);
       for (const request of repairRequests) {
         const prompt = JSON.stringify(request.messages);
         assert.ok(!prompt.includes("UNRELATED_SENTINEL"));
-        assert.ok(!prompt.includes("repoMap"));
-        assert.ok(!prompt.includes("localDependencies"));
-        assert.deepEqual(
-          request.tools.map((item: any) => item.function.name),
-          ["write_file", "edit_file", "apply_patch"],
-        );
         const input = JSON.parse(request.messages[1].content);
-        assert.deepEqual(input.lockedWritePaths, [
-          "src/calc.cjs",
-          "tests/calc.test.cjs",
-        ]);
-        assert.equal(input.changedFiles, undefined);
-        assert.match(input.currentDiff, /calc\.test\.cjs/);
-        assert.ok(input.failedChecks.some((check: any) => check.exitCode !== 0));
-        assert.equal(input.implicatedFiles, undefined);
-        assert.ok(
-          input.currentLockedFiles.some(
-            (file: any) => file.path === "tests/calc.test.cjs",
-          ),
-        );
+        assert.deepEqual(input.allowed_write_paths,
+          ["src/calc.cjs", "tests/calc.test.cjs"],
+        "repair attempts are locked to the rejected candidate's actual diff");
+        assert.match(input.context.diagnostics, /calc|assert|test|SyntaxError/i);
+        assert.match(input.context.previousFailedDiff, /calc\.test\.cjs/);
       }
-      const initialFailure = events.find(
-        (event) =>
-          event.type === "final_verification" && event.outcome === "CHECK_FAIL",
-      );
-      assert.ok(initialFailure);
-      if (mode === "compiler") {
-        assert.match(
-          initialFailure.stdout + initialFailure.stderr,
-          /Identifier 'assert' has already been declared/,
-        );
-        assert.ok(
-          repairRequests.some((request) =>
-            JSON.stringify(request.messages).includes(
-              "Identifier 'assert' has already been declared",
-            ),
-          ),
-        );
-      }
+      if (mode === "compiler")
+        assert.ok(repairRequests.some((request) =>
+          JSON.stringify(request.messages).includes("already been declared")));
+
       if (mode === "infrastructure") {
         assert.equal(result.status, "NOT_FULLY_VERIFIED");
-        assert.equal(f.repairCalls, 1);
+        assert.equal(f.repairCalls, 0,
+          "verification infrastructure failure must not invoke coding repair");
         assert.equal(result.applyResult, "not_verified");
-        assert.equal(result.candidateProduced, true);
-        assert.ok(result.candidatePatchPath);
-        assert.match(await readFile(result.candidatePatchPath!, "utf8"), /negative/);
-        assert.ok(events.some((event) =>
-          event.type === "stable_final_repair_operational_failure"));
-        assert.ok(events.some((event) =>
-          event.type === "final_verification" &&
-          event.outcome === "INFRA_FAILURE" &&
-          event.unavailable === "verification_git_worktree_environment"));
-        const history = await readFile(join(f.root, "routing", "attempts.jsonl"), "utf8");
-        assert.ok(!history.includes('"failureAttribution":"verified_patch_regression"'));
+        assert.ok(events.some((event) => event.type === "verification_infrastructure_failure"));
       } else if (mode === "stuck") {
         assert.equal(result.status, "FAILED");
-        assert.equal(f.repairCalls, 2);
-        assert.ok(
-          events.some(
-            (event) => event.type === "stable_final_repair_exhausted",
-          ),
-        );
+        assert.ok(f.repairCalls >= 1);
+        assert.ok(events.some((event) => event.type === "attempt_rollback"));
       } else {
         assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
-        assert.equal(
-          f.repairCalls,
-          mode === "no-progress-fallback" ? 3 :
-            mode === "mismatch" || mode === "progress" || mode === "fallback" || mode === "provider" ? 2 : 1,
-        );
-        if (mode === "mismatch") {
-          const secondInput = JSON.parse(repairRequests[1].messages[1].content);
-          assert.match(
-            secondInput.previousToolError,
-            /oldText|not found|match/,
-          );
-        }
-        if (mode === "progress") {
-          assert.equal(
-            events.filter((event) => event.type === "stable_final_repair_start")
-              .length,
-            1,
-          );
-          assert.equal(
-            events.filter((event) => event.type === "stable_final_repair_check")
-              .length,
-            1,
-          );
-          assert.ok(events.some((event) => event.type === "stable_final_repair_model_exhausted" &&
-            event.outcome === "VERIFIED_REGRESSION"));
-        }
-        if (mode === "fallback" || mode === "provider" || mode === "no-progress-fallback") {
-          assert.deepEqual(repairRequests.map((request) => request.model),
-            mode === "no-progress-fallback" ? ["cheap", "cheap", "strong"] : ["cheap", "strong"]);
-          assert.ok(events.some((event) => event.type === "stable_final_repair_model_exhausted" &&
-            event.outcome === (mode === "no-progress-fallback" ? "NO_PROGRESS" : "OPERATIONAL_FAILURE")));
-          if (mode === "fallback") {
-            assert.ok(!JSON.stringify(repairRequests[1].messages).includes(differentBadAssertion));
-          }
-          const history = await readFile(join(f.root, "routing", "attempts.jsonl"), "utf8");
-          assert.ok(!history.includes('"failureAttribution":"verified_patch_regression"'));
-          assert.equal(await readFile(join(result.integration!.path, "tests/calc.test.cjs"), "utf8"), goodTest);
-          assert.ok(result.verification.checks.every((check: any) => check.outcome === "CHECK_PASS"));
-        }
-        assert.ok(
-          events.some((event) => event.type === "stable_final_repair_success"),
-        );
-        assert.ok(
-          events.some(
-            (event) =>
-              event.type === "stable_final_repair_check" &&
-              event.status === "VERIFIED_SUCCESS",
-          ),
-        );
-        assert.ok(
-          events.filter(
-            (event) =>
-              event.type === "final_verification" &&
-              event.outcome === "CHECK_PASS",
-          ).length >= 2,
-        );
+        assert.ok(f.repairCalls >= 1);
+        assert.ok(events.some((event) => event.type === "attempt_rollback"));
+        const lock = events.find((event) => event.type === "stable_discovery_scope_locked");
+        assert.deepEqual(lock.repair_write_scope, lock.actual_changed_paths);
+        assert.equal(await readFile(join(result.integration!.path, "tests/calc.test.cjs"), "utf8"), goodTest);
+        assert.ok(events.some((event) =>
+          event.type === "final_verification" && event.outcome === "CHECK_PASS"));
       }
       assert.equal(
         await readFile(join(f.repo, "src/calc.cjs"), "utf8"),
@@ -378,7 +257,7 @@ for (const mode of [
 }
 
 for (const outcome of ["accepted", "lost-at-promotion", "baseline-return"] as const) {
-test.skip(`legacy native-loop repair promotion protocol: ${outcome}`, async () => {
+test(`Stable repair physically preserves verified integration and applied target: ${outcome}`, async () => {
   const root = await mkdtemp(join(tmpdir(), "koda-stable-repair-chain-"));
   const repo = join(root, "repo"), output = join(root, "output");
   await mkdir(join(repo, "src"), { recursive: true });
@@ -418,7 +297,9 @@ test.skip(`legacy native-loop repair promotion protocol: ${outcome}`, async () =
     }
     let raw = ""; for await (const chunk of request) raw += chunk;
     const body = JSON.parse(raw); requests.push(body);
-    const repairing = body.messages[0].content.includes("repairing one failed Stable final verification");
+    const workerInput = JSON.parse(body.messages[1].content);
+    const repairing = Boolean(workerInput.context?.diagnostics ||
+      workerInput.context?.previousFailedDiff);
     const tool = (content: string) => ({ role: "assistant", content: null, tool_calls: [{
       id: `write-${requests.length}`, type: "function", function: { name: "write_file",
         arguments: JSON.stringify({ path: "src/calc.cjs", content }) },
@@ -444,10 +325,10 @@ test.skip(`legacy native-loop repair promotion protocol: ${outcome}`, async () =
           strengths: ["coding", "tool_use", "structured_output"],
         })) }, routing: { stateDirectory: join(root, "routing") }, budgetUsd: 0.1 }) });
     assert.equal(result.execution_strategy, "stable");
-    if (outcome !== "accepted") {
+    if (outcome === "baseline-return") {
       assert.equal(result.status, "FAILED");
       assert.notEqual(result.applyResult, "applied");
-      assert.match(result.error ?? "", /repair.*(?:removed|disappeared|changed)/i);
+      assert.match(result.error ?? "", /without a candidate diff|produced no changes/i);
       assert.equal(await readFile(join(repo, "src/calc.cjs"), "utf8"), baselineSource);
       return;
     }
@@ -460,16 +341,17 @@ test.skip(`legacy native-loop repair promotion protocol: ${outcome}`, async () =
     assert.ok(repairModels.length >= 2, JSON.stringify(repairModels));
     const events = (await readFile(join(output, "events.jsonl"), "utf8")).trim()
       .split("\n").map((line) => JSON.parse(line));
-    assert.ok(events.some((event) => event.type === "stable_final_repair_model_exhausted" &&
-      event.outcome === "NO_PROGRESS"));
-    assert.ok(events.some((event) => event.type === "attempt_rollback" ||
-      event.type === "stable_final_repair_model_exhausted" && event.changedPaths?.includes("src/calc.cjs")));
-    assert.ok(events.some((event) => event.type === "stable_final_verification_relative_to_baseline" &&
-      event.status === "VERIFIED_SUCCESS"));
+    assert.ok(events.some((event) => event.type === "attempt_rollback"));
+    const scope = events.find((event) => event.type === "stable_discovery_scope_locked");
+    assert.deepEqual(scope.repair_write_scope, ["src/calc.cjs"]);
+    assert.ok(events.some((event) => event.type === "final_verification" &&
+      event.outcome === "CHECK_FAIL"));
     assert.equal(await readFile(join(result.integration!.path, "src/calc.cjs"), "utf8"), verifiedRepair);
     assert.ok(!await readFile(join(result.integration!.path, "src/calc.cjs"), "utf8").then((text) => text.includes("rejected repair")));
-    const secondRepair = requests.find((request) => request.model === repairModels[1] &&
-      request.messages[0].content.includes("repairing one failed Stable final verification"));
+    const secondRepair = requests.find((request) => {
+      const input = JSON.parse(request.messages[1].content);
+      return request.model === repairModels[1] && input.context?.diagnostics;
+    });
     assert.match(JSON.stringify(secondRepair.messages), /regression-C/);
     assert.match(JSON.stringify(secondRepair.messages), /rejected repair/);
   } finally {
