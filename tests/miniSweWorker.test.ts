@@ -73,7 +73,12 @@ test("DIRECT narrow scope keeps mini-SWE IPC outside the candidate repository", 
   const root = await mkdtemp(join(tmpdir(), "koda-mini-direct-ipc-"));
   const runtime = await mkdtemp(join(tmpdir(), "koda-mini-runtime-"));
   const logRoot = await mkdtemp(join(tmpdir(), "koda-mini-log-"));
-  const pythonBin = (await execa("which", ["python3"])).stdout.trim();
+  const pythonBin = (
+    await execa("python3", [
+      "-c",
+      "import sys; print(getattr(sys, '_base_executable', None) or sys.executable)",
+    ])
+  ).stdout.trim();
   const python = join(runtime, "venv", "bin", "python");
   const bridge = join(runtime, "venv", "koda_bridge.py");
   const previousKey = process.env.OPENROUTER_API_KEY;

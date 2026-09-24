@@ -84,49 +84,12 @@ def _token_limit_state(configured: int, consumed: int, next_prompt: int) -> dict
     }
 
 
-_MUTATION = re.compile(
-    r"(?:apply_patch|cat\s+[^|;&]*>|(?:sed|perl)\s+-i|(?:write|append)_file|"
-    r"tee(?:\s+-a)?\s+|printf\b[^;&|]*>|"
-    r"python\w*\s+-c.*(?:write_text|write\(|open\())",
-    re.I | re.S,
-)
-_VERIFICATION = re.compile(
-    r"(?:^|\s)(?:pytest|unittest|pnpm\s+(?:test|typecheck|build)|"
-    r"npm\s+(?:test|run\s+(?:test|typecheck|build))|"
-    r"yarn\s+(?:test|typecheck|build)|cargo\s+test|go\s+test|"
-    r"node\s+--test|tsc(?:\s|$))",
-    re.I,
-)
-_DISCOVERY_ONLY = re.compile(
-    r"^\s*(?:pwd|ls(?:\s|$)|find(?:\s|$)|rg(?:\s|$)|grep(?:\s|$)|"
-    r"cat(?:\s|$)|head(?:\s|$)|tail(?:\s|$)|sed\s+-n\b|"
-    r"git\s+(?:status|diff|log|show)\b|wc(?:\s|$)|tree(?:\s|$))",
-    re.I,
-)
-
-
-def _direct_edit_first_mode(request: dict, context: dict) -> bool:
-    """Enable strict mutation-first execution for Koda-localized single-file DIRECT tasks."""
-    scope = request.get("writeScope") or []
-    return (
-        request.get("attemptId") == "direct"
-        and bool(request.get("returnOnMutation"))
-        and len(scope) == 1
-        and scope[0] != "."
-        and bool(context.get("sourceFiles"))
-    )
-
-
-def _direct_command_is_discovery(command: str) -> bool:
-    """Identify commands that cannot advance a localized DIRECT attempt to mutation."""
-    text = command.strip()
-    if not text:
-        return True
-    if _MUTATION.search(text):
-        return False
-    if "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" in text:
-        return True
-    return bool(_DISCOVERY_ONLY.search(text) or _VERIFICATION.search(text))
+_MUTATION = re.compile(r"(?:apply_patch|cat\s+[^|;&]*>|(?:sed|perl)\s+-i|"
+                       r"(?:write|append)_file|python\w*\s+-c.*(?:write|open\())", re.I | re.S)
+_VERIFICATION = re.compile(r"(?:^|\s)(?:pytest|unittest|pnpm\s+(?:test|typecheck|build)|"
+                           r"npm\s+(?:test|run\s+(?:test|typecheck|build))|"
+                           r"yarn\s+(?:test|typecheck|build)|cargo\s+test|go\s+test|"
+                           r"node\s+--test|tsc(?:\s|$))", re.I)
 
 
 def _workspace_signature(cwd: str) -> str:
@@ -260,7 +223,6 @@ def main() -> int:
                     "id": "pareto-router",
                     "min_coding_score": scores[coding_route["tier"]],
                 }]
-
             class BoundedLitellmModel(LitellmModel):
                 """Enforce Koda's whole-attempt token and dollar bounds before every call."""
 
@@ -338,7 +300,6 @@ def main() -> int:
                 completion_price=request.get("completionPricePerMillion"),
                 context_limit=request.get("contextWindowTokens"),
             )
-
             class BoundedLocalEnvironment(LocalEnvironment):
                 def execute(self, action, cwd="", *, timeout=None):
                     output = super().execute(action, cwd, timeout=timeout)
@@ -355,7 +316,6 @@ def main() -> int:
             scope = ", ".join(request.get("writeScope") or [])
             context = request.get("context") or {}
             context_text = json.dumps(context, ensure_ascii=False)
-            direct_edit_first = _direct_edit_first_mode(request, context)
             watchdog = ProgressWatchdog(request["repoPath"])
             first_mutation_ms = None
 
@@ -363,16 +323,6 @@ def main() -> int:
                 def query(self):
                     if watchdog.stalled:
                         raise _limit("KodaProgressStalled", "other")
-                    # A fully localized DIRECT task gets at most two model turns:
-                    # one chance to comply immediately and one corrective turn if
-                    # the model attempted discovery. This prevents a read loop from
-                    # consuming the whole attempt before any edit is made.
-                    if direct_edit_first and first_mutation_ms is None and self.n_calls >= 2:
-                        raise _limit(
-                            "KodaDirectMutationNotProduced",
-                            "other",
-                            {"direct_edit_first": True, "reason": "no_mutation_after_two_turns"},
-                        )
                     if 0 < self.config.step_limit <= self.n_calls:
                         raise _limit("KodaStepLimitExceeded", "step_limit")
                     if 0 < self.config.cost_limit <= self.cost:
@@ -388,27 +338,6 @@ def main() -> int:
                     watched = request.get("writeScope") or []
                     before = _workspace_signature(watchdog.cwd)
                     before_paths = _paths_signature(watchdog.cwd, watched)
-
-                    # For a fully localized DIRECT task the source packet is the
-                    # discovery result. Do not allow another repository-reading or
-                    # verification round before mutation. Give the model one compact
-                    # corrective observation instead of executing the read command.
-                    if (
-                        direct_edit_first
-                        and first_mutation_ms is None
-                        and actions
-                        and commands
-                        and all(_direct_command_is_discovery(command) for command in commands)
-                    ):
-                        feedback = (
-                            "printf '%s\\n' 'KODA_DIRECT_MUTATION_REQUIRED: discovery and tests are "
-                            "already complete; mutate the authorized target now from the supplied "
-                            "source context. Koda will verify immediately after the first mutation.'"
-                        )
-                        for index, action in enumerate(actions):
-                            action["command"] = feedback if index == 0 else "true"
-                        commands = [str(action.get("command", "")) for action in actions]
-
                     observations = super().execute_actions(message)
                     after = _workspace_signature(watchdog.cwd)
                     after_paths = _paths_signature(watchdog.cwd, watched)
@@ -422,50 +351,25 @@ def main() -> int:
                         })
                     return observations
 
-            if direct_edit_first:
-                system_template = (
-                    "You are the mutation worker for one fully localized Koda DIRECT attempt. "
-                    "Repository discovery is already complete. Do NOT list, search, grep, cat, "
-                    "inspect, re-read files, or run tests before editing. The supplied Koda source "
-                    "context is the source truth for this attempt. Your first shell action must "
-                    "modify exactly one authorized write path and make the smallest change that "
-                    "satisfies the task. Do not route to or invoke another language model. Koda "
-                    "stops this worker immediately after the first real mutation and independently "
-                    "runs verification. Authorized write paths: " + scope + "."
-                )
-                instance_template = (
-                    "Task:\n{{task}}\n\nKoda source context (current repository content, captured "
-                    "immediately before this attempt):\n" + context_text +
-                    "\n\nDIRECT MUTATION CONTRACT:\n"
-                    "1. Do not perform repository discovery or verification.\n"
-                    "2. Use the supplied source context directly.\n"
-                    "3. First action: mutate the authorized target.\n"
-                    "4. Make only the smallest task-required edit.\n"
-                    "5. Koda will verify after the mutation."
-                )
-            else:
-                system_template = (
+            agent = KodaProgressAgent(
+                model_client,
+                environment,
+                system_template=(
                     "You are the sole coding worker for one Koda attempt. Explore the assigned "
                     "repository, implement the task, and use shell commands to inspect and edit. "
                     "Do not route to or invoke another language model. Work only in the current "
                     "repository. Authorized write paths: " + scope + ". Koda independently checks "
                     "the final diff and verification. Finish with exactly: "
                     "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
-                )
-                instance_template = (
+                ),
+                instance_template=(
                     "Task:\n{{task}}\n\nKoda source context (current repository content, "
                     "captured immediately before this attempt):\n" + context_text +
                     "\nUse this bounded context as the initial source truth. Do not re-read a file "
                     "already included here unless its excerpt omits the exact edit location or a "
                     "required definition. For a localized task, mutate the authorized target "
                     "directly from this context, then run the focused check."
-                )
-
-            agent = KodaProgressAgent(
-                model_client,
-                environment,
-                system_template=system_template,
-                instance_template=instance_template,
+                ),
                 step_limit=request["maxSteps"],
                 cost_limit=request["budgetUsd"],
                 wall_time_limit_seconds=max(1, int(request["timeoutMs"] / 1000)),

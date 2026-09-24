@@ -9,6 +9,7 @@ import { command } from "../repo/commands.js";
 import { AttemptCheckpoint } from "./attemptCheckpoint.js";
 import type { CodingWorker, CodingWorkerInput, CodingWorkerResult } from "./codingWorker.js";
 import { bridgeForRuntime, ensureMiniSweRuntime, MINI_SWE_VERSION } from "./miniSweRuntime.js";
+import { DirectEditWorker } from "./directEditWorker.js";
 
 const PLACEHOLDER_KEY = /^(?:redacted|replace[_ -]?me|your[_ -]?(?:api[_ -]?)?key|changeme|none|null)$/i;
 
@@ -72,6 +73,27 @@ export class MiniSweWorker implements CodingWorker {
   }
 
   async run(input: CodingWorkerInput): Promise<CodingWorkerResult> {
+    // DIRECT is already localized by Koda. Do not pay for a repository-browsing
+    // mini-SWE loop when one concrete target and a bounded source packet exist.
+    // The direct worker performs one structured model call; Koda still owns
+    // path validation, patch application, verification, rollback and recovery.
+    if (!this.options.runner && input.attemptId === "direct" && input.returnOnMutation &&
+        input.writeScope.length === 1 && input.writeScope[0] !== ".") {
+      this.logger.log("direct_edit_dispatch", {
+        subtaskId: input.attemptId,
+        model: input.model,
+        target: input.writeScope[0],
+      });
+      const direct = await new DirectEditWorker(this.budget, this.logger).run(input);
+      if (direct.terminationReason !== "direct_edit_unsupported") return direct;
+      this.logger.log("direct_edit_fallback", {
+        subtaskId: input.attemptId,
+        model: input.model,
+        target: input.writeScope[0],
+        reason: direct.fatalError ?? direct.terminationReason,
+      });
+    }
+
     const scope = new WriteScope(input.writeScope, this.logger, `mini-swe:${input.model}`);
     const checkpoint = await AttemptCheckpoint.capture(input.repoPath, scope);
     const trajectoryPath = join(this.logger.directory,

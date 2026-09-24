@@ -42,7 +42,7 @@ export interface CodingWorkerInput {
 export interface CodingWorkerResult {
   exitStatus: "completed" | "failed" | "infra_failure";
   model: string;
-  engine: "mini-swe-agent";
+  engine: "mini-swe-agent" | "direct-edit";
   engineVersion: string;
   trajectoryPath?: string;
   changedPaths: string[];
