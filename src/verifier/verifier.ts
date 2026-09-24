@@ -50,6 +50,26 @@ const normalizedFailureOutput = (check: CommandResult) =>
     .filter((line) => !/^=+\s*(?:short test summary|\d+ (?:passed|failed)|warnings?).*=*$/i.test(line.trim()))
     .join("\n").trim();
 
+const tapFailureUnits = (check: CommandResult) => {
+  const lines = normalizedFailureOutput(check).split("\n");
+  const units: string[] = [];
+  for (let index = 0; index < lines.length; index++) {
+    const match = lines[index]!.match(/^\s*not ok\s+\d+\s+-\s+(.+?)\s*$/);
+    if (!match) continue;
+    const details: string[] = [];
+    for (let cursor = index + 1; cursor < lines.length; cursor++) {
+      if (/^\s*(?:not )?ok\s+\d+\s+-\s+/.test(lines[cursor]!) || /^\s*1\.\.\d+/.test(lines[cursor]!))
+        break;
+      const detail = lines[cursor]!.trim().match(
+        /^(error|code|name|expected|actual|operator):\s*(.*)$/,
+      );
+      if (detail) details.push(`${detail[1]}:${detail[2]}`);
+    }
+    units.push(`tap:${match[1]!.trim()}:${details.join("|")}`);
+  }
+  return units;
+};
+
 export const verificationFailureIdentities = (check: CommandResult) => {
   const normalized = normalizedFailureOutput(check);
   // Pytest's detailed trace contains volatile object addresses, temporary
@@ -60,6 +80,9 @@ export const verificationFailureIdentities = (check: CommandResult) => {
     /^(?:FAILED|ERROR)\s+(.+?)(?:\s+-\s+.*|\s*)$/gm,
   )].map((match) => match[1]!).sort();
   if (pytestTests.length) return [...new Set(pytestTests)];
+  const tapTests = tapFailureUnits(check).map((unit) =>
+    unit.split(":").slice(0, 2).join(":"));
+  if (tapTests.length) return [...new Set(tapTests)];
   return [];
 };
 const failureSignature = (check: CommandResult) => {
@@ -99,6 +122,12 @@ const introducedFailure = (previous: CommandResult, check: CommandResult) => {
   if (before.length && after.length) {
     const known = new Set(before);
     return after.some((identity) => !known.has(identity));
+  }
+  const beforeTap = tapFailureUnits(previous);
+  const afterTap = tapFailureUnits(check);
+  if (beforeTap.length && afterTap.length) {
+    const known = new Set(beforeTap);
+    return afterTap.some((identity) => !known.has(identity));
   }
   const previousSignature = failureSignature(previous);
   const candidateSignature = failureSignature(check);

@@ -39,40 +39,76 @@ async function sandbox(prefix = "koda-workspace-") {
   return { parent, root, output };
 }
 
-test("DIRECT exits before coding when a passing focused test already proves the attempt boundary", async () => {
-  const f = await sandbox("koda-direct-covered-boundary-");
-  const testPath = "tests/controlPolicy.test.cjs";
-  const source = `const {test}=require("node:test");\nconst assert=require("node:assert/strict");\nconst maxCodingAttempts=1;\nfunction chooseAdaptiveRecovery(attempted){return attempted.size>=maxCodingAttempts?undefined:"next";}\ntest("recovery stops at the configured attempt bound",()=>{assert.equal(chooseAdaptiveRecovery(new Set(["first"])),undefined);});\n`;
+test("DIRECT explicit test mutation codes despite related words and keeps final checks scoped", async () => {
+  const f = await sandbox("koda-direct-test-mutation-");
+  const testPath = "tests/controlPolicy.test.ts";
+  const source = `import {test} from "node:test";\nimport assert from "node:assert/strict";\nconst maxCodingAttempts=1;\nfunction chooseAdaptiveRecovery(attempted:Set<string>){return attempted.size>=maxCodingAttempts?undefined:"next";}\ntest("configured attempts are exposed",()=>assert.equal(maxCodingAttempts,1));\ntest("recovery starts with a candidate",()=>assert.equal(chooseAdaptiveRecovery(new Set()),"next"));\n`;
+  const changed = `${source}test("recovery stops at the configured attempt bound",()=>assert.equal(chooseAdaptiveRecovery(new Set(["first"])),undefined));\n`;
   const task = `In ${testPath}, add a deterministic regression test proving recovery stops when maxCodingAttempts is reached.`;
+  const requests: any[] = [];
+  const server = createServer(async (req, res) => {
+    let raw = "";
+    for await (const chunk of req) raw += chunk;
+    const body = JSON.parse(raw);
+    requests.push(body);
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ id: "mock", model: body.model, choices: [{ index: 0,
+      finish_reason: "tool_calls", message: { role: "assistant", content: null, tool_calls: [{
+        id: "write-test", type: "function", function: { name: "write_file",
+          arguments: JSON.stringify({ path: testPath, content: changed }) },
+      }] } }], usage: { prompt_tokens: 100, completion_tokens: 20, cost: 0 } }));
+  });
   try {
     await mkdir(join(f.root, "tests"), { recursive: true });
+    await mkdir(join(f.root, "tests/fixtures/math"), { recursive: true });
     await writeFile(join(f.root, testPath), source);
     await writeFile(join(f.root, "package.json"), JSON.stringify({ scripts: {
-      test: `node --test ${testPath}`,
+      test: "node --test tests/*.test.ts", build: "node -e \"process.exit(0)\"",
+      typecheck: "node -e \"process.exit(0)\"",
+    }, type: "module" }));
+    await writeFile(join(f.root, "tests/fixtures/math/package.json"), JSON.stringify({ scripts: {
+      test: "node --test failing.test.cjs",
     } }));
+    await writeFile(join(f.root, "tests/fixtures/math/failing.test.cjs"),
+      `const {test}=require("node:test");test("unrelated fixture",()=>{throw Error("must not run")});\n`);
     await git(f.root, "init", "-q");
     await git(f.root, "config", "user.email", "test@koda.local");
     await git(f.root, "config", "user.name", "Koda Test");
     await git(f.root, "add", ".");
     await git(f.root, "commit", "-qm", "covered regression");
-    assert.equal(testRequirementAlreadyCovered(task, [{ path: testPath, content: source }],
-      { allowSetupEvidence: true }), true);
+    assert.equal(testRequirementAlreadyCovered(task, [{ path: testPath, content: source }]), false);
     assert.equal(testRequirementAlreadyCovered(task, [{ path: testPath,
       content: `// recovery maxCodingAttempts\ntest("name only",()=>assert.equal(1,1));\n` }]), false);
 
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const result = await run({ repo: f.root, task, output: f.output, quiet: true,
       config: await config(undefined, { adaptiveCoding: false, specialistRouting: false,
-        baseUrl: "http://127.0.0.1:1/v1", budgetUsd: .1 }) });
+        models: {}, baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`,
+        budgetUsd: 10 }) });
     const events = (await readFile(join(f.output, "events.jsonl"), "utf8")).trim()
       .split("\n").map((line) => JSON.parse(line));
-    assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
-    assert.ok(events.some((event) => event.type === "no_changes_required"));
-    assert.equal(events.some((event) => event.type === "coding_worker_start"), false);
-    assert.equal(events.some((event) => event.type === "model_call"), false);
-    assert.deepEqual(result.changedFiles, []);
+    assert.equal(result.status, "VERIFIED_SUCCESS",
+      `${result.error ?? ""}\n${JSON.stringify(events.slice(-20), null, 2)}`);
+    assert.equal(result.execution_strategy, "direct");
+    assert.equal(result.execution_effort, "normal");
+    assert.equal(events.some((event) => event.type === "no_changes_required"), false);
+    assert.equal(events.some((event) => event.type === "coding_worker_start"), true);
+    assert.equal(requests.length, 1);
+    assert.deepEqual(result.workerScopes[0]?.allowed_write_paths, [testPath]);
+    assert.deepEqual(result.changedFiles, [testPath]);
+    const finalCommands = events.filter((event) => event.type === "final_verification")
+      .map((event) => event.command);
+    assert.ok(finalCommands.some((command) => command.includes(testPath)), finalCommands.join("\n"));
+    assert.ok(finalCommands.some((command) => /build/.test(command)), finalCommands.join("\n"));
+    assert.ok(finalCommands.some((command) => /typecheck/.test(command)), finalCommands.join("\n"));
+    assert.equal(finalCommands.some((command) => command.includes("tests/fixtures/math")), false);
     assert.equal(await readFile(join(f.root, testPath), "utf8"), source);
     assert.equal((await git(f.root, "status", "--porcelain")).trim(), "");
-  } finally { await rm(f.parent, { recursive: true, force: true }); }
+  } finally {
+    if (server.listening)
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(f.parent, { recursive: true, force: true });
+  }
 });
 
 test("Linux /tmp workspaces have mountpoints before /tmp becomes read-only", async () => {

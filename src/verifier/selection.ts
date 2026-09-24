@@ -190,6 +190,11 @@ function targetedNativeCheck(
     return undefined;
   }
 
+  const directTests = subtask.likelyWritePaths.filter((path) =>
+    isTestPath(path) && /\.[cm]?[jt]s$/.test(path));
+  if (directTests.length && directTests.length === subtask.likelyWritePaths.length)
+    return "node --test " + directTests.map(quote).join(" ");
+
   const targets = subtask.likelyWritePaths.filter(isSourcePath);
 
   const tests = context.files.filter(

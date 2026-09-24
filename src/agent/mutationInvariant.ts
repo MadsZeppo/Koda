@@ -20,7 +20,6 @@ const taskConceptWords = (task: string) => (task
 export function testRequirementAlreadyCovered(
   task: string,
   files: readonly { path: string; content: string }[],
-  options: { allowSetupEvidence?: boolean } = {},
 ) {
   if (!isExplicitTestOnlyTask(task) || !files.length || files.some((file) => !isTestPath(file.path)))
     return false;
@@ -39,25 +38,7 @@ export function testRequirementAlreadyCovered(
     words.filter((word) => identifier.split("_").includes(word)).length >= 2);
   if (new Set(compositeAssertions).size >= 2 && covered.size >= Math.min(4, words.length))
     return true;
-
-  if (!options.allowSetupEvidence) return false;
-
-  // Some focused regression tests express their boundary in setup and the
-  // outcome in one assertion (for example a named attempt limit plus an
-  // undefined recovery result). Accept that existing proof only when the
-  // task concepts occur in executable identifiers, at least one concept is
-  // exercised by an assertion, and the focused test itself passes.
-  const executable = files.map((file) => file.content)
-    .join("\n")
-    .replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*|#[^\n]*/g, "")
-    .replace(/(['"`])(?:\\.|(?!\1)[^\\])*\1/g, "");
-  const executableIdentifiers = (executable.match(/[A-Za-z_$][\w$]*/g) ?? [])
-    .map((identifier) => identifier.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase())
-    .flatMap((identifier) => identifier.split("_"));
-  const executableConcepts = new Set(words.filter((word) =>
-    executableIdentifiers.includes(word)));
-  return words.length >= 2 && executableConcepts.size >= Math.min(3, words.length) &&
-    covered.size >= 1;
+  return false;
 }
 
 /** Stable mutation success requires a non-test change whenever its locked scope owns implementation. */

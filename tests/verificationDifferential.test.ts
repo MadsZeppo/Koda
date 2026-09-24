@@ -29,6 +29,19 @@ test("new candidate pytest failure remains a regression", () => {
   assert.equal(verificationAgainstBaseline(result(old), result(old + other)).status, "FAILED");
   assert.equal(verificationAgainstBaseline(result("passed", 0), result(other)).status, "FAILED");
 });
+const tap = (...names: string[]) => result(names.map((name, index) => [
+  `not ok ${index + 1} - ${name}`,
+  "  ---",
+  "  error: assertion failed",
+  "  ...",
+].join("\n")).join("\n") + `\n1..${names.length}\n# fail ${names.length}\n`, 1,
+"node --test");
+test("Node TAP removed baseline failures are neutral while added subtests regress", () => {
+  assert.equal(verificationAgainstBaseline(tap("A", "B", "C"), tap("C")).status,
+    "VERIFIED_SUCCESS");
+  assert.equal(verificationAgainstBaseline(tap("A", "B", "C"),
+    tap("A", "B", "C", "D")).status, "FAILED");
+});
 test("removing some or all baseline failures is improvement", () => {
   assert.equal(verificationAgainstBaseline(result(old + other), result(old)).status, "VERIFIED_SUCCESS");
   assert.equal(verificationAgainstBaseline(result(old), result("passed", 0)).status, "VERIFIED_SUCCESS");

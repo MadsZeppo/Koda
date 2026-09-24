@@ -23,6 +23,7 @@ import { compileContext } from "../src/context/compiler.js";
 import { extractFeatures, featureKey } from "../src/router/features.js";
 import { config } from "../src/config.js";
 import { bridgeDependencies } from "../src/repo/dependencies.js";
+import { finalVerificationScope } from "../src/run.js";
 const pkg = (scripts: Record<string, string> = {}, extra: object = {}) =>
   JSON.stringify({ scripts, ...extra });
 async function fixture(files: Record<string, string>) {
@@ -71,6 +72,25 @@ test("localized test context follows the named test imports without generic test
     assert.equal(selected.includes("src/agent/unrelated.ts"), false);
     assert.ok(Buffer.byteLength(JSON.stringify(context)) < 6_000,
       "localized context must leave the worker budget for mutation and verification");
+  } finally { await f.close(); }
+});
+test("zero-diff DIRECT final verification retains its target and excludes unrelated project units", async () => {
+  const f = await fixture({
+    "package.json": pkg({ test: "node --test tests/*.test.ts", build: "node -e 'process.exit(0)'",
+      typecheck: "node -e 'process.exit(0)'" }, { type: "module" }),
+    "tests/controlPolicy.test.ts": "test('policy',()=>{});\n",
+    "tests/fixtures/math/package.json": pkg({ test: "node --test failing.test.cjs" }),
+    "tests/fixtures/math/failing.test.cjs": "throw Error('unrelated');\n",
+  });
+  try {
+    const target = "tests/controlPolicy.test.ts";
+    const scope = finalVerificationScope([], [], [target]);
+    assert.deepEqual(scope, [target]);
+    const plan = verificationPlan(await f.profile(), scope, true);
+    assert.ok(plan.length > 0);
+    assert.equal(plan.some((candidate) =>
+      candidate.cwd?.includes("tests/fixtures/math") ||
+      candidate.command.includes("tests/fixtures/math")), false);
   } finally { await f.close(); }
 });
 test("baseline-aware verification distinguishes unchanged failures, regressions, and infrastructure", () => {

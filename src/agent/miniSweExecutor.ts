@@ -240,8 +240,7 @@ export async function implement(
       path: file, content: await readFile(join(path, file), "utf8").catch(() => ""),
     })));
   const alreadySatisfied = baseline.status === "VERIFIED_SUCCESS" &&
-    (testRequirementAlreadyCovered(task, lockedTests,
-      { allowSetupEvidence: subtask.id === "direct" }) ||
+    ((subtask.id !== "direct" && testRequirementAlreadyCovered(task, lockedTests)) ||
       objectiveCanBeAlreadySatisfied(subtask) &&
       !!profile.ecosystem &&
       workerChecksAreTaskSpecific(subtask, profile, context));

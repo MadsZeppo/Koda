@@ -72,6 +72,15 @@ export interface RunOptions {
   /** Deterministic test seam. CLI/production never supplies a worker factory. */
   codingWorkerFactory?: (gateway: Gateway) => CodingWorker;
 }
+
+export function finalVerificationScope(
+  changed: readonly string[],
+  stableScope: readonly string[] = [],
+  directScope: readonly string[] = [],
+) {
+  return [...(changed.length ? changed : stableScope.length ? stableScope : directScope)];
+}
+
 async function assertWriteResponsibility(path: string, subtask: Subtask) {
   const changed =
     (await workspaceChangedPaths(path)) ??
@@ -564,8 +573,19 @@ export async function run(options: RunOptions) {
           evidence: sharedRoutingEvidence,
         },
       );
-      if (strategy.execution_effort === "tiny")
-        directRepairContext = { subtask, context };
+      // Preserve the authoritative DIRECT target even when the worker returns
+      // no diff. Final verification must not expand an empty change set to all
+      // project units (for example unrelated fixture packages).
+      directRepairContext = { subtask, context };
+      const directTestTargets = subtask.likelyWritePaths.filter(isTestPath);
+      const directFocusedChecks = result.verification.checks
+        .filter((check) => directTestTargets.some((path) => check.command.includes(path)))
+        .map((check) => check.command);
+      if (directTestTargets.length === subtask.likelyWritePaths.length &&
+          directFocusedChecks.length) {
+        taskVerificationCommands = [...new Set(directFocusedChecks)];
+        taskVerificationIsFocused = true;
+      }
       if (result.verification.checks.some((check) =>
         check.outcome === "INFRA_FAILURE" || check.outcome === "CHECK_UNAVAILABLE")) {
         status = "NOT_FULLY_VERIFIED";
@@ -856,13 +876,9 @@ export async function run(options: RunOptions) {
     const changed = (await backend.changes(integration.path)).map(
       (c) => c.path,
     );
-    const verificationPaths = changed.length
-      ? changed
-      : stableRepairContext?.subtask.likelyWritePaths.length
-        ? stableRepairContext.subtask.likelyWritePaths
-        : directRepairContext?.subtask.likelyWritePaths.length
-          ? directRepairContext.subtask.likelyWritePaths
-          : changed;
+    const verificationPaths = finalVerificationScope(changed,
+      stableRepairContext?.subtask.likelyWritePaths ?? [],
+      directRepairContext?.subtask.likelyWritePaths ?? []);
     const currentPlan = verificationPlan(finalProfile, verificationPaths, true);
     const allFinalCandidates = [
       ...currentPlan,
