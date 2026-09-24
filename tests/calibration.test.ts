@@ -107,7 +107,7 @@ test("strict calibration compares two models on one frozen baseline without chan
       routing: { stateDirectory: join(root, "routing") },
       budgetUsd: 0.1,
       maxIterations: 3,
-      stageMaxTokens: 100,
+      stageMaxTokens: 30000,
     });
     const result = await calibrateModels({
       repo,
@@ -125,7 +125,7 @@ test("strict calibration compares two models on one frozen baseline without chan
     );
     assert.deepEqual(
       rows.map((row) => row.status),
-      ["VERIFIED_SUCCESS", "FAILED"],
+      ["VERIFIED_SUCCESS", "NOT_FULLY_VERIFIED"],
     );
     assert.deepEqual(
       rows.map((row) => row.verified),

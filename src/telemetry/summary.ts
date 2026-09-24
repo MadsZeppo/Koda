@@ -22,6 +22,7 @@ export function summarize(
     } else if (event.type === "coding_worker_stop") active.delete(key);
   }
   const calls = logger.events.filter((e) => e.type === "model_call");
+  const routingProfile = logger.events.findLast((event) => event.type === "task_profile");
   const elapsed = (start: any, end: any) => start && end
     ? Math.max(0, Date.parse(end.timestamp) - Date.parse(start.timestamp)) : 0;
   const first = (type: string) => logger.events.find((event) => event.type === type);
@@ -118,6 +119,15 @@ export function summarize(
     plannerRoutes: logger.events.filter((e) => e.type === "planner_route"),
     routingDecisions: logger.events.filter((e) => e.type === "model_router"),
     modelAttempts: logger.events.filter((e) => e.type === "model_attempt"),
+    executionPolicies: logger.events.filter((e) => e.type === "specialist_route")
+      .map((event) => ({ subtaskId: event.subtaskId, planId: event.selected_plan_id,
+        qualityClass: event.quality_class, requiredQuality: event.required_quality,
+        selectedModel: event.selected_model, evidenceClass: event.model_evidence_class,
+        conservativeQuality: event.conservative_quality,
+        estimatedCostPerVerifiedSolve: event.estimated_cost_per_verified_solve,
+        approvedRecoveryCandidates: event.approved_recovery_candidates,
+        whySelected: event.why_selected })),
+    adaptiveRecoveries: logger.events.filter((e) => e.type === "adaptive_recovery_decision"),
     fallbacks: logger.events.filter((e) => e.type === "model_fallback" ||
       e.type === "coding_route_fallback" || e.type === "mini_swe_fallback" && e.moved === true).length,
     plannerModels: [
@@ -143,6 +153,11 @@ export function summarize(
       outcome: c.outcome,
     })),
     totalModelCalls: calls.length,
+    routingResearchCalls: routingProfile?.routing_research_calls ?? 0,
+    routingResearchCostUsd: routingProfile?.routing_research_cost_usd ?? 0,
+    routingResearchTokens: routingProfile?.routing_research_tokens ?? 0,
+    microScoutUsed: routingProfile?.micro_scout_used ?? false,
+    deterministicProfileConfidence: routingProfile?.profile?.scopeConfidence ?? null,
     toolCalls: logger.events.filter((e) => e.type === "tool").length,
     verificationCalls: logger.events.filter(
       (e) => e.type === "verification" || e.type === "final_verification",
@@ -150,6 +165,10 @@ export function summarize(
     contextBytes: logger.events
       .filter((e) => e.type === "worker_context")
       .reduce((sum, event) => sum + (event.context_bytes ?? 0), 0),
+    contextBytesInitial: logger.events.filter((event) => event.type === "coding_worker_start")
+      .reduce((sum, event) => sum + (event.context_bytes_initial ?? 0), 0),
+    contextBytesRepeated: logger.events.filter((event) => event.type === "coding_worker_start")
+      .reduce((sum, event) => sum + (event.context_bytes_repeated ?? 0), 0),
     plannerModelCalls: calls.filter((c) => c.stage === "plan").length,
     coderModelCalls: calls.filter((c) => c.stage === "implement").length,
     modelCallsPerRole: Object.fromEntries(

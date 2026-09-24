@@ -40,6 +40,8 @@ const pool = {
       qualityPrior: 0.94,
       latencyPriorMs: 1000,
       strengths: ["coding", "tool_use", "structured_output"],
+      fallback: { inputPrice: 0.1, outputPrice: 0.2,
+        supportedParameters: ["tools", "tool_choice", "structured_outputs", "response_format"] },
     },
     {
       id: "strong",
@@ -53,6 +55,8 @@ const pool = {
         "repo_scale",
         "reasoning",
       ],
+      fallback: { inputPrice: 1, outputPrice: 2,
+        supportedParameters: ["tools", "tool_choice", "structured_outputs", "response_format"] },
     },
   ],
 };

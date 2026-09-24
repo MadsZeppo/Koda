@@ -145,7 +145,7 @@ export function compactProfile(profile: RepoProfile) {
 }
 
 const stopWords = new Set(
-  "fix the a an and or in of to so all tests test pass function helper broken bug with for this that implement return correct repair file source change update".split(
+  "fix the a an and or in of to so all tests test pass function helper broken bug with for this that implement return correct repair file source change update deterministic regression unit proving proves stop stops when reached reach make smallest necessary run relevant".split(
     " ",
   ),
 );
@@ -211,6 +211,55 @@ export function resolveImports(
   return [...result];
 }
 
+function relevantNamedTestImports(
+  file: string,
+  text: string,
+  files: Set<string>,
+  terms: string[],
+) {
+  const all = resolveImports(file, text, files);
+  if (!all.length) return all;
+  const lines = text.split("\n");
+  const relevantLines = new Set<number>();
+  const starts = lines.map((line, index) => /^\s*test\s*\(/.test(line) ? index : -1)
+    .filter((index) => index >= 0);
+  const ranges = starts.map((start, index) => ({ start,
+    end: (starts[index + 1] ?? lines.length) - 1 }));
+  for (const range of ranges) {
+    const block = lines.slice(range.start, range.end + 1).join("\n").toLowerCase();
+    if (terms.some((term) => block.includes(term)))
+      for (let cursor = range.start; cursor <= range.end; cursor++) relevantLines.add(cursor);
+  }
+  for (const [index, line] of lines.entries()) {
+    if (!terms.some((term) => line.toLowerCase().includes(term)) || relevantLines.has(index))
+      continue;
+    for (let cursor = Math.max(0, index - 2);
+      cursor <= Math.min(lines.length - 1, index + 2); cursor++)
+      relevantLines.add(cursor);
+  }
+  if (!relevantLines.size) return all;
+  const localWindow = lines.filter((_line, index) => relevantLines.has(index))
+    .join("\n").replace(/^\s*import[\s\S]*?;\s*$/gm, "");
+  const selected = new Set<string>();
+  for (const match of text.matchAll(
+    /import\s+(?:type\s+)?([\s\S]*?)\s+from\s*["'](\.[^"']+)["']/g,
+  )) {
+    const resolved = resolveImports(file, match[0], files)[0];
+    if (!resolved) continue;
+    const clause = match[1]!;
+    const bindings = [
+      ...[...clause.matchAll(/(?:^|[,{}])\s*([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?/g)]
+        .map((binding) => binding[2] ?? binding[1]!),
+      ...[...clause.matchAll(/\*\s+as\s+([A-Za-z_$][\w$]*)/g)]
+        .map((binding) => binding[1]!),
+    ];
+    if (bindings.some((binding) =>
+      new RegExp(`\\b${binding.replace(/[$]/g, "\\$")}\\b`).test(localWindow)))
+      selected.add(resolved);
+  }
+  return selected.size ? [...selected] : all;
+}
+
 /**
  * Read hints are advisory. Independent sibling ownership is not a reason to
  * preload its source; actual imports are still retrieved below.
@@ -273,6 +322,13 @@ export async function compileContext(
 
   const known = new Set(files);
   const terms = taskTerms(task);
+  const normalizedTask = task.toLowerCase();
+  const explicitlyNamed = new Set(files.filter((file) =>
+    normalizedTask.includes(file.toLowerCase())));
+  const namedTests = new Set([...explicitlyNamed].filter(isTestPath));
+  // An exact test path is stronger localization evidence than broad filename
+  // and keyword matches. Keep its import neighborhood small and deterministic.
+  const localizedTestTask = namedTests.size > 0;
   const scores = new Map<string, number>();
   const texts = new Map<string, string>();
 
@@ -283,25 +339,23 @@ export async function compileContext(
   };
 
   for (const file of files) {
-    if (
-      paths.some(
+    const pathAssigned = paths.some(
         (p) =>
           p === "." ||
           file === p ||
           file.startsWith(p.replace(/\/$/, "") + "/"),
-      )
-    ) {
-      add(file, isTestPath(file) ? 90 : 110);
+      );
+    if (pathAssigned && (!localizedTestTask || namedTests.has(file))) {
+      add(file, namedTests.has(file) ? 140 : isTestPath(file) ? 90 : 110);
     }
 
-    if (
-      !focused &&
-      (task.includes(file) || task.includes(posix.basename(file)))
-    ) {
+    if (!focused && explicitlyNamed.has(file)) {
+      add(file, isTestPath(file) ? 140 : 120);
+    } else if (!focused && !localizedTestTask && task.includes(posix.basename(file))) {
       add(file, 100);
     }
 
-    if (!focused && terms.some((t) => file.toLowerCase().includes(t))) {
+    if (!focused && !localizedTestTask && terms.some((t) => file.toLowerCase().includes(t))) {
       add(file, isTestPath(file) ? 85 : 70);
     }
   }
@@ -321,6 +375,8 @@ export async function compileContext(
           f,
         ),
     )
+    .filter((f) => !localizedTestTask || explicitlyNamed.has(f) ||
+      /(?:package\.json|tsconfig\.json|pyproject\.toml|go\.mod|Cargo\.toml)$/.test(f))
     .slice(0, limits.scanFiles)) {
     if (
       !/\.(?:[cm]?[jt]sx?|py|go|rs|java|[ch](?:pp)?|rb|json|toml|yaml|yml)$/.test(
@@ -339,7 +395,7 @@ export async function compileContext(
         text.toLowerCase().includes(t),
       ).length;
 
-      if (hits && !focused) {
+      if (hits && !focused && (!localizedTestTask || explicitlyNamed.has(file) || !isTestPath(file))) {
         add(file, Math.min(60, hits * 10));
       }
     } catch {}
@@ -348,24 +404,34 @@ export async function compileContext(
   const primary = [...scores]
     .filter(([f, s]) => s >= 70 && !isTestPath(f))
     .map(([f]) => f);
+  const importSeeds = [...new Set([...primary, ...explicitlyNamed])];
 
   const dependencies = new Set<string>();
 
-  for (const file of primary) {
+  for (const file of importSeeds) {
+    let source = texts.get(file);
+    if (source === undefined) {
+      try {
+        source = await prefix(root, file, limits.readBytes);
+        texts.set(file, source);
+      } catch { source = ""; }
+    }
     const unit = projectFor(profile.ecosystem, file);
 
-    for (const config of unit?.configFiles ?? []) {
-      add(config, 80);
-    }
+    if (!localizedTestTask)
+      for (const config of unit?.configFiles ?? []) add(config, 80);
 
-    for (const dep of resolveImports(file, texts.get(file) ?? "", known)) {
+    const imports = namedTests.has(file)
+      ? relevantNamedTestImports(file, source, known, terms)
+      : resolveImports(file, source, known);
+    for (const dep of imports) {
       dependencies.add(dep);
-      add(dep, 75);
+      add(dep, namedTests.has(file) ? 125 : 75);
     }
 
     const stem = posix.basename(file).replace(/\.[^.]+$/, "");
 
-    for (const test of files.filter(isTestPath)) {
+    for (const test of localizedTestTask ? [...namedTests] : files.filter(isTestPath)) {
       if (
         posix.basename(test).includes(stem) ||
         resolveImports(test, texts.get(test) ?? "", known).includes(file)
@@ -374,23 +440,21 @@ export async function compileContext(
       }
     }
 
-    let dir = posix.dirname(file);
-
-    while (true) {
-      const pkg = posix.join(dir, "package.json");
-
-      if (known.has(pkg)) {
-        add(pkg, 80);
-        break;
+    if (!localizedTestTask) {
+      let dir = posix.dirname(file);
+      while (true) {
+        const pkg = posix.join(dir, "package.json");
+        if (known.has(pkg)) {
+          add(pkg, 80);
+          break;
+        }
+        if (dir === ".") break;
+        dir = posix.dirname(dir);
       }
-
-      if (dir === ".") break;
-
-      dir = posix.dirname(dir);
     }
   }
 
-  for (const file of [
+  for (const file of localizedTestTask ? [] : [
     "package.json",
     "pyproject.toml",
     "go.mod",

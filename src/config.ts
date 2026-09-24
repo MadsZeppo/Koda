@@ -11,10 +11,11 @@ const schema = z.object({
   maxIterations: z.number().int().positive().default(18),
   maxMinutes: z.number().positive().default(20),
   commandTimeoutMs: z.number().positive().default(120000),
+  codingAttemptTimeoutMs: z.number().positive().default(120000),
   modelTimeoutMs: z.object({
     inspection: z.number().positive().default(18000),
     planning: z.number().positive().default(30000),
-    implementation: z.number().positive().default(45000),
+    implementation: z.number().positive().default(30000),
     finalization: z.number().positive().default(12000),
   }).default({}),
   phaseBudget: z.object({

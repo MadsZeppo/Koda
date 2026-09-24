@@ -72,6 +72,43 @@ test("verified rescue makes an economical first attempt competitive with referen
   assert.ok(cascade.reason.length > 0);
 });
 
+test("paired task history lowers cascade value when the stronger model rarely rescues failures", () => {
+  const sparse = route([efficient(), reference()]);
+  const rows: Attempt[] = [];
+  for (let index = 0; index < 4; index++) {
+    rows.push(observation("efficient", fingerprint(), {
+      runId: `pair-${index}`, verification: "FAILED", escalated: true,
+      reason: "focused_verification_failed", failureAttribution: "verified_patch_regression",
+    }));
+    rows.push(observation("reference", fingerprint(), {
+      runId: `pair-${index}`, verification: index === 0 ? "VERIFIED_SUCCESS" : "FAILED",
+      escalated: index !== 0, reason: index === 0 ? undefined : "focused_verification_failed",
+      failureAttribution: index === 0 ? undefined : "verified_patch_regression",
+    }));
+  }
+  const learned = route([efficient(), reference()], fingerprint(), rows);
+  const sparseCascade = plan(sparse, "efficient", "reference");
+  const learnedCascade = plan(learned, "efficient", "reference");
+  assert.equal(learnedCascade.recoveryEvidence?.samples, 4);
+  assert.ok(learnedCascade.expectedFinalSuccess < sparseCascade.expectedFinalSuccess);
+  assert.ok(learnedCascade.qualityGap > sparseCascade.qualityGap);
+});
+
+test("exact external paired evidence supplies conditional recovery when Koda history is sparse", () => {
+  const candidate = efficient(), rescue = reference();
+  const pair = { sourceId: "paired-fixture", candidateModelId: "efficient",
+    referenceModelId: "reference", taskFamily: "implementation",
+    bothSucceed: 0, candidateOnly: 0, referenceOnly: 1, bothFail: 9,
+    sampleSize: 10, identityLevel: "EXACT" as const };
+  candidate.knowledge = { snapshotId: "paired", observations: [], pairwiseEvidence: [pair] };
+  rescue.knowledge = { snapshotId: "paired", observations: [], pairwiseEvidence: [pair] };
+  const result = route([candidate, rescue]);
+  const cascade = plan(result, "efficient", "reference");
+  assert.equal(cascade.recoveryEvidence?.source, "paired_external");
+  assert.equal(cascade.recoveryEvidence?.samples, 10);
+  assert.equal(cascade.recoveryEvidence?.successes, 1);
+});
+
 test("material final quality loss rejects a cheap plan despite its lower completion cost", () => {
   const result = route([model("efficient", 0.6, 0.00001), reference()], fingerprint("weak"), [], [],
     { minimumQuality: 0.75 });

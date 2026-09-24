@@ -8,6 +8,9 @@ export type TaskKind =
   | "testing" | "refactor" | "architecture" | "review" | "repo_scanning"
   | "shell" | "devops" | "sql_database" | "documentation";
 export type Difficulty = "low" | "medium" | "high";
+export type TaskFamily = "localized_bugfix" | "debugging" | "test_change" | "refactor" |
+  "frontend_ui" | "backend_api" | "database" | "architecture" | "devops" |
+  "documentation" | "multi_component";
 export interface TaskDifficulty {
   technicalComplexity: Difficulty;
   visualComplexity: Difficulty;
@@ -18,6 +21,7 @@ export interface TaskDifficulty {
   contextUncertainty: Difficulty;
 }
 export interface TaskFingerprint {
+  taskFamily?: TaskFamily;
   primary: TaskKind;
   secondary: TaskKind[];
   languages: string[];
@@ -33,6 +37,17 @@ export interface TaskFingerprint {
   toolsRequired: boolean;
   visionRequired: boolean;
   verificationStrength: "strong" | "medium" | "weak";
+  scopeUncertainty?: Difficulty;
+  focusedFailingReproduction?: boolean;
+  targetedExecutableVerification?: boolean;
+  broaderProjectVerification?: boolean;
+  likelyComponents?: number;
+  crossComponent?: boolean;
+  publicApiRisk?: boolean;
+  schemaRisk?: boolean;
+  configRisk?: boolean;
+  concurrencyRisk?: boolean;
+  decompositionConfidence?: "high" | "medium" | "low";
   taskType?: Features["taskType"];
   localizationConfidence?: Features["localizationConfidence"];
   expectedFiles?: number;
@@ -116,7 +131,19 @@ export function taskFingerprint(
       : features.localizationConfidence === "medium" || kinds.includes("repo_scanning") ? "medium" : "low",
   };
   const reasons = [`${primary} from worker objective`, `${scope} write scope`, `${features.localizationConfidence} localization confidence`, `${verificationStrength} executable verification evidence`];
+  const taskFamily: TaskFamily = scope === "cross-component" || kinds.includes("fullstack") ? "multi_component"
+    : primary === "debugging" && scope === "single" ? "localized_bugfix"
+    : primary === "debugging" ? "debugging"
+    : primary === "testing" ? "test_change"
+    : primary === "frontend_ui" ? "frontend_ui"
+    : primary === "backend" ? "backend_api"
+    : primary === "sql_database" ? "database"
+    : primary === "architecture" ? "architecture"
+    : primary === "devops" ? "devops"
+    : primary === "documentation" ? "documentation"
+    : primary === "refactor" ? "refactor" : scope === "single" ? "localized_bugfix" : "multi_component";
   return {
+    taskFamily,
     primary, secondary: kinds.filter((kind) => kind !== primary),
     languages: [...new Set([...features.languages, ...paths.map(extname).filter((ext) => ext === ".sql").map(() => "sql")])],
     frameworks: features.frameworks,
@@ -127,6 +154,19 @@ export function taskFingerprint(
     architectureHeavy: kinds.includes("architecture") || features.requiresArchitectureReasoning,
     toolsRequired: !subtask.readOnly,
     visionRequired, verificationStrength, difficulty,
+    scopeUncertainty: difficulty.contextUncertainty,
+    focusedFailingReproduction: focusedCheck && checks.some((check) => check.outcome === "CHECK_FAIL"),
+    targetedExecutableVerification: focusedCheck,
+    broaderProjectVerification: profile.verificationCommands.length > 0,
+    likelyComponents: new Set(paths.map((path) => path.includes("/")
+      ? path.split("/").slice(0, -1).join("/") : ".")).size,
+    crossComponent: scope === "cross-component",
+    publicApiRisk: high(/\b(?:public.api|exported|endpoint|breaking|contract)\w*\b/),
+    schemaRisk: high(/\b(?:schema|migration|database|protocol)\w*\b/),
+    configRisk: high(/\b(?:config|configuration|manifest)\w*\b/),
+    concurrencyRisk: high(/\b(?:concurren|race.condition|synchron|deadlock|atomic)\w*\b/),
+    decompositionConfidence: features.localizationConfidence === "low" ? "low"
+      : scope === "cross-component" && subtask.dependsOn.length === 0 ? "medium" : "high",
     taskType: features.taskType,
     localizationConfidence: features.localizationConfidence,
     expectedFiles: features.estimatedFiles,

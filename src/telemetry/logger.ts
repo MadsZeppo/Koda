@@ -30,6 +30,9 @@ export class Logger {
       case "model_router":
         detail = `selected_model=${d.selected_model} estimated_quality=${d.estimated_quality?.toFixed(3) ?? "unknown"} routing_reason=${d.routing_reason}`;
         break;
+      case "specialist_route":
+        detail = `plan=${d.selected_plan_id ?? "none"} model=${d.selected_model ?? "none"} quality_class=${d.quality_class ?? "unknown"} evidence_class=${d.model_evidence_class ?? "unknown"} conservative_quality=${d.conservative_quality?.toFixed?.(3) ?? "unknown"} quality_floor=${d.required_quality ?? "unknown"} cost_per_verified_solve=$${d.estimated_cost_per_verified_solve ?? "unknown"} expected_latency_ms=${d.expected_completion_latency_ms ?? "unknown"}`;
+        break;
       case "model_attempt":
         detail = `${d.modelRequested}: ${d.verification}`;
         break;

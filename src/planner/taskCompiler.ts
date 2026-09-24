@@ -7,6 +7,7 @@ import type { RepoProfile } from "../types.js";
 import { planningPolicy, reconcilePlannedPaths, validatePlanningCandidate } from "./policy.js";
 import { selectPlanner } from "./routing.js";
 import type { PoolModel } from "../router/pool.js";
+import type { TaskResume } from "../router/taskProfiler.js";
 
 const submitPlanTool = [{
   type: "function" as const,
@@ -60,6 +61,7 @@ export async function compileTask(
   gateway: Gateway,
   task: string,
   profile: RepoProfile,
+  routingResume?: TaskResume,
 ) {
   const started = Date.now(),
     settings = gateway.config.planner;
@@ -98,7 +100,13 @@ Maximum four tasks. Preserve real dependencies. Combine same-file fixes. Write o
       },
       {
         role: "user",
-        content: JSON.stringify({ task, planningContext: policy.context }),
+        content: JSON.stringify({ task, planningContext: policy.context,
+          routingResume: routingResume ? {
+            likelyPaths: routingResume.relevantPaths,
+            evidence: routingResume.evidence,
+            scopeConfidence: routingResume.profile.scopeConfidence,
+            decompositionConfidence: routingResume.profile.decompositionConfidence,
+          } : undefined }),
       },
     ];
     const features = extractFeatures(

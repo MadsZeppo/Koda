@@ -29,6 +29,7 @@ import { AgentTools, currentDiff } from "../src/agent/tools.js";
 import { WriteScope } from "../src/repo/writeScope.js";
 import { ProgressTracker } from "../src/router/progress.js";
 import { verificationResult } from "../src/verifier/verifier.js";
+import { testRequirementAlreadyCovered } from "../src/agent/mutationInvariant.js";
 
 async function sandbox(prefix = "koda-workspace-") {
   const parent = await mkdtemp(join(tmpdir(), prefix));
@@ -37,6 +38,42 @@ async function sandbox(prefix = "koda-workspace-") {
   await mkdir(root);
   return { parent, root, output };
 }
+
+test("DIRECT exits before coding when a passing focused test already proves the attempt boundary", async () => {
+  const f = await sandbox("koda-direct-covered-boundary-");
+  const testPath = "tests/controlPolicy.test.cjs";
+  const source = `const {test}=require("node:test");\nconst assert=require("node:assert/strict");\nconst maxCodingAttempts=1;\nfunction chooseAdaptiveRecovery(attempted){return attempted.size>=maxCodingAttempts?undefined:"next";}\ntest("recovery stops at the configured attempt bound",()=>{assert.equal(chooseAdaptiveRecovery(new Set(["first"])),undefined);});\n`;
+  const task = `In ${testPath}, add a deterministic regression test proving recovery stops when maxCodingAttempts is reached.`;
+  try {
+    await mkdir(join(f.root, "tests"), { recursive: true });
+    await writeFile(join(f.root, testPath), source);
+    await writeFile(join(f.root, "package.json"), JSON.stringify({ scripts: {
+      test: `node --test ${testPath}`,
+    } }));
+    await git(f.root, "init", "-q");
+    await git(f.root, "config", "user.email", "test@koda.local");
+    await git(f.root, "config", "user.name", "Koda Test");
+    await git(f.root, "add", ".");
+    await git(f.root, "commit", "-qm", "covered regression");
+    assert.equal(testRequirementAlreadyCovered(task, [{ path: testPath, content: source }],
+      { allowSetupEvidence: true }), true);
+    assert.equal(testRequirementAlreadyCovered(task, [{ path: testPath,
+      content: `// recovery maxCodingAttempts\ntest("name only",()=>assert.equal(1,1));\n` }]), false);
+
+    const result = await run({ repo: f.root, task, output: f.output, quiet: true,
+      config: await config(undefined, { adaptiveCoding: false, specialistRouting: false,
+        baseUrl: "http://127.0.0.1:1/v1", budgetUsd: .1 }) });
+    const events = (await readFile(join(f.output, "events.jsonl"), "utf8")).trim()
+      .split("\n").map((line) => JSON.parse(line));
+    assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
+    assert.ok(events.some((event) => event.type === "no_changes_required"));
+    assert.equal(events.some((event) => event.type === "coding_worker_start"), false);
+    assert.equal(events.some((event) => event.type === "model_call"), false);
+    assert.deepEqual(result.changedFiles, []);
+    assert.equal(await readFile(join(f.root, testPath), "utf8"), source);
+    assert.equal((await git(f.root, "status", "--porcelain")).trim(), "");
+  } finally { await rm(f.parent, { recursive: true, force: true }); }
+});
 
 test("Linux /tmp workspaces have mountpoints before /tmp becomes read-only", async () => {
   for (const cwd of [

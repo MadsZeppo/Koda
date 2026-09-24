@@ -258,7 +258,7 @@ export class Gateway {
       const usage = providerUsage.costUsd === null
         ? { ...providerUsage, costUsd: estimatedUsageCost! }
         : providerUsage;
-      release(usage);
+      release.settle(usage);
       releasePhase(usage.costUsd, usage.promptTokens + usage.completionTokens);
       this.logger.log("model_call", {
         subtaskId,
@@ -330,14 +330,23 @@ export class Gateway {
       }
       return message;
     } catch (e) {
-      const rejected =
+      const rejectedBeforeExecution =
         !responseLogged &&
         e instanceof OpenAI.APIError &&
-        ([400, 404].includes(e.status ?? 0) || transientStatus(e.status));
+        [400, 404].includes(e.status ?? 0);
       const transient = !responseLogged && isTransientProviderError(e);
-      if (rejected || transient) release(parseUsage({ cost: 0 }));
-      else release();
-      releasePhase(rejected || transient ? 0 : null);
+      const unboundedCost = !responseLogged &&
+        /omitted charged cost and usable token counts/i.test(String(e));
+      // The request was bounded before dispatch. If usage is unavailable,
+      // consume that entire reservation rather than poisoning every later call.
+      if (unboundedCost) release.settleUncertain();
+      else if (rejectedBeforeExecution) release.cancel();
+      else if (!responseLogged) release.settleUncertain();
+      // A response has already settled the reservation exactly once. Errors
+      // while validating that response must not charge it a second time.
+      if (rejectedBeforeExecution) releasePhase(0);
+      else if (unboundedCost) releasePhase(estimated, reserveTokens);
+      else if (!responseLogged) releasePhase(estimated, reserveTokens);
       if (!responseLogged)
         this.logger.log("model_call", {
           subtaskId,
@@ -360,14 +369,14 @@ export class Gateway {
           timestampStart: new Date(start).toISOString(),
           timestampEnd: new Date().toISOString(),
           wallClockMs: Date.now() - start,
-          ...parseUsage(rejected || transient ? { cost: 0 } : undefined),
+          ...parseUsage(rejectedBeforeExecution ? { cost: 0 } : undefined),
           attempt,
           outcome: "error",
           classification: "OPERATIONAL_FAILURE",
           error: String(e),
         });
       if (!responseLogged) operation("error", null, null, Date.now() - start,
-        rejected || transient ? 0 : null);
+        rejectedBeforeExecution ? 0 : transient ? estimated : null);
       this.logger.log("model_error", {
         subtaskId,
         stage,

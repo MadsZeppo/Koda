@@ -42,6 +42,37 @@ async function fixture(files: Record<string, string>) {
     close: () => rm(root, { recursive: true, force: true }),
   };
 }
+test("localized test context follows the named test imports without generic test padding", async () => {
+  const f = await fixture({
+    "package.json": pkg({ test: "node --test" }, { type: "module" }),
+    "tests/controlPolicy.test.ts": `import { chooseAdaptiveRecovery, freezeExecutionPolicy } from "../src/router/controlPolicy.js";\nimport { unrelatedSelection } from "../src/verifier/selection.js";\nconst maxCodingAttempts = freezeExecutionPolicy({ maxCodingAttempts: 2 });\ntest("recovery stops at maxCodingAttempts", () => assert.equal(chooseAdaptiveRecovery(maxCodingAttempts), undefined));\ntest("unrelated selection", () => assert.ok(unrelatedSelection()));\n`,
+    "src/router/controlPolicy.ts": `export function freezeExecutionPolicy<T>(value: T): T { return value; }\n`,
+    "src/verifier/selection.ts": "export const unrelatedSelection = () => true;\n",
+    "src/agent/unrelated.ts": "export const maxCodingAttempts = 99;\n",
+    "tests/e2e.test.ts": `// generic regression fixture mentioning maxCodingAttempts\nexport const maxCodingAttempts = 99;\n`,
+    "tests/stable.test.ts": `// another unrelated deterministic recovery test\nexport const recovery = true;\n`,
+    "tests/fixtures/math/add.cjs": "module.exports = (a, b) => a + b;\n",
+  });
+  try {
+    const settings = await config(undefined, { models: {} });
+    const context = await compileContext(f.root,
+      "In tests/controlPolicy.test.ts, add a deterministic regression test proving recovery stops when maxCodingAttempts is reached.",
+      ["tests/controlPolicy.test.ts", "tests/e2e.test.ts", "tests/stable.test.ts",
+        "src/verifier/selection.ts", "src/agent/unrelated.ts"],
+      await f.profile(), settings.context);
+    const selected = context.files.map((file) => file.path);
+    assert.ok(selected.includes("tests/controlPolicy.test.ts"));
+    assert.ok(selected.includes("src/router/controlPolicy.ts"));
+    assert.ok(context.localDependencies.includes("src/router/controlPolicy.ts"));
+    assert.equal(selected.includes("tests/e2e.test.ts"), false);
+    assert.equal(selected.includes("tests/stable.test.ts"), false);
+    assert.equal(selected.includes("tests/fixtures/math/add.cjs"), false);
+    assert.equal(selected.includes("src/verifier/selection.ts"), false);
+    assert.equal(selected.includes("src/agent/unrelated.ts"), false);
+    assert.ok(Buffer.byteLength(JSON.stringify(context)) < 6_000,
+      "localized context must leave the worker budget for mutation and verification");
+  } finally { await f.close(); }
+});
 test("baseline-aware verification distinguishes unchanged failures, regressions, and infrastructure", () => {
   const check = (command: string, stderr: string) => ({
     command, exitCode: 1, stdout: "", stderr, wallClockMs: 1, timedOut: false,

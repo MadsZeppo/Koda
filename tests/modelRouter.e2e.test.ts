@@ -214,7 +214,7 @@ for (const scenario of [
           "forced-stall",
         ].includes(scenario)
       )
-        assert.equal(result.status, scenario === "permanent-failure"
+        assert.equal(result.status, ["permanent-failure", "forced-stall"].includes(scenario)
           ? "NOT_FULLY_VERIFIED" : "FAILED");
       else assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
       if (["budget", "unknown-price"].includes(scenario))
@@ -238,7 +238,8 @@ for (const scenario of [
         assert.equal(result.routingDecisions[0].selected_model, "cheap");
       }
       if (scenario === "permanent-failure") {
-        assert.equal(requests.length, 1);
+        assert.deepEqual(requests.map((request) => request.model), ["cheap", "strong"],
+          "bounded operational failures consume their reservations but still allow routed fallback");
         assert.equal(result.costComplete, false);
         assert.equal(result.fallbacks, 1);
       }

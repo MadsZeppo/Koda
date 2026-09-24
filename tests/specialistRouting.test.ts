@@ -76,19 +76,21 @@ test("universal selector considers every discovered model and chooses the cheape
   const uiTask = scenario("Fix React UI layout", ["src/Dashboard.tsx"], ["node --test tests/dashboard.test.ts"]);
   const uiRoute = route(uiTask.fingerprint, uiTask.features, [], all);
   assert.equal(uiRoute.cascade[0]?.model.id, tiny.model.id);
-  assert.ok(uiRoute.cascade.slice(1).some((candidate) => candidate.model.id === ui.model.id),
-    "the economical first attempt retains the UI reference as verified rescue");
+  assert.equal(uiRoute.reference?.model.id, tiny.model.id,
+    "a configured specialty label alone does not create a stronger quality claim");
   const dbTask = scenario("Fix SQL database query", ["src/query.sql"], ["node --test tests/query.test.ts"]);
-  assert.equal(route(dbTask.fingerprint, dbTask.features, [], all).cascade[0]?.model.id, database.model.id);
+  assert.equal(route(dbTask.fingerprint, dbTask.features, [], all).cascade[0]?.model.id, tiny.model.id,
+    "unverified configured specialty tags do not override economics");
   const refactorTask = scenario("Refactor repository module", ["src/state.ts"], ["node --test tests/state.test.ts"]);
-  assert.equal(route(refactorTask.fingerprint, refactorTask.features, [], all).cascade[0]?.model.id, refactor.model.id);
+  assert.equal(route(refactorTask.fingerprint, refactorTask.features, [], all).cascade[0]?.model.id, tiny.model.id);
   const tinyTask = scenario("Correct a value", ["src/state.ts"], ["node --test tests/state.test.ts"]);
   const tinyResult = route(tinyTask.fingerprint, tinyTask.features, [], all);
   assert.equal(tinyResult.considered.length, all.length, "no fixed shortlist truncates discovery");
   assert.equal(tinyResult.cascade[0]?.model.id, tiny.model.id);
   const unknown = model("unknown-specialty", [], 0.0001);
-  assert.match(route(dbTask.fingerprint, dbTask.features, [], [unknown, database]).considered
-    .find((candidate) => candidate.model.id === unknown.model.id)!.rejected!, /quality|high-risk/);
+  assert.equal(route(dbTask.fingerprint, dbTask.features, [], [unknown, database]).considered
+    .find((candidate) => candidate.model.id === unknown.model.id)!.hardRejection, undefined,
+    "unknown evidence is uncertainty, not technical incompatibility");
 });
 
 test("missing soft domain tags remain eligible when benchmark evidence supports verified quality", () => {
@@ -367,7 +369,7 @@ test("one localized failure does not poison another file, and HTTP 429 is operat
     route(first.fingerprint, first.features).considered.find((c) => c.model.id === cheap.model.id)!.quality);
 });
 
-test("high uncertainty blocks weakly verified cheap choice and execution strategies are retained", () => {
+test("weak verification remains conservative without collapsing a quality plateau", () => {
   for (const strategy of ["direct", "stable", "planned"]) {
     const s = scenario("Change React layout", undefined, [], strategy);
     assert.equal(s.fingerprint.executionStrategy, strategy);
@@ -377,8 +379,9 @@ test("high uncertainty blocks weakly verified cheap choice and execution strateg
   s.fingerprint.difficulty.contextUncertainty = "high";
   const dynamic = { ...cheap, configured: false };
   const result = route(s.fingerprint, s.features, [], [dynamic, strong]);
-  assert.equal(result.cascade[0]?.model.id, strong.model.id);
-  assert.match(result.considered.find((c) => c.model.id === cheap.model.id)?.rejected ?? "", /uncertain|quality/);
+  assert.equal(result.cascade[0]?.model.id, cheap.model.id);
+  assert.ok(result.selectedPlan!.qualityGap <= result.allowedRegret);
+  assert.equal(result.considered.find((c) => c.model.id === cheap.model.id)?.confidence, "low");
 });
 
 test("a 0.99 configured prior alone is weak evidence, while verified history tightens uncertainty", () => {
@@ -559,15 +562,30 @@ test("parallel PLANNED coding subtasks choose independently and report reference
     assert.equal(typeof routes[0].candidates[0].quality_gap, "number");
     assert.equal(typeof routes[0].candidates[0].uncertainty, "number");
     for (const event of routes) {
-      assert.deepEqual(event.selected_plan.models, event.fallback_chain);
       assert.equal(event.selected_model, event.selected_plan.models[0]);
-      assert.equal(event.expected_standalone_success, event.selected_plan.expectedStandaloneSuccess);
-      assert.equal(event.expected_final_success, event.selected_plan.expectedFinalSuccess);
+      assert.ok(Array.isArray(event.approved_recovery_candidates));
+      assert.equal(event.expected_standalone_success,
+        Number(event.selected_plan.expectedStandaloneSuccess.toFixed(3)));
+      assert.equal(event.expected_final_success,
+        Number(event.selected_plan.expectedFinalSuccess.toFixed(3)));
       assert.equal(event.expected_completion_cost_usd, event.selected_plan.expectedCompletionCost);
       assert.equal(event.expected_completion_latency_ms, event.selected_plan.expectedCompletionLatencyMs);
+      assert.equal(event.expected_completion_latency_p90_ms, event.selected_plan.completionLatencyP90Ms);
       assert.equal(event.quality_gap, event.selected_plan.qualityGap);
+      assert.equal(typeof event.candidates[0].expected_total_tokens, "number");
+      assert.ok(Array.isArray(event.candidates[0].knowledge_sources));
       assert.ok(event.plans.every((plan: any) => typeof plan.reason === "string"));
     }
+    const since = logger.events.length;
+    logger.log("model_call", { subtaskId: "easy", modelRequested: cheap.model.id,
+      modelReturned: cheap.model.id, wallClockMs: 900, promptTokens: 120,
+      completionTokens: 30, costUsd: .001 });
+    pool.record(cheap.model, easy.features, "easy", since, "VERIFIED_SUCCESS", false,
+      undefined, easy.fingerprint);
+    const error = logger.events.find((event) => event.type === "routing_prediction_error");
+    assert.equal(error.predicted_model, cheap.model.id);
+    assert.equal(error.actual_input_tokens, 120);
+    assert.equal(typeof error.token_error, "number");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -589,8 +607,9 @@ test("race reservations select complete plans without silently removing their re
     assert.notEqual(choices[0]![0]!.model.id, choices[1]![0]!.model.id);
     const routes = logger.events.filter((event) => event.type === "specialist_route");
     for (const [index, event] of routes.entries()) {
-      assert.deepEqual(event.selected_plan.models, choices[index]!.map((candidate) => candidate.model.id));
-      assert.deepEqual(event.selected_plan.models, event.fallback_chain);
+      assert.equal(event.selected_model, choices[index]![0]!.model.id);
+      assert.deepEqual(new Set([event.selected_model, ...event.approved_recovery_candidates]),
+        new Set(choices[index]!.map((candidate) => candidate.model.id)));
     }
     assert.equal(routes[0]!.reference_model, routes[1]!.reference_model);
     assert.ok(routes[1]!.plans.some((plan: any) => plan.reason === "already reserved for race"));

@@ -22,6 +22,11 @@ export class Catalog {
       (configured) => new Map([...configured, ...this.dynamic]),
     );
   }
+  /** Explicit, user-triggered refresh. Routing itself continues to use cached data. */
+  refresh() {
+    this.pending = this.load(true);
+    return this.pending.then((configured) => new Map([...configured, ...this.dynamic]));
+  }
   addDynamic(models: Iterable<[string, Metadata]>) {
     for (const [id, metadata] of models) this.dynamic.set(id, metadata);
   }
@@ -41,7 +46,7 @@ export class Catalog {
       ...this.dynamic,
     ]);
   }
-  private async load() {
+  private async load(force = false) {
     const path = join(this.directory, "catalog.json");
     let cached:
       | { baseUrl: string; retrievedAt: number; entries: [string, Metadata][] }
@@ -67,7 +72,7 @@ export class Catalog {
       (!officialOpenRouter || this.models.filter((model) => model.enabled &&
         model.strengths.includes("tool_use")).every((model) =>
         cached!.entries.find(([id]) => id === model.id)?.[1].routableParameterSets !== undefined)) &&
-      Date.now() - cached.retrievedAt < this.ttlMs
+      !force && Date.now() - cached.retrievedAt < this.ttlMs
     )
       return new Map(cached.entries);
     try {

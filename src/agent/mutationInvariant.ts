@@ -4,10 +4,14 @@ export interface MutationPath { path: string }
 
 export const isExplicitTestOnlyTask = (task: string) =>
   /\b(?:only|solely|exclusively)\b[^.\n]{0,50}\btests?\b|\btests?\s+only\b/i.test(task) ||
+  /^\s*in\s+[\w./-]*(?:tests?|spec)[\w./-]*\.[\w]+\s*,?\s*(?:add|write|create|update|modify|fix|repair)\b/i.test(task) ||
   /^\s*(?:add|write|create|update|modify|fix|repair)\s+(?:(?:a|an|one|the|new|existing|focused|regression|unit|integration|deterministic|missing|failing|broken)\s+){0,8}tests?\b/i.test(task);
 
-const taskConceptWords = (task: string) => (task.toLowerCase().match(/[a-z][a-z0-9]*/g) ?? [])
-  .filter((word) => !/^(?:add|write|create|update|modify|fix|repair|a|an|the|new|existing|focused|regression|unit|integration|deterministic|test|tests|that|which|verifies|verify|includes|include|contains|contain|and|or|with|for|from|into)$/.test(word));
+const taskConceptWords = (task: string) => (task
+  .replace(/(?:^|\s)[\w./-]+\.(?:[cm]?[jt]sx?|py|go|rs|java|rb)(?=\s|[,.:;]|$)/gi, " ")
+  .replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase()
+  .match(/[a-z][a-z0-9]*/g) ?? [])
+  .filter((word) => !/^(?:add|write|create|update|modify|fix|repair|a|an|the|new|existing|focused|regression|unit|integration|deterministic|test|tests|that|which|verifies|verify|includes|include|contains|contain|and|or|with|for|from|into|in|proving|proves|stop|stops|when|reach|reached|make|smallest|necessary|change|run|relevant|is|are)$/.test(word));
 
 /**
  * Prove that an explicit test-only request is already represented by actual
@@ -16,6 +20,7 @@ const taskConceptWords = (task: string) => (task.toLowerCase().match(/[a-z][a-z0
 export function testRequirementAlreadyCovered(
   task: string,
   files: readonly { path: string; content: string }[],
+  options: { allowSetupEvidence?: boolean } = {},
 ) {
   if (!isExplicitTestOnlyTask(task) || !files.length || files.some((file) => !isTestPath(file.path)))
     return false;
@@ -32,7 +37,27 @@ export function testRequirementAlreadyCovered(
     identifiers.some((identifier) => identifier.split("_").includes(word))));
   const compositeAssertions = identifiers.filter((identifier) =>
     words.filter((word) => identifier.split("_").includes(word)).length >= 2);
-  return new Set(compositeAssertions).size >= 2 && covered.size >= Math.min(4, words.length);
+  if (new Set(compositeAssertions).size >= 2 && covered.size >= Math.min(4, words.length))
+    return true;
+
+  if (!options.allowSetupEvidence) return false;
+
+  // Some focused regression tests express their boundary in setup and the
+  // outcome in one assertion (for example a named attempt limit plus an
+  // undefined recovery result). Accept that existing proof only when the
+  // task concepts occur in executable identifiers, at least one concept is
+  // exercised by an assertion, and the focused test itself passes.
+  const executable = files.map((file) => file.content)
+    .join("\n")
+    .replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*|#[^\n]*/g, "")
+    .replace(/(['"`])(?:\\.|(?!\1)[^\\])*\1/g, "");
+  const executableIdentifiers = (executable.match(/[A-Za-z_$][\w$]*/g) ?? [])
+    .map((identifier) => identifier.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase())
+    .flatMap((identifier) => identifier.split("_"));
+  const executableConcepts = new Set(words.filter((word) =>
+    executableIdentifiers.includes(word)));
+  return words.length >= 2 && executableConcepts.size >= Math.min(3, words.length) &&
+    covered.size >= 1;
 }
 
 /** Stable mutation success requires a non-test change whenever its locked scope owns implementation. */

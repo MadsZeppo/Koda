@@ -5,12 +5,14 @@ import { join, dirname, relative, isAbsolute, posix, resolve, delimiter } from "
 import { createConnection, createServer } from "node:net";
 import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
+import { tmpdir } from "node:os";
 import type { CommandResult } from "../types.js";
 import {
   dependenciesForWorkspace,
   nodeEnvironmentForWorkspace,
   pythonEnvironmentForWorkspace,
   type DependencyBridge,
+  type NodeRuntimeEnvironment,
 } from "./dependencies.js";
 
 const within = (root: string, path: string) => {
@@ -205,6 +207,9 @@ async function brokeredCommand(
   dependencyBootstrap = false,
   nodeProjectRoot = ".",
   additionalEnvironment: NodeJS.ProcessEnv = {},
+  nodeEnvironment?: NodeRuntimeEnvironment,
+  writableRuntimeRoots: string[] = [],
+  additionalReadRoots: string[] = [],
 ) {
   const socket = process.env.KODA_SANDBOX_BROKER;
   const token = process.env.KODA_SANDBOX_BROKER_TOKEN;
@@ -235,6 +240,9 @@ async function brokeredCommand(
           },
           dependencyBootstrap,
           nodeProjectRoot,
+          nodeEnvironment,
+          writableRuntimeRoots,
+          additionalReadRoots,
           additionalEnvironment: {
             OPENROUTER_API_KEY: additionalEnvironment.OPENROUTER_API_KEY,
           },
@@ -324,6 +332,72 @@ async function sandboxBroker(
           if (!roots.some((root) => within(root, pythonSourceRoot!)))
             throw Error("Sandbox broker Python source root is outside allowed roots");
         }
+        const allowedRoot = async (candidate: unknown, label: string) => {
+          if (typeof candidate !== "string" || !candidate)
+            throw Error(`Invalid sandbox broker ${label}`);
+          const resolved = await realpath(candidate);
+          if (!roots.some((root) => within(root, resolved)))
+            throw Error(`Sandbox broker ${label} is outside allowed roots`);
+          return resolved;
+        };
+        const allowedReadRoot = async (candidate: unknown, label: string) => {
+          if (typeof candidate !== "string" || !candidate)
+            throw Error(`Invalid sandbox broker ${label}`);
+          const resolved = await realpath(candidate);
+          const systemReadRoots = ["/usr", "/bin", "/sbin", "/opt", "/System", "/Library"];
+          if (!roots.some((root) => within(root, resolved)) &&
+              !systemReadRoots.some((root) => within(root, resolved)))
+            throw Error(`Sandbox broker ${label} is outside allowed read roots`);
+          return resolved;
+        };
+        const writableRuntimeRoots: string[] = [];
+        for (const root of message.writableRuntimeRoots ?? [])
+          writableRuntimeRoots.push(await allowedRoot(root, "writable runtime root"));
+        const additionalReadRoots: string[] = [];
+        for (const root of message.additionalReadRoots ?? [])
+          additionalReadRoots.push(await allowedReadRoot(root, "read root"));
+        let nodeEnvironment: NodeRuntimeEnvironment | undefined;
+        if (message.nodeEnvironment) {
+          const root = await allowedRoot(message.nodeEnvironment.root, "Node runtime root");
+          const binPath = await allowedRoot(message.nodeEnvironment.binPath, "Node runtime bin");
+          const executable = await allowedRoot(message.nodeEnvironment.executable, "Node executable");
+          if (!within(root, binPath) || !within(root, executable))
+            throw Error("Sandbox broker Node runtime paths do not share an allowed root");
+          let buildPython: NodeRuntimeEnvironment["buildPython"];
+          if (message.nodeEnvironment.buildPython) {
+            const pythonRoot = await allowedReadRoot(
+              message.nodeEnvironment.buildPython.root,
+              "Node build Python root",
+            );
+            const pythonExecutable = await realpath(
+              String(message.nodeEnvironment.buildPython.executable),
+            );
+            if (!within(pythonRoot, pythonExecutable))
+              throw Error("Sandbox broker Node build Python is outside its runtime root");
+            buildPython = {
+              root: pythonRoot,
+              executable: pythonExecutable,
+              version: String(message.nodeEnvironment.buildPython.version),
+            };
+            additionalReadRoots.push(pythonRoot);
+          }
+          nodeEnvironment = {
+            root,
+            binPath,
+            executable,
+            version: String(message.nodeEnvironment.version),
+            buildPython,
+          };
+          additionalReadRoots.push(root);
+          pythonEnvironment.PATH = `${binPath}${delimiter}${pythonEnvironment.PATH ?? ""}`;
+        }
+        const additionalEnvironment: NodeJS.ProcessEnv =
+          typeof message.additionalEnvironment?.OPENROUTER_API_KEY === "string"
+            ? { OPENROUTER_API_KEY: message.additionalEnvironment.OPENROUTER_API_KEY } : {};
+        if (nodeEnvironment?.buildPython) {
+          additionalEnvironment.PYTHON = nodeEnvironment.buildPython.executable;
+          additionalEnvironment.npm_config_python = nodeEnvironment.buildPython.executable;
+        }
         const result = await command(
           cwd,
           String(message.cmd),
@@ -336,8 +410,9 @@ async function sandboxBroker(
           pythonEnvironment,
           !!message.dependencyBootstrap,
           typeof message.nodeProjectRoot === "string" ? message.nodeProjectRoot : ".",
-          typeof message.additionalEnvironment?.OPENROUTER_API_KEY === "string"
-            ? { OPENROUTER_API_KEY: message.additionalEnvironment.OPENROUTER_API_KEY } : {},
+          additionalEnvironment,
+          writableRuntimeRoots,
+          [...new Set(additionalReadRoots)],
         );
         client.end(JSON.stringify({ result }));
       } catch (error) {
@@ -373,6 +448,8 @@ export async function command(
   dependencyBootstrap = false,
   nodeProjectRoot = ".",
   additionalEnvironment: NodeJS.ProcessEnv = {},
+  writableRuntimeRoots: string[] = [],
+  additionalReadRoots: string[] = [],
 ): Promise<CommandResult> {
   const dependencyBridges =
     inheritedBridges ?? (await dependenciesForWorkspace(cwd));
@@ -393,7 +470,8 @@ export async function command(
       (copy, remaining) =>
         command(copy, cmd, remaining, readOnly, undefined, dependencyBridges,
           strictPythonEnvironment, pythonSourceRoot, effectivePythonEnvironment,
-          dependencyBootstrap, nodeProjectRoot, additionalEnvironment),
+          dependencyBootstrap, nodeProjectRoot, additionalEnvironment, writableRuntimeRoots,
+          additionalReadRoots),
       timeoutMs,
     );
   const brokered = await brokeredCommand(
@@ -409,10 +487,23 @@ export async function command(
     dependencyBootstrap,
     nodeProjectRoot,
     additionalEnvironment,
+    registeredNode,
+    writableRuntimeRoots,
+    additionalReadRoots,
   );
   if (brokered) return brokered;
   const start = Date.now();
   cwd = await realpath(cwd);
+  const externalWritableRoots: string[] = [];
+  const systemTemporaryRoots = [...new Set(await Promise.all(
+    [tmpdir(), "/tmp"].map((root) => realpath(root)),
+  ))];
+  for (const candidate of writableRuntimeRoots) {
+    const root = await realpath(candidate);
+    if (!systemTemporaryRoots.some((temporaryRoot) => within(temporaryRoot, root)))
+      throw Error("Writable runtime root must be inside the system temporary directory");
+    externalWritableRoots.push(root);
+  }
   const { unavailable: pythonUnavailable, readRoots: pythonReadRoots,
     interpreter: pythonInterpreter, ...pythonEnvironment } =
     await pythonSandboxEnvironment(cwd, effectivePythonEnvironment,
@@ -425,6 +516,7 @@ export async function command(
   const runtimeReadRoots = [...new Set([
     ...pythonReadRoots,
     hostNodeRoot,
+    ...await Promise.all(additionalReadRoots.map((root) => realpath(root))),
     ...(registeredNode ? [registeredNode.root] : []),
     ...(registeredNode?.buildPython ? [registeredNode.buildPython.root] : []),
   ])];
@@ -546,8 +638,9 @@ export async function command(
     const dependencyWriteDenials = activeBridges
       .map((bridge) => `(deny file-write* (subpath ${q(bridge.sourcePath)}))`)
       .join("");
-    const readable = `(require-any ${ancestors.join(" ")} (literal "/") (subpath "/System") (subpath "/Library") (subpath "/usr") (subpath "/bin") (subpath "/sbin") (subpath "/opt") (subpath "/private/etc") (subpath "/private/var/db") (subpath "/dev") (subpath ${q(cwd)}) (subpath ${q(scratch)}) ${dependencyReads})`;
-    const writable = `(require-any (literal "/dev/null") (subpath ${q(scratch)}) ${readOnly ? "" : `(subpath ${q(cwd)})`})`;
+    const runtimeWrites = externalWritableRoots.map((root) => `(subpath ${q(root)})`).join(" ");
+    const readable = `(require-any ${ancestors.join(" ")} (literal "/") (subpath "/System") (subpath "/Library") (subpath "/usr") (subpath "/bin") (subpath "/sbin") (subpath "/opt") (subpath "/private/etc") (subpath "/private/var/db") (subpath "/dev") (subpath ${q(cwd)}) (subpath ${q(scratch)}) ${dependencyReads} ${runtimeWrites})`;
+    const writable = `(require-any (literal "/dev/null") (subpath ${q(scratch)}) ${runtimeWrites} ${readOnly ? "" : `(subpath ${q(cwd)})`})`;
     const localNetwork = `(require-any (prefix ${q(scratch + "/")}) (local ip "localhost:*"))`;
     const localOutbound = `(require-any (prefix ${q(scratch + "/")}) (remote ip "localhost:*"))`;
     const networkPolicy = dependencyBootstrap ? "" :
@@ -567,7 +660,7 @@ export async function command(
       "/proc",
       "--dev",
       "/dev",
-      ...linuxTemporaryMountArguments(cwd, scratch, runtimeReadRoots),
+      ...linuxTemporaryMountArguments(cwd, scratch, [...runtimeReadRoots, ...externalWritableRoots]),
     ];
     for (const p of ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/opt"])
       args.push("--ro-bind-try", p, p);
@@ -587,6 +680,7 @@ export async function command(
     for (const bridge of activeBridges)
       args.push("--ro-bind", bridge.sourcePath, bridge.targetPath);
     for (const root of runtimeReadRoots) args.push("--ro-bind", root, root);
+    for (const root of externalWritableRoots) args.push("--bind", root, root);
     args.push("--chdir", cwd, "/bin/sh", "-c", resolvedCommand);
   } else
     throw Error(
@@ -599,7 +693,7 @@ export async function command(
       closeBroker = await sandboxBroker(
         brokerSocket,
         brokerToken!,
-        [cwd, scratch, ...runtimeReadRoots],
+        [cwd, scratch, ...runtimeReadRoots, ...externalWritableRoots],
         activeBridges,
         start + timeoutMs,
       );

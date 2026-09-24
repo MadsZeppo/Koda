@@ -3,8 +3,10 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { Config } from "../config.js";
 import type { Catalog } from "../openrouter/catalog.js";
-import type { Metadata, PoolModel } from "./pool.js";
+import { supportsParameters, type Metadata, type PoolModel } from "./pool.js";
 import type { TaskFingerprint } from "./taskFingerprint.js";
+import { RoutingKnowledgeStore } from "./knowledge/store.js";
+import type { ModelRoutingKnowledge, ProviderCapabilityMetric, RoutingKnowledgeObservation } from "./knowledge/schema.js";
 
 export interface SpecialistEvidence {
   source: "configured_prior" | "coding_benchmark" | "agentic_benchmark" | "reasoning_benchmark" | "terminal_benchmark" | "design_benchmark" | "task_market" | "verified_history";
@@ -22,6 +24,7 @@ export interface SpecialistModel {
   vision: boolean;
   evidence: SpecialistEvidence[];
   capabilityEvidence?: NormalizedCapabilityEvidence[];
+  knowledge?: ModelRoutingKnowledge;
   configured: boolean;
 }
 export interface ModelSnapshot { models: any[]; benchmarks: any[]; classifications: any[]; retrievedAt: number; baseUrl: string }
@@ -56,11 +59,15 @@ const marketPattern = (primary: TaskFingerprint["primary"]) => ({
 /** Free, cached OpenRouter metadata only. Missing metadata never creates a priced candidate. */
 export class CapabilityRegistry {
   private pending?: Promise<SpecialistModel[]>;
+  private refreshStarted = false;
+  private readonly knowledge: RoutingKnowledgeStore;
   constructor(
     readonly config: Config,
     readonly catalog: Catalog,
     readonly adapter?: ModelDiscoveryAdapter,
-  ) {}
+    knowledgeDirectory?: string,
+  ) { this.knowledge = new RoutingKnowledgeStore(undefined,
+    knowledgeDirectory ?? config.routing.stateDirectory); }
   all() { return this.load(); }
   forTask(fingerprint: TaskFingerprint) {
     // The raw snapshot is shared; task-specific market evidence is computed per subtask.
@@ -182,8 +189,15 @@ export class CapabilityRegistry {
     }
   }
   private async load(): Promise<SpecialistModel[]> {
-    if (!this.pending) this.pending = (this.adapter ? this.cachedSnapshot() : this.fetchSnapshot(false))
-      .then((snapshot) => this.build(snapshot));
+    if (!this.pending) {
+      // Routing never waits for catalog research. Use the last-known-good
+      // snapshot immediately and refresh it opportunistically for later tasks.
+      this.pending = this.cachedSnapshot().then((snapshot) => this.build(snapshot));
+      if (!this.adapter && process.env.OPENROUTER_API_KEY && !this.refreshStarted) {
+        this.refreshStarted = true;
+        void this.refresh().catch(() => undefined);
+      }
+    }
     return this.pending;
   }
   private async build(snapshot: ModelSnapshot) {
@@ -260,7 +274,27 @@ export class CapabilityRegistry {
           : 0.78 + 0.18 * clamp((coding ?? agentic ?? reasoning ?? terminal!) / 100),
         latencyPriorMs: 5000,
       };
-      result.push({ model, metadata, vision, evidence, capabilityEvidence, configured: !!existing });
+      const baseKnowledge = this.knowledge.forModel(id);
+      const snapshotDate = new Date(snapshot.retrievedAt || 0).toISOString().slice(0, 10);
+      const providerRows: RoutingKnowledgeObservation[] = [];
+      const providerFact = (metric: ProviderCapabilityMetric, value: number,
+        unit: RoutingKnowledgeObservation["unit"]) => providerRows.push({
+        id: `provider-${id}-${metric}`, category: "provider_capability", source: "provider metadata cache",
+        sourceDate: snapshotDate, snapshotDate, displayModel: id, canonicalModelId: id,
+        metric, value, unit, freshnessDays: Math.ceil(this.config.routing.cacheTtlMs / 86_400_000),
+      });
+      if (metadata.contextLength !== undefined) providerFact("context_tokens", metadata.contextLength, "tokens");
+      if (metadata.inputPrice !== undefined) providerFact("input_price_per_million", metadata.inputPrice, "usd");
+      if (metadata.outputPrice !== undefined) providerFact("output_price_per_million", metadata.outputPrice, "usd");
+      if (metadata.supportedParameters?.includes("tools")) providerFact("tools_supported", 1, "ratio");
+      if ((metadata.supportedParameters || metadata.routableParameterSets) &&
+          supportsParameters(metadata, ["tools", "tool_choice"])) providerFact("tool_choice_supported", 1, "ratio");
+      providerFact("availability", metadata.available === false ? 0 : 1, "ratio");
+      providerFact("text_modality", 1, "ratio");
+      if (vision) providerFact("vision_modality", 1, "ratio");
+      result.push({ model, metadata, vision, evidence, capabilityEvidence,
+        knowledge: { snapshotId: baseKnowledge.snapshotId,
+          observations: [...baseKnowledge.observations, ...providerRows] }, configured: !!existing });
       if (source) dynamic.push([id, metadata]);
     }
     this.catalog.addDynamic(dynamic);

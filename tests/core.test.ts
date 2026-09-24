@@ -289,7 +289,7 @@ test("usage retains exact charged cost and all cache counters", () => {
   assert.equal(u.reasoningTokens, 4);
   assert.equal(parseUsage({}).costUsd, null);
 });
-test("budget reserves concurrent requests, enforces tokens/time, and fails closed on unknown cost", () => {
+test("budget reserves concurrent requests, enforces tokens/time, and bounds unknown cost", () => {
   const b = new Budget(1, 100, 1000);
   const release = b.reserve(0.7, 60);
   assert.throws(() => b.reserve(0.4, 10));
@@ -297,8 +297,24 @@ test("budget reserves concurrent requests, enforces tokens/time, and fails close
   release(parseUsage({ prompt_tokens: 10, completion_tokens: 10, cost: 0.2 }));
   assert.equal(b.spent, 0.2);
   b.reserve(0.1, 10)();
-  assert.throws(() => b.reserve(0.1, 1));
+  assert.equal(b.unknown, false);
+  assert.throws(() => b.reserve(0.8, 1), /USD budget exhausted/);
   assert.throws(() => new Budget(1, 100, -1).reserve(0.1, 1));
+});
+test("bounded uncertain provider failure consumes its reservation without poisoning fallback", () => {
+  const budget = new Budget(1, 100, 1000);
+  const first = budget.reserve(0.4, 40);
+  first.settleUncertain();
+  assert.equal(budget.spent, 0.4);
+  assert.equal(budget.tokens, 40);
+  assert.equal(budget.unknown, false);
+  const second = budget.reserve(0.6, 60);
+  assert.throws(() => budget.reserve(0.001, 1));
+  second.settle(parseUsage({ prompt_tokens: 20, completion_tokens: 10, cost: 0.2 }));
+  assert.ok(Math.abs(budget.spent - 0.6) < 1e-9);
+  assert.equal(budget.tokens, 70);
+  assert.equal(budget.reserved, 0);
+  assert.equal(budget.reservedTokens, 0);
 });
 test("worktrees isolate writes, produce commits, and clean up without modifying original checkout", async () => {
   const repo = await fixture();
@@ -517,6 +533,10 @@ const good=await command(fixture,'echo nested > result.txt');
 if(good.exitCode!==0||(await readFile(join(fixture,'result.txt'),'utf8'))!=='nested\\n') process.exit(2);
 const escape=await command(fixture,'echo escaped > ../outside.txt');
 if(escape.exitCode===0) process.exit(3);
+const runtime=await mkdtemp(join(process.env.TMPDIR,'runtime-'));
+const runtimeCommand='echo runtime > '+JSON.stringify(join(runtime,'state.txt'));
+const runtimeWrite=await command(fixture,runtimeCommand,5000,false,undefined,undefined,false,undefined,process.env,false,'.',{},[runtime]);
+if(runtimeWrite.exitCode!==0||(await readFile(join(runtime,'state.txt'),'utf8'))!=='runtime\\n') process.exit(4);
 console.log('NESTED_SANDBOX_OK');
 `;
     const encoded = Buffer.from(script).toString("base64");

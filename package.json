@@ -10,6 +10,12 @@
   "scripts": {
     "agent": "tsx src/cli.ts",
     "calibrate:model": "tsx src/cli.ts calibrate-model",
+    "routing:sync-evidence": "tsx src/cli.ts routing-sync-evidence",
+    "routing:prepare-coderouterbench": "tsx src/cli.ts routing-prepare-coderouterbench",
+    "routing:prepare-swe-rebench": "tsx src/cli.ts routing-prepare-swe-rebench",
+    "routing:refresh-catalog": "tsx src/cli.ts routing-refresh-catalog",
+    "routing:build-knowledge": "tsx src/cli.ts routing-build-knowledge",
+    "routing:evidence-report": "tsx src/cli.ts routing-evidence-report",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",

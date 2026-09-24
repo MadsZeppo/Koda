@@ -8,8 +8,24 @@ import { History, attributableCodingFailure } from "./history.js";
 import { historyMatches, taskBucket, type Features } from "./features.js";
 import { type PoolModel, type Metadata, supportsParameters } from "./pool.js";
 import { CapabilityRegistry, type ModelDiscoveryAdapter } from "./capabilityRegistry.js";
-import { optimizeSpecialists } from "./routeOptimizer.js";
+import { optimizeSpecialists, type SpecialistEstimate } from "./routeOptimizer.js";
 import type { TaskFingerprint } from "./taskFingerprint.js";
+import { activeModelBoard, chooseAdaptiveRecovery, freezeExecutionPolicy,
+  requiredQualityClass, type FrozenExecutionPolicy, type RecoveryObservation } from "./controlPolicy.js";
+export const routerStateDirectory = (config: Config) => config.routing.stateDirectory ??
+  join(homedir(), ".koda", "model-router",
+    createHash("sha256").update(config.baseUrl).digest("hex").slice(0, 12));
+export interface FrozenExecutionPlan extends FrozenExecutionPolicy<SpecialistEstimate> {
+  readonly type: "single" | "cascade";
+  readonly initialCandidate: SpecialistEstimate;
+  readonly evidenceClass: SpecialistEstimate["evidenceLevel"];
+  readonly conservativeQuality: number;
+  readonly expectedCostPerVerifiedSolve: number;
+  readonly expectedLatencyMs: number;
+  readonly whySelected: string;
+  readonly verificationStrength: TaskFingerprint["verificationStrength"];
+  readonly stopConditions: readonly string[];
+}
 export interface Candidate {
   model: PoolModel;
   metadata: Metadata;
@@ -128,20 +144,14 @@ export class PoolRouter {
   readonly capabilities: CapabilityRegistry;
   readonly disabled = new Set<string>();
   private readonly raceSelections = new Map<string, Set<string>>();
+  private readonly raceRoutingLocks = new Map<string, Promise<void>>();
   constructor(
     readonly config: Config,
     readonly logger: Logger,
     adapter?: ModelDiscoveryAdapter,
     private readonly remainingBudget: () => number = () => config.budgetUsd,
   ) {
-    const dir =
-      config.routing.stateDirectory ??
-      join(
-        homedir(),
-        ".koda",
-        "model-router",
-        createHash("sha256").update(config.baseUrl).digest("hex").slice(0, 12),
-      );
+    const dir = routerStateDirectory(config);
     this.catalog = new Catalog(
       config.baseUrl,
       dir,
@@ -149,18 +159,38 @@ export class PoolRouter {
       config.modelPool!.models,
     );
     this.history = new History(dir);
-    this.capabilities = new CapabilityRegistry(config, this.catalog, adapter);
+    this.capabilities = new CapabilityRegistry(config, this.catalog, adapter, dir);
   }
-  async selectSpecialist(
+  async selectExecutionPlan(
     fingerprint: TaskFingerprint,
     features: Features,
     subtaskId: string,
     budgetUsd: number,
     raceGroup?: string,
-  ) {
+    lockHeld = false,
+  ): Promise<FrozenExecutionPlan> {
+    if (raceGroup && !lockHeld) {
+      const prior = this.raceRoutingLocks.get(raceGroup) ?? Promise.resolve();
+      let release!: () => void;
+      const current = new Promise<void>((resolve) => { release = resolve; });
+      const queued = prior.then(() => current);
+      this.raceRoutingLocks.set(raceGroup, queued);
+      await prior;
+      try {
+        return await this.selectExecutionPlan(fingerprint, features, subtaskId,
+          budgetUsd, raceGroup, true);
+      } finally {
+        release();
+        if (this.raceRoutingLocks.get(raceGroup) === queued)
+          this.raceRoutingLocks.delete(raceGroup);
+      }
+    }
     // Load the cached/free provider catalog before building specialist
     // candidates so Stable never routes from a model-level parameter union
     // when concrete endpoint protocol evidence is available or required.
+    // Catalog metadata is free provider evidence. Resolve it before building
+    // the task board so a cold process can price and protocol-filter configured
+    // models instead of failing before the first coding attempt.
     await this.catalog.get();
     const models = (await this.capabilities.forTask(fingerprint)).filter(
       (item) => !this.disabled.has(item.model.id),
@@ -171,30 +201,96 @@ export class PoolRouter {
       this.history.readOperations(), reserved,
     );
     const cascade = result.cascade;
+    if (!cascade.length || !result.reference)
+      throw Error("No compatible priced model fits the frozen execution policy");
     if (raceGroup && cascade.length) {
       reserved.add(cascade[0]!.model.id);
       this.raceSelections.set(raceGroup, reserved);
     }
+    const board = activeModelBoard(result.considered, this.config.routing.shortlistSize);
+    const approvedCandidateSet = [...new Map([
+      ...cascade.map((candidate) => [candidate.model.id, candidate] as const),
+      ...board.approved.map((candidate) => [candidate.model.id, candidate] as const),
+    ]).values()].filter((candidate) => !candidate.hardRejection);
+    const planId = `route-${createHash("sha256").update(JSON.stringify({
+      subtaskId, initial: cascade[0]!.model.id,
+      approved: approvedCandidateSet.map((candidate) => candidate.model.id),
+      verification: fingerprint.verificationStrength,
+    })).digest("hex").slice(0, 12)}`;
+    const qualityClass = requiredQualityClass(fingerprint);
+    const requiredQuality = Math.max(0.05,
+      result.reference.conservativeQuality - result.allowedRegret);
+    const planType: FrozenExecutionPlan["type"] = cascade.length > 1 ? "cascade" : "single";
+    const plan = freezeExecutionPolicy({
+      id: planId,
+      type: planType,
+      taskFingerprint: fingerprint,
+      qualityClass,
+      requiredQuality: Number(requiredQuality.toFixed(3)),
+      approvedCandidateSet,
+      activeBoard: board.board,
+      referenceModel: result.reference.model.id,
+      initialModel: cascade[0]!.model.id,
+      initialCandidate: cascade[0]!,
+      evidenceClass: cascade[0]!.evidenceLevel,
+      conservativeQuality: Number((result.selectedPlan?.conservativeFinalSuccess ??
+        cascade[0]!.conservativeQuality).toFixed(3)),
+      expectedCostPerVerifiedSolve: result.selectedPlan?.costPerVerifiedCompletion ??
+        cascade[0]!.expectedCompletionCost / Math.max(0.05, cascade[0]!.conservativeQuality),
+      expectedLatencyMs: result.selectedPlan?.expectedCompletionLatencyMs ??
+        cascade[0]!.expectedCompletionLatencyMs,
+      whySelected: result.selectedPlan?.reason ?? result.reason,
+      totalBudgetUsd: budgetUsd,
+      latencyBudgetMs: this.config.stageMaxMinutes * 60_000,
+      maxCodingAttempts: Math.min(this.config.maxIterations, 3, approvedCandidateSet.length),
+      maxScoutCalls: fingerprint.localizationConfidence === "low" ? 1 : 0,
+      providerConstraints: {
+        requiredParameters: fingerprint.executionStrategy === "stable"
+          ? ["tools", "tool_choice"] : ["tools"],
+        sessionSticky: true,
+      },
+      writeScopes: Object.freeze([...features.likelyWritePaths]),
+      verificationContract: {
+        strength: fingerprint.verificationStrength,
+        targeted: fingerprint.targetedExecutableVerification === true,
+        broaderProject: fingerprint.broaderProjectVerification === true,
+      },
+      verificationStrength: fingerprint.verificationStrength,
+      stopConditions: Object.freeze(["verified", "budget exhausted", "plan exhausted"]),
+    });
     this.logger.log("specialist_route", {
       subtaskId, fingerprint, reason: result.reason,
+      selected_plan_id: plan.id,
+      selected_plan_type: plan.type,
       verification_strength: fingerprint.verificationStrength,
+      quality_class: qualityClass,
+      required_quality: Number(requiredQuality.toFixed(3)),
+      model_evidence_class: cascade[0]?.evidenceLevel ?? "UNKNOWN",
+      approved_recovery_candidates: approvedCandidateSet.slice(1).map((candidate) => candidate.model.id),
+      active_model_board: board.board.map((entry) => ({
+        model: entry.candidate.model.id, lifecycle: entry.lifecycle, reason: entry.reason,
+      })),
       allowed_quality_regret: result.allowedRegret,
       first_attempt_quality_floor: result.considered[0]?.firstAttemptQualityFloor ?? this.config.routing.minimumQuality,
       reference_model: result.reference?.model.id ?? null,
-      reference_expected_success: result.reference?.quality ?? null,
-      reference_conservative_success: result.reference?.conservativeQuality ?? null,
+      reference_expected_success: result.reference ? Number(result.reference.quality.toFixed(3)) : null,
+      reference_conservative_success: result.reference ? Number(result.reference.conservativeQuality.toFixed(3)) : null,
       reference_plan: result.referencePlan ?? null,
       reference_expected_cost_usd: result.referencePlan?.expectedCompletionCost ?? null,
       reference_expected_latency_ms: result.referencePlan?.expectedCompletionLatencyMs ?? null,
       selected_model: cascade[0]?.model.id ?? null,
       selected_plan: result.selectedPlan ?? null,
-      expected_standalone_success: result.selectedPlan?.expectedStandaloneSuccess ?? null,
-      expected_final_success: result.selectedPlan?.expectedFinalSuccess ?? null,
+      expected_standalone_success: result.selectedPlan ? Number(result.selectedPlan.expectedStandaloneSuccess.toFixed(3)) : null,
+      expected_final_success: result.selectedPlan ? Number(result.selectedPlan.expectedFinalSuccess.toFixed(3)) : null,
+      conservative_quality: result.selectedPlan ? Number(result.selectedPlan.conservativeFinalSuccess.toFixed(3)) : null,
+      estimated_cost_per_verified_solve: result.selectedPlan?.costPerVerifiedCompletion ?? null,
+      why_selected: result.selectedPlan?.reason ?? result.reason,
       expected_completion_cost_usd: result.selectedPlan?.expectedCompletionCost ?? null,
       expected_completion_latency_ms: result.selectedPlan?.expectedCompletionLatencyMs ?? null,
+      expected_completion_latency_p50_ms: result.selectedPlan?.completionLatencyP50Ms ?? null,
+      expected_completion_latency_p90_ms: result.selectedPlan?.completionLatencyP90Ms ?? null,
       quality_gap: result.selectedPlan?.qualityGap ?? null,
       plans: result.plans,
-      fallback_chain: cascade.map((candidate) => candidate.model.id),
       candidates: result.considered.map((candidate) => ({
         id: candidate.model.id,
         rejected: candidate.rejected,
@@ -211,6 +307,15 @@ export class PoolRouter {
         call_cost_usd: Number.isFinite(candidate.cost) ? candidate.cost : null,
         expected_completion_cost_usd: Number.isFinite(candidate.expectedCompletionCost) ? candidate.expectedCompletionCost : null,
         expected_completion_latency_ms: Number.isFinite(candidate.expectedCompletionLatencyMs) ? candidate.expectedCompletionLatencyMs : null,
+        expected_input_tokens: candidate.expectedInputTokens,
+        expected_output_tokens: candidate.expectedOutputTokens,
+        expected_total_tokens: candidate.expectedTotalTokens,
+        token_efficiency: candidate.tokenEfficiency,
+        conservative_attempt_cost_usd: Number.isFinite(candidate.conservativeAttemptCost) ? candidate.conservativeAttemptCost : null,
+        knowledge_sources: candidate.knowledgeSources,
+        evidence_level: candidate.evidenceLevel,
+        observation_count: candidate.observationCount,
+        evidence_freshness: candidate.evidenceFreshness,
         latency_ms: candidate.latency,
         call_count: candidate.callCount,
         latency_ewma_ms: candidate.latencyEwmaMs,
@@ -222,7 +327,36 @@ export class PoolRouter {
         capability_evidence: models.find((item) => item.model.id === candidate.model.id)?.capabilityEvidence ?? [],
       })),
     });
-    return cascade;
+    return plan;
+  }
+  selectRecoveryCandidate(plan: FrozenExecutionPlan, observation: RecoveryObservation,
+    attempted: ReadonlySet<string>) {
+    const selected = chooseAdaptiveRecovery(plan, observation, attempted);
+    this.logger.log("adaptive_recovery_decision", {
+      previous_model: observation.previousModel,
+      failure_mode: observation.failureMode,
+      failure_phase: observation.failurePhase,
+      trajectory_summary: observation,
+      recovery_model: selected?.model.id ?? null,
+      why_recovery_selected: selected
+        ? "best frozen-board candidate for observed failure state"
+        : "frozen policy exhausted",
+      approved_recovery_candidates: plan.approvedCandidateSet.map((candidate) => candidate.model.id),
+    });
+    return selected;
+  }
+  async selectSpecialist(
+    fingerprint: TaskFingerprint,
+    features: Features,
+    subtaskId: string,
+    budgetUsd: number,
+    raceGroup?: string,
+  ) {
+    const plan = await this.selectExecutionPlan(
+      fingerprint, features, subtaskId, budgetUsd, raceGroup,
+    );
+    return [plan.initialCandidate, ...plan.approvedCandidateSet.filter((candidate) =>
+      candidate.model.id !== plan.initialModel)];
   }
   recordServed(
     features: Features,
@@ -259,6 +393,7 @@ export class PoolRouter {
     previous?: PoolModel,
     fallback = false,
     raceGroup?: string,
+    routeLimits?: { budgetUsd?: number; inputTokens?: number; outputTokens?: number },
   ) {
     const discovered = this.config.specialistRouting
       ? await this.capabilities.all() : undefined;
@@ -282,9 +417,9 @@ export class PoolRouter {
       this.history.read(),
       features,
       this.config.routing,
-      features.contextBytes + 256,
-      this.config.maxOutputTokens,
-      { budgetUsd: this.remainingBudget(), excluded: blocked },
+      routeLimits?.inputTokens ?? features.contextBytes + 256,
+      routeLimits?.outputTokens ?? this.config.maxOutputTokens,
+      { budgetUsd: Math.min(this.remainingBudget(), routeLimits?.budgetUsd ?? Infinity), excluded: blocked },
     );
     // Forced evaluations still respect execution constraints, including budget.
     const selected = considered.find((candidate) => !candidate.hardRejection &&
@@ -383,6 +518,12 @@ export class PoolRouter {
           e.modelRequested === model.id,
       );
     if (!calls.length) return;
+    const prediction = [...this.logger.events].reverse().find((event) =>
+      event.type === "specialist_route" && event.subtaskId === subtaskId &&
+      event.selected_model === model.id);
+    const worker = [...this.logger.events].reverse().find((event) =>
+      event.type === "coding_worker_stop" && event.subtaskId === subtaskId &&
+      event.model === model.id);
     const record = {
       timestamp: new Date().toISOString(),
       runId: this.logger.runId,
@@ -395,6 +536,8 @@ export class PoolRouter {
       wallClockMs: calls.reduce((n, c) => n + c.wallClockMs, 0),
       inputTokens: calls.reduce((n, c) => n + c.promptTokens, 0),
       outputTokens: calls.reduce((n, c) => n + c.completionTokens, 0),
+      cachedTokens: calls.reduce((n, c) => n + (c.cachedTokens ?? 0), 0),
+      cacheWriteTokens: calls.reduce((n, c) => n + (c.cacheWriteTokens ?? 0), 0),
       costUsd: calls.some((c) => c.costUsd === null)
         ? null
         : calls.reduce((n, c) => n + c.costUsd, 0),
@@ -402,8 +545,47 @@ export class PoolRouter {
       reason,
       failureAttribution: verification === "FAILED" && reason === "focused_verification_failed"
         ? "verified_patch_regression" as const : undefined,
+      modelKnowledgeVersion: 1,
+      planId: prediction?.selected_plan_id,
+      nodeId: subtaskId,
+      verificationStrength: fingerprint?.verificationStrength,
+      predictedQuality: prediction?.expected_final_success,
+      predictedTokens: prediction?.candidates?.find((candidate: any) =>
+        candidate.id === model.id)?.expected_total_tokens,
+      predictedCostUsd: prediction?.expected_completion_cost_usd,
+      predictedLatencyP50Ms: prediction?.expected_completion_latency_p50_ms,
+      predictedLatencyP90Ms: prediction?.expected_completion_latency_p90_ms,
+      turns: worker?.turns ?? worker?.steps,
+      changedPaths: worker?.actual_changed_paths,
+      terminationReason: worker?.termination_reason,
+      failurePhase: worker?.progress_phase,
+      progressPhase: worker?.progress_phase,
+      mutationObserved: (worker?.actual_changed_paths?.length ?? 0) > 0,
+      focusedVerification: [...this.logger.events].reverse().find((event) =>
+        event.type === "mini_swe_attempt_verification" &&
+        event.subtaskId === subtaskId && event.model === model.id)?.outcome,
+      timeToFirstMutationMs: worker?.time_to_first_mutation_ms ?? undefined,
+      toolFailures: this.logger.events.slice(since).filter((event) =>
+        event.subtaskId === subtaskId && event.type === "tool_result" &&
+        (event.ok === false || Number(event.exitCode ?? 0) !== 0)).length,
     };
     this.history.record(record);
     this.logger.log("model_attempt", record);
+    if (prediction) this.logger.log("routing_prediction_error", {
+      subtaskId, predicted_model: prediction.selected_model,
+      predicted_cost_usd: prediction.expected_completion_cost_usd,
+      predicted_tokens: prediction.candidates?.find((candidate: any) => candidate.id === model.id)?.expected_total_tokens ?? null,
+      predicted_latency_ms: prediction.expected_completion_latency_ms,
+      predicted_success: prediction.expected_final_success,
+      actual_cost_usd: record.costUsd,
+      actual_input_tokens: record.inputTokens, actual_output_tokens: record.outputTokens,
+      actual_wall_clock_ms: record.wallClockMs, verification_result: verification,
+      failure_attribution: record.failureAttribution ?? (verification === "FAILED" ? "operational_or_unattributed" : null),
+      cost_error_usd: record.costUsd === null || prediction.expected_completion_cost_usd === null
+        ? null : record.costUsd - prediction.expected_completion_cost_usd,
+      token_error: prediction.candidates?.find((candidate: any) => candidate.id === model.id)?.expected_total_tokens == null
+        ? null : record.inputTokens + record.outputTokens - prediction.candidates.find((candidate: any) => candidate.id === model.id).expected_total_tokens,
+      latency_error_ms: prediction.expected_completion_latency_ms == null ? null : record.wallClockMs - prediction.expected_completion_latency_ms,
+    });
   }
 }

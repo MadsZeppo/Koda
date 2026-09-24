@@ -35,13 +35,19 @@ export const poolSchema = z
 export const routingSchema = z
   .object({
     minimumQuality: z.number().min(0).max(1).default(0.9),
-    maxQualityRegret: z.number().min(0).max(0.2).default(0.025),
+    maxQualityRegret: z.number().min(0).max(0.2).default(0.02),
     costWeight: z.number().nonnegative().default(0.55),
     latencyWeight: z.number().nonnegative().default(0.45),
     priorStrength: z.number().positive().default(10),
     plannerCandidates: z.array(z.string()).optional(),
     cacheTtlMs: z.number().positive().default(21600000),
     stateDirectory: z.string().optional(),
+    shortlistSize: z.number().int().min(3).max(20).default(8),
+    researchAbsoluteCapUsd: z.number().nonnegative().max(1).default(0.002),
+    researchBudgetFraction: z.number().nonnegative().max(0.25).default(0.03),
+    researchMaxOutputTokens: z.number().int().min(128).max(1024).default(400),
+    researchTimeoutMs: z.number().int().positive().max(20000).default(12000),
+    conditionalRecoveryMinSamples: z.number().int().min(2).max(50).default(3),
   })
   .refine(
     (r) => r.costWeight + r.latencyWeight > 0,

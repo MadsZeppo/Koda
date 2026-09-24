@@ -52,27 +52,50 @@ export class Budget {
     readonly durationMs: number,
   ) {}
   reserve(cost: number, tokens: number) {
-    if (
-      this.unknown ||
-      this.spent + this.reserved + cost > this.usd ||
-      this.tokens + this.reservedTokens + tokens > this.maxTokens ||
-      Date.now() - this.start >= this.durationMs
-    )
-      throw Error("Run budget exhausted or cost unknown");
+    if (this.unknown) throw Error("Run budget cost is unknown");
+    if (this.spent + this.reserved + cost > this.usd)
+      throw Error("Run USD budget exhausted");
+    if (this.tokens + this.reservedTokens + tokens > this.maxTokens)
+      throw Error("Run token budget exhausted");
+    if (Date.now() - this.start >= this.durationMs)
+      throw Error("Run time budget exhausted");
     this.reserved += cost;
     this.reservedTokens += tokens;
     let released = false;
-    return (usage?: Usage) => {
+    const finish = (mode: "known" | "uncertain" | "cancel", usage?: Usage) => {
       if (released) return;
       released = true;
       this.reserved -= cost;
       this.reservedTokens -= tokens;
-      if (usage) {
-        this.tokens += usage.promptTokens + usage.completionTokens;
-        if (usage.costUsd === null) this.unknown = true;
-        else this.spent += usage.costUsd;
-      } else this.unknown = true;
+      if (mode === "known" && usage) {
+        if (usage.costUsd === null) {
+          // The call was bounded before dispatch. Charge the full reservation
+          // when the provider cannot report usage instead of making every
+          // future reservation unknowable.
+          this.spent += cost;
+          this.tokens += tokens;
+        } else {
+          this.tokens += usage.promptTokens + usage.completionTokens;
+          this.spent += usage.costUsd;
+        }
+      } else if (mode === "uncertain") {
+        // The provider may have started generation without returning usage.
+        // Consume the bounded reservation, preserving safety and allowing a
+        // later attempt to use only the genuinely remaining run budget.
+        this.spent += cost;
+        this.tokens += tokens;
+      }
     };
+    const reservation = ((usage?: Usage) =>
+      finish(usage ? "known" : "uncertain", usage)) as ((usage?: Usage) => void) & {
+        settle: (usage: Usage) => void;
+        settleUncertain: () => void;
+        cancel: () => void;
+      };
+    reservation.settle = (usage) => finish("known", usage);
+    reservation.settleUncertain = () => finish("uncertain");
+    reservation.cancel = () => finish("cancel");
+    return reservation;
   }
   remainingMs() {
     return Math.max(1, this.durationMs - (Date.now() - this.start));

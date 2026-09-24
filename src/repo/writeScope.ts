@@ -33,7 +33,7 @@ export class WriteScope {
             !p ||
             p.startsWith("/") ||
             /[\\\0*?\[\]]/.test(p) ||
-            p.split("/").some((s) => s === ".." || s === ".git")
+            p.split("/").some((s) => s === ".." || s === ".git" || s === ".koda")
           )
             throw Error("Write responsibility requires safe concrete paths");
           return posix.normalize(p).replace(/\/$/, "");
@@ -47,7 +47,7 @@ export class WriteScope {
       !path ||
       path.startsWith("/") ||
       /[\\\0]/.test(path) ||
-      path.split("/").some((s) => s === ".." || s === ".git")
+      path.split("/").some((s) => s === ".." || s === ".git" || s === ".koda")
     )
       return false;
     path = posix.normalize(path);

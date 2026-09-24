@@ -151,7 +151,11 @@ test("missing charged cost settles once from known token prices without becoming
   const reserve = fixture.budget.reserve.bind(fixture.budget);
   (fixture.budget as any).reserve = (cost: number, tokens: number) => {
     const release = reserve(cost, tokens);
-    return (usage: unknown) => { releases++; release(usage as any); };
+    const tracked: any = (usage: unknown) => { releases++; release(usage as any); };
+    tracked.settle = (usage: unknown) => { releases++; release.settle(usage as any); };
+    tracked.settleUncertain = () => { releases++; release.settleUncertain(); };
+    tracked.cancel = () => { releases++; release.cancel(); };
+    return tracked;
   };
   try {
     const message = await fixture.gateway.call("coder", [{ role: "user", content: "code" }],
@@ -181,8 +185,12 @@ test("missing cost without complete token usage fails closed", async () => {
     await assert.rejects(fixture.gateway.call("coder", [{ role: "user", content: "code" }],
       "cost", "implement", 0, undefined, { maxOutputTokens: 20 }),
     /omitted charged cost and usable token counts/);
-    assert.equal(fixture.budget.spent, 0);
-    assert.equal(fixture.budget.unknown, true);
+    assert.ok(fixture.budget.spent > 0,
+      "unknown usage consumes the bounded preflight reservation");
+    assert.equal(fixture.budget.unknown, false,
+      "one bounded provider failure must not poison later candidates");
+    const remaining = fixture.budget.reserve(0.000001, 1);
+    remaining.cancel();
     const call = fixture.logger.events.find((event) => event.type === "model_call");
     assert.equal(call?.outcome, "error");
     assert.equal(call?.costUsd, null);

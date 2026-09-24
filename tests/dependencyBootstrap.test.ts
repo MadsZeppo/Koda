@@ -214,6 +214,7 @@ test("bootstrap enforces repository Node runtime evidence before installation", 
     const profile = await profileRepo(f.target);
     await assert.rejects(bootstrapDependencies(f.source, f.target, profile.ecosystem!, f.logger, {
       cacheBase: f.cache, toolVersions: f.versions,
+      allowRuntimeProvisioning: false,
       runner: async () => { installs++; return { exitCode: 0, stdout: "", stderr: "" }; },
     }), /INFRA_FAILURE.*compatible Node runtime unavailable.*98\.21\.3/);
     assert.equal(installs, 0);

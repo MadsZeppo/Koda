@@ -458,7 +458,24 @@ for (const cheapFails of [false, true])
       if (cheapFails) assert.equal(events.find((event) =>
         event.type === "coding_route_escalation")?.reason, "focused_verification_failed");
       assert.equal(attempts.some((event) => event.reason === "worker ended"), false);
-      assert.equal(events.find((event) => event.type === "coding_route_decision")?.candidate, "cheap");
+      const routeDecision = events.find((event) => event.type === "coding_route_decision");
+      const frozenPlan = events.find((event) => event.type === "specialist_route");
+      assert.equal(routeDecision?.candidate, "cheap");
+      assert.equal(routeDecision?.candidate, frozenPlan?.selected_model,
+        "production first-model selection comes from the frozen V3 plan");
+      assert.equal(routeDecision?.quality_class, frozenPlan?.quality_class);
+      assert.equal(routeDecision?.evidence_class, frozenPlan?.model_evidence_class);
+      assert.equal(routeDecision?.quality_floor, frozenPlan?.required_quality);
+      assert.equal(routeDecision?.conservative_quality,
+        frozenPlan?.conservative_quality);
+      assert.equal(routeDecision?.expected_cost_per_verified_solve,
+        frozenPlan?.selected_plan.costPerVerifiedCompletion);
+      assert.equal(routeDecision?.expected_latency,
+        frozenPlan?.selected_plan.expectedCompletionLatencyMs);
+      assert.equal(typeof routeDecision?.why_selected, "string");
+      assert.ok(Array.isArray(routeDecision?.approved_recovery_candidates));
+      assert.equal("estimated_success" in routeDecision, false);
+      assert.equal("evidence_source" in routeDecision, false);
       if (cheapFails) assert.equal(events.find((event) =>
         event.type === "coding_route_escalation")?.to, "strong");
     } finally {

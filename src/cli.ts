@@ -1,14 +1,83 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
 import { config } from "./config.js";
 import { run } from "./run.js";
 import { benchmark } from "./benchmark.js";
 import { calibrateModels } from "./calibration.js";
 import { applyWorkspaceRun, revertWorkspaceRun } from "./workspace/backend.js";
+import { syncRoutingEvidence } from "./router/knowledge/sync.js";
+import { routerStateDirectory } from "./router/modelRouter.js";
+import { PoolRouter } from "./router/modelRouter.js";
+import { Logger } from "./telemetry/logger.js";
+import { currentIdentityCatalog, currentPricingFromState, evidenceInputPaths, prepareCodeRouterBench,
+  prepareSWERebench } from "./router/knowledge/bootstrap.js";
+import { routingEvidenceReport } from "./router/knowledge/report.js";
 const cli = new Command()
   .name("agent")
   .description("Parallel, evidence-driven local coding agent");
+cli.command("routing-prepare-coderouterbench")
+  .option("--config <path>")
+  .option("--output <path>")
+  .action(async (o) => {
+    const c = await config(o.config), directory = routerStateDirectory(c);
+    const output = resolve(o.output ?? evidenceInputPaths(directory).codeRouterBench);
+    console.log(JSON.stringify(await prepareCodeRouterBench(output), null, 2));
+  });
+cli.command("routing-prepare-swe-rebench")
+  .option("--config <path>")
+  .option("--output <path>")
+  .action(async (o) => {
+    const c = await config(o.config), directory = routerStateDirectory(c);
+    const output = resolve(o.output ?? evidenceInputPaths(directory).sweRebench);
+    console.log(JSON.stringify(await prepareSWERebench(output), null, 2));
+  });
+cli.command("routing-refresh-catalog")
+  .option("--config <path>")
+  .action(async (o) => {
+    const c = await config(o.config), directory = routerStateDirectory(c);
+    const router = new PoolRouter(c, new Logger(join(directory, "catalog-refresh"),
+      `catalog-refresh-${Date.now()}`, true));
+    const catalog = await router.catalog.refresh();
+    const specialists = await router.capabilities.refresh();
+    console.log(JSON.stringify({ directory, catalogModels: catalog.size,
+      specialistModels: specialists.length, refreshedAt: new Date().toISOString() }, null, 2));
+  });
+cli.command("routing-build-knowledge")
+  .option("--config <path>")
+  .option("--output <path>")
+  .action(async (o) => {
+    const c = await config(o.config), directory = routerStateDirectory(c);
+    const inputs = evidenceInputPaths(directory);
+    const output = resolve(o.output ?? join(directory, "routing-knowledge-v2.json"));
+    const snapshot = await syncRoutingEvidence([inputs.codeRouterBench, inputs.sweRebench],
+      output, fetch, new Date().toISOString(), await currentPricingFromState(directory),
+      await currentIdentityCatalog(directory));
+    console.log(JSON.stringify({ output, snapshotId: snapshot.snapshotId,
+      observations: snapshot.observations.length,
+      pairwiseEvidence: snapshot.pairwiseEvidence?.length ?? 0,
+      sources: snapshot.sources }, null, 2));
+  });
+cli.command("routing-evidence-report")
+  .option("--config <path>")
+  .action(async (o) => {
+    const c = await config(o.config);
+    console.log(JSON.stringify(await routingEvidenceReport(routerStateDirectory(c)), null, 2));
+  });
+cli
+  .command("routing-sync-evidence")
+  .requiredOption("--source <locations...>", "local JSON or HTTP evidence source documents")
+  .option("--config <path>")
+  .option("--output <path>")
+  .action(async (o) => {
+    const c = await config(o.config);
+    const output = resolve(o.output ?? join(routerStateDirectory(c), "routing-knowledge-v2.json"));
+    const snapshot = await syncRoutingEvidence(o.source, output);
+    console.log(JSON.stringify({ output, snapshotId: snapshot.snapshotId,
+      observations: snapshot.observations.length,
+      pairwiseEvidence: snapshot.pairwiseEvidence?.length ?? 0,
+      sources: snapshot.sources }, null, 2));
+  });
 cli
   .command("run")
   .requiredOption("--repo <path>")

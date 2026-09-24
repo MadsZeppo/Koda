@@ -135,7 +135,8 @@ async function fixture(mode: Case) {
           }),
           tool("write-regression", "write_file", {
             path: "tests/calc.test.cjs",
-            content: mode === "compiler" || mode === "infrastructure" ? duplicateImport : badAssertion,
+            content: mode === "compiler" ? duplicateImport
+              : mode === "infrastructure" ? goodTest : badAssertion,
           }),
         ],
       };

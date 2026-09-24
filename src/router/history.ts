@@ -21,10 +21,31 @@ export interface Attempt {
   wallClockMs: number;
   inputTokens: number;
   outputTokens: number;
+  cachedTokens?: number;
+  cacheWriteTokens?: number;
   costUsd: number | null;
   escalated: boolean;
   reason?: string;
   failureAttribution?: "verified_patch_regression";
+  modelKnowledgeVersion?: number;
+  planId?: string;
+  nodeId?: string;
+  verificationStrength?: TaskFingerprint["verificationStrength"];
+  predictedQuality?: number;
+  predictedTokens?: number;
+  predictedCostUsd?: number;
+  predictedLatencyP50Ms?: number;
+  predictedLatencyP90Ms?: number;
+  turns?: number;
+  changedPaths?: string[];
+  terminationReason?: string;
+  failurePhase?: string;
+  progressPhase?: string;
+  mutationObserved?: boolean;
+  focusedVerification?: string;
+  timeToFirstMutationMs?: number;
+  toolFailures?: number;
+  operationalFailure?: string;
 }
 /** Legacy FAILED rows lack proof that a candidate patch caused a regression. */
 export const attributableCodingFailure = (row: Attempt) =>
