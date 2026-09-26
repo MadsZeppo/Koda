@@ -66,21 +66,8 @@ export function estimateLatency(priorMs: number, knowledge: ModelRoutingKnowledg
   fp: TaskFingerprint, operations: OperationalCall[]) {
   const rows = relevant((knowledge?.observations ?? []).filter((row) => row.category === "efficiency"), fp);
   const samples = operations.map((row) => row.wallClockMs).filter((n) => n >= 0);
-  const directOneCall = fp.executionStrategy === "direct" &&
-    (fp.scope === "single" || fp.scope === "localized");
-
-  // Public benchmark completion latency can include whole agent trajectories
-  // (multiple turns, tools and verification). That is useful for STABLE and
-  // PLANNED work, but it is not comparable to DIRECT's one structured model
-  // request. For DIRECT, use real Koda request observations when we have them;
-  // otherwise fall back to the model/provider request prior.
-  const publicP50 = metric(rows, "completion_latency_p50_ms");
-  const publicP90 = metric(rows, "completion_latency_p90_ms");
-  const p50 = samples.length >= 3 ? quantile(samples, 0.5)!
-    : directOneCall ? priorMs : publicP50 ?? priorMs;
-  const p90 = samples.length >= 5 ? quantile(samples, 0.9)!
-    : directOneCall ? p50 * 1.8 : publicP90 ?? p50 * 1.8;
+  const p50 = samples.length >= 3 ? quantile(samples, 0.5)! : metric(rows, "completion_latency_p50_ms") ?? priorMs;
+  const p90 = samples.length >= 5 ? quantile(samples, 0.9)! : metric(rows, "completion_latency_p90_ms") ?? p50 * 1.8;
   return { p50, p90, sampleCount: samples.length,
-    confidence: samples.length >= 5 || (!directOneCall && rows.length)
-      ? "medium" as const : "low" as const };
+    confidence: samples.length >= 5 || rows.length ? "medium" as const : "low" as const };
 }

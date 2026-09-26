@@ -1,27 +1,13 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { ROUTING_KNOWLEDGE_V1 } from "./snapshot.js";
-import { modelFamilyKey } from "./identity.js";
-import type { ModelRoutingKnowledge, RoutingKnowledgeObservation, RoutingKnowledgeSnapshot } from "./schema.js";
+import type { ModelRoutingKnowledge, RoutingKnowledgeSnapshot } from "./schema.js";
 
 const valid = (value: any): value is RoutingKnowledgeSnapshot => value &&
   Number.isInteger(value.schemaVersion) && typeof value.snapshotId === "string" &&
   typeof value.createdAt === "string" && Array.isArray(value.observations) &&
   value.observations.every((row: any) => row && typeof row.id === "string" &&
     typeof row.source === "string" && typeof row.metric === "string" && Number.isFinite(row.value));
-
-function transferred(row: RoutingKnowledgeObservation, canonicalModelId: string,
-  family: string): RoutingKnowledgeObservation | undefined {
-  if (row.canonicalModelId === canonicalModelId && row.identityLevel !== "UNKNOWN") return row;
-  const sourceIdentity = row.canonicalModelId ?? row.externalModelName ?? row.displayModel;
-  if (modelFamilyKey(sourceIdentity) !== family) return undefined;
-  return {
-    ...row,
-    id: `${row.id}::family:${canonicalModelId}`,
-    canonicalModelId,
-    identityLevel: "FAMILY_TRANSFER",
-  };
-}
 
 export class RoutingKnowledgeStore {
   readonly snapshot: RoutingKnowledgeSnapshot;
@@ -36,17 +22,10 @@ export class RoutingKnowledgeStore {
     this.snapshot = loaded ?? ROUTING_KNOWLEDGE_V1;
   }
   forModel(canonicalModelId: string): ModelRoutingKnowledge {
-    const family = modelFamilyKey(canonicalModelId);
-    const observations = family
-      ? this.snapshot.observations.flatMap((row) => {
-          const item = transferred(row, canonicalModelId, family);
-          return item ? [item] : [];
-        })
-      : this.snapshot.observations.filter((row) =>
-          row.canonicalModelId === canonicalModelId && row.identityLevel !== "UNKNOWN");
     return {
       snapshotId: this.snapshot.snapshotId,
-      observations,
+      observations: this.snapshot.observations.filter((row) =>
+        row.canonicalModelId === canonicalModelId && row.identityLevel !== "UNKNOWN"),
       pairwiseEvidence: (this.snapshot.pairwiseEvidence ?? []).filter((row) =>
         row.candidateModelId === canonicalModelId || row.referenceModelId === canonicalModelId),
     };

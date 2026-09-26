@@ -533,28 +533,6 @@ export async function implement(
       directFullScope: subtask.id === "stable" && !subtask.parallelSafe &&
         writeScope.paths.length === 1 && writeScope.paths[0] === ".",
       context: workerContext });
-    // DirectEditWorker bypasses Gateway.call, so explicitly feed the one-call
-    // provider outcome into the operational ledger. This calibrates future
-    // DIRECT latency/reliability without contaminating coding-quality history.
-    if (result.engine === "direct-edit" && pool) {
-      pool.history.recordOperation({
-        type: "operational_call",
-        timestamp: new Date().toISOString(),
-        runId: gateway.logger.runId,
-        subtaskId: subtask.id,
-        stage: "implement",
-        taskBucket: taskBucket(features),
-        modelRequested: model!,
-        modelServed: result.exitStatus === "infra_failure" ? null : result.model,
-        provider: null,
-        wallClockMs: result.wallClockMs,
-        outcome: result.exitStatus === "infra_failure" ? "error" : "response",
-        costUsd: result.costUsd ?? null,
-        classification: result.exitStatus === "infra_failure"
-          ? "OPERATIONAL_FAILURE"
-          : undefined,
-      });
-    }
     gateway.logger.log("latency", { subtaskId: subtask.id,
       coding_worker_ms: Date.now() - workerStarted });
     gateway.logger.log("coding_worker_stop", { subtaskId: subtask.id,

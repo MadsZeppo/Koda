@@ -39,7 +39,6 @@ export interface SpecialistEstimate extends Candidate {
   latencyP50Ms: number | null;
   latencyP90Ms: number | null;
   latencySlaPassed: boolean;
-  deadlineFeasible: boolean;
   operationalErrorRate: number;
   rejection?: string;
 }
@@ -97,9 +96,6 @@ const failure = attributableCodingFailure;
 const value = (level: TaskDifficulty[keyof TaskDifficulty]) => level === "high" ? 2 : level === "medium" ? 1 : 0;
 const difficultyDistance = (a: TaskDifficulty, b: TaskDifficulty) =>
   (Object.keys(a) as (keyof TaskDifficulty)[]).reduce((n, key) => n + Math.abs(value(a[key]) - value(b[key])), 0);
-const expectedFiniteLatency = (...values: Array<number | null | undefined>) =>
-  Math.max(...values.filter((value): value is number =>
-    typeof value === "number" && Number.isFinite(value) && value >= 0));
 
 function conditionalRecovery(history: Attempt[], initial: string, rescue: string,
   fp: TaskFingerprint, features: Features) {
@@ -127,43 +123,23 @@ function conditionalRecovery(history: Attempt[], initial: string, rescue: string
 }
 
 /**
- * Local verified history is strongest when it describes the same task shape
- * and the same concrete write target. Cross-file history remains a weak prior
- * only; public routing evidence is responsible for broad cross-repository
- * transfer. This prevents one bad patch in one file from poisoning another
- * localized task while still allowing repeated matching outcomes to calibrate
- * a route quickly.
+ * Learn across repositories and paths. File identity is not evidence of model
+ * ability; task shape, language, execution contract and difficulty are.
  */
 function historyWeight(row: Attempt, current: TaskFingerprint, features: Features): number {
-  if (taskBucket(row.features) !== taskBucket(features)) return 0.005;
+  if (taskBucket(row.features) !== taskBucket(features)) return 0.02;
   const prior = row.fingerprint;
-  if (!prior) return row.features.taskKind === "planning" ? 0 : 0.05;
-  if (prior.primary !== current.primary && prior.taskFamily !== current.taskFamily) return 0.005;
+  if (!prior) return row.features.taskKind === "planning" ? 0 : 0.08;
+  if (prior.primary !== current.primary && prior.taskFamily !== current.taskFamily) return 0.08;
 
-  const priorPaths = new Set(row.features.likelyWritePaths);
-  const currentPaths = features.likelyWritePaths;
-  const hasComparablePaths = priorPaths.size > 0 && currentPaths.length > 0;
-  const pathOverlap = hasComparablePaths && currentPaths.some((path) => priorPaths.has(path));
+  let weight = 0.35;
+  if (prior.taskFamily && prior.taskFamily === current.taskFamily) weight += 0.25;
+  if (prior.executionStrategy === current.executionStrategy) weight += 0.15;
+  if (prior.scope === current.scope) weight += 0.10;
+  if (prior.languages.some((language) => current.languages.includes(language))) weight += 0.10;
   const distance = difficultyDistance(prior.difficulty, current.difficulty);
-
-  // Different concrete targets are deliberately weak local evidence. Public
-  // benchmark knowledge handles generalization across repositories and files.
-  if (hasComparablePaths && !pathOverlap) {
-    if (prior.taskFamily === current.taskFamily &&
-        prior.executionStrategy === current.executionStrategy &&
-        prior.scope === current.scope && distance <= 1 &&
-        prior.languages.some((language) => current.languages.includes(language))) return 0.05;
-    return 0.01;
-  }
-
-  let weight = 0.45;
-  if (prior.taskFamily && prior.taskFamily === current.taskFamily) weight += 0.20;
-  if (prior.executionStrategy === current.executionStrategy) weight += 0.10;
-  if (prior.scope === current.scope) weight += 0.08;
-  if (prior.languages.some((language) => current.languages.includes(language))) weight += 0.07;
-  if (distance === 0) weight += 0.10;
-  else if (distance === 1) weight += 0.04;
-  else if (distance > 2) weight *= 0.5;
+  if (distance === 0) weight += 0.05;
+  else if (distance > 2) weight *= 0.6;
   return Math.max(0.05, Math.min(1, weight));
 }
 
@@ -253,15 +229,6 @@ export function optimizeSpecialists(models: SpecialistModel[], fp: TaskFingerpri
       ? recent.filter((call) => call.outcome === "error").length / (recent.length + 4) : 0;
     const latencySlaPassed = p90 <= POLICY.interactiveP90Ms;
     const latency = ewma * (1 + operationalErrorRate);
-    // A DIRECT model call cannot be a viable initial plan when Koda already
-    // predicts that the request itself will outlive its hard implementation
-    // deadline. Keep this separate from the softer interactive-SLA preference.
-    const implementationTimeout = Number.isFinite(config.modelTimeoutMs?.implementation)
-      ? config.modelTimeoutMs.implementation : Infinity;
-    const attemptTimeout = Number.isFinite(config.codingAttemptTimeoutMs)
-      ? config.codingAttemptTimeoutMs : Infinity;
-    const requestDeadlineMs = Math.min(implementationTimeout, attemptTimeout);
-    const deadlineFeasible = expectedFiniteLatency(latency, p50, p90) <= requestDeadlineMs;
     // Attempts may contain multiple model calls. Learn their token/time totals
     // at current prices; provider errors never enter the quality posterior.
     const measured = weighted.filter(({ row }) => row.inputTokens >= 0 && row.outputTokens >= 0);
@@ -312,38 +279,19 @@ export function optimizeSpecialists(models: SpecialistModel[], fp: TaskFingerpri
       firstAttemptQualityFloor,
       callCount: recent.length, latencyEwmaMs: ewma,
       latencyP50Ms: p50, latencyP90Ms: p90,
-      latencySlaPassed, deadlineFeasible, operationalErrorRate,
+      latencySlaPassed, operationalErrorRate,
     } satisfies SpecialistEstimate;
   });
-  const technicallyEligible = considered.filter((candidate) => !candidate.rejected);
-  // The reference is a quality target, so compute it before the DIRECT
-  // request-deadline gate. This prevents a slow cheap model from lowering the
-  // quality bar merely because it cannot finish inside the configured request.
-  const reference = technicallyEligible.filter((candidate) => !excludedInitial.has(candidate.model.id))
+  const eligible = considered.filter((candidate) => !candidate.rejected);
+  // A reference must itself be executable now. A reserved race participant or
+  // unaffordable model cannot set an impossible quality target for this worker.
+  const reference = eligible.filter((candidate) => !excludedInitial.has(candidate.model.id))
     .sort((a, b) => b.conservativeQuality - a.conservativeQuality || b.quality - a.quality ||
       a.cost - b.cost || a.model.id.localeCompare(b.model.id))[0];
   const highRisk = fp.difficulty.changeRisk === "high" || fp.architectureHeavy ||
     fp.difficulty.architecturalComplexity === "high";
   const allowedRegret = Math.min(config.routing.maxQualityRegret,
     fp.verificationStrength === "weak" ? 0.012 : 0.025) * (highRisk ? 0.5 : 1);
-
-  // A model that Koda predicts will miss the hard implementation request
-  // deadline must not be the first DIRECT attempt when any executable model
-  // can finish inside that deadline. Slow candidates remain part of the
-  // quality reference above, but are removed from the runtime board/cascade.
-  const directDeadlineGuard = fp.executionStrategy === "direct" &&
-    technicallyEligible.some((candidate) => candidate.deadlineFeasible);
-  if (directDeadlineGuard) {
-    for (const candidate of technicallyEligible) {
-      if (candidate.deadlineFeasible) continue;
-      candidate.rejected = candidate.rejection =
-        "predicted model latency exceeds implementation request deadline";
-      candidate.hardRejection = candidate.rejected;
-      candidate.softPenalties = [...candidate.softPenalties ?? [],
-        "request deadline infeasible"];
-    }
-  }
-  const eligible = considered.filter((candidate) => !candidate.rejected);
   // This is a policy gate, not a fabricated probability. Only a targeted
   // executable oracle permits a cheap-first quality cascade. Every accepted
   // candidate still runs the complete final verification contract.
@@ -473,11 +421,8 @@ export function optimizeSpecialists(models: SpecialistModel[], fp: TaskFingerpri
     plansByInitial.set(initial.model.id, alternatives);
   }
   const costFirst = economicalTrial && recoveryCoverage === "targeted" && !highRisk;
-  const interactiveRank = (plan: ExecutionPlanEstimate) =>
-    plan.completionLatencyP90Ms <= POLICY.interactiveP90Ms ? 0 : 1;
   const order = (a: ExecutionPlanEstimate, b: ExecutionPlanEstimate) => costFirst
-    ? interactiveRank(a) - interactiveRank(b) ||
-      a.costPerVerifiedCompletion - b.costPerVerifiedCompletion ||
+    ? a.costPerVerifiedCompletion - b.costPerVerifiedCompletion ||
       a.completionLatencyP90Ms - b.completionLatencyP90Ms ||
       b.conservativeFinalSuccess - a.conservativeFinalSuccess ||
       a.models.join("\0").localeCompare(b.models.join("\0"))

@@ -114,29 +114,12 @@ function localizedRawExcerpt(content: string, task: string, maxBytes: number) {
 }
 
 function boundedReferenceContext(input: CodingWorkerInput, maxBytes: number) {
-  const terms = taskTerms(input.task);
   const files = (input.context?.sourceFiles ?? [])
-    .filter((file) => !input.writeScope.includes(file.path))
-    .map((file, index) => {
-      const lower = file.snippet.toLowerCase();
-      const score = terms.reduce((sum, term) => sum +
-        (lower.includes(term) ? (/[_.-]/.test(term) ? 6 : 3) : 0), 0);
-      return { file, index, score };
-    })
-    .sort((a, b) => b.score - a.score || a.index - b.index);
+    .filter((file) => !input.writeScope.includes(file.path));
   let output = "";
-  for (const { file } of files) {
-    const remaining = maxBytes - Buffer.byteLength(output);
-    if (remaining <= 96) break;
-    const header = `\n\nREFERENCE ${file.path}\n`;
-    const bodyBudget = Math.max(0, remaining - Buffer.byteLength(header));
-    if (bodyBudget <= 0) break;
-    // Re-center each reference on the task vocabulary before truncation. This
-    // keeps named policy fields/symbols in the prompt even when the source
-    // packet itself is larger than DIRECT's reference budget.
-    const body = localizedRawExcerpt(file.snippet, input.task, bodyBudget);
-    const section = header + truncateBytes(body, bodyBudget);
-    if (Buffer.byteLength(section) > remaining) break;
+  for (const file of files) {
+    const section = `\n\nREFERENCE ${file.path}\n${file.snippet}`;
+    if (Buffer.byteLength(output + section) > maxBytes) break;
     output += section;
   }
   return output;
@@ -174,15 +157,9 @@ export class DirectEditWorker implements CodingWorker {
       maxRetries: 0,
       timeout: input.requestTimeoutMs,
     });
-    // DIRECT bypasses Gateway.call, so it must carry the same provider-level
-    // routing contract itself: cheapest provider among endpoints that satisfy
-    // the interactive latency preference. Without this, OpenRouter can pick a
-    // cheap but very slow endpoint and Koda burns the whole request deadline.
     const provider: Record<string, unknown> = {
       require_parameters: true,
       allow_fallbacks: true,
-      sort: { by: "price", partition: "none" },
-      preferred_max_latency: { p90: 3 },
     };
     if (input.promptPricePerMillion !== undefined &&
         input.completionPricePerMillion !== undefined) {
@@ -277,26 +254,11 @@ export class DirectEditWorker implements CodingWorker {
       }
     }
 
-    // DIRECT is a one-call structured patch, so reserving the full global
-    // 4k completion allowance needlessly crowds source grounding out of the
-    // prompt. Keep enough output for a bounded single-file patch and spend the
-    // remaining conservative attempt budget on the target + implementation
-    // references that determine correctness.
-    const maxOutputTokens = Math.max(512, Math.min(
-      input.maxOutputTokens,
-      2048,
-      Math.max(512, Math.floor(input.maxTokens * 0.30)),
-    ));
+    const maxOutputTokens = Math.max(512, Math.min(input.maxOutputTokens, 4096));
     const promptByteBudget = Math.max(2048,
       Math.min(32_000, input.maxTokens - maxOutputTokens - 768));
-    const framingBudget = Math.min(768, Math.floor(promptByteBudget * 0.20));
-    const usablePromptBytes = Math.max(1024, promptByteBudget - framingBudget);
-    const hasReferences = (input.context?.sourceFiles ?? [])
-      .some((file) => !input.writeScope.includes(file.path));
-    const referenceBudget = hasReferences
-      ? Math.min(4096, Math.max(768, Math.floor(usablePromptBytes * 0.30)))
-      : 0;
-    const targetBudget = Math.max(1024, usablePromptBytes - referenceBudget);
+    const targetBudget = Math.max(1536, Math.floor(promptByteBudget * 0.72));
+    const referenceBudget = Math.max(0, promptByteBudget - targetBudget - 1024);
     const targetContext = source === undefined
       ? "[TARGET DOES NOT EXIST YET]"
       : localizedRawExcerpt(source, input.task, targetBudget);
@@ -314,8 +276,6 @@ export class DirectEditWorker implements CodingWorker {
           "The target is already localized. Do not ask for more context and do not describe a plan.",
           "Call submit_direct_edit exactly once.",
           "For an existing target, return the smallest exact unique oldText/newText replacements needed.",
-          "For test edits, mirror the existing helper signatures and neighboring assertion patterns exactly; do not invent APIs, fields, or positional semantics.",
-          "Use REFERENCE excerpts to ground every named policy field or symbol from the task before constructing fixtures.",
           "For a missing target, return createContent only.",
           "Use delete=true only when the task explicitly asks to delete the target.",
           "Do not modify any path except the authorized target.",
@@ -331,19 +291,6 @@ export class DirectEditWorker implements CodingWorker {
     const reservation = this.budget.reserve(input.budgetUsd, input.maxTokens);
     let settled = false;
     const eventStart = this.logger.events.length;
-    this.logger.log("provider_policy", {
-      subtaskId: input.attemptId, stage: "implement", model: input.model,
-      session_id: input.sessionId ?? null,
-      provider: { require_parameters: true, allow_fallbacks: true,
-        sort: { by: "price", partition: "none" }, preferred_max_latency: { p90: 3 },
-        ...(input.promptPricePerMillion !== undefined &&
-            input.completionPricePerMillion !== undefined ? {
-          max_price: { prompt: input.promptPricePerMillion,
-            completion: input.completionPricePerMillion },
-        } : {}) },
-      reasoning_effort: null,
-      worker_engine: "direct-edit",
-    });
     try {
       const response = await this.request(input, messages, maxOutputTokens);
 

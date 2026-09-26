@@ -106,9 +106,8 @@ export function ingestEvidenceSource(input: EvidenceSourceInput, snapshotDate: s
         { sampleSize: binary.length, successes, failures: binary.length - successes });
     }
     const scores = rows.map((row) => row.benchmarkScore).filter(finite);
-    if (scores.length && ["benchmark_prior", "paired_task_model", "agentic_economics"].includes(input.type))
-      add("result_at_1", quantile(scores, .5)!, "ratio",
-        input.type === "benchmark_prior" ? "coding_reasoning" : "agentic_swe",
+    if (input.type === "benchmark_prior" && scores.length)
+      add("result_at_1", quantile(scores, .5)!, "ratio", "coding_reasoning",
         { sampleSize: scores.length, detail: "Comparative prior, not universal success probability" });
     const values = (key: keyof ExternalEvidenceRecord) => rows.map((row) => row[key]).filter(finite);
     for (const [key, metric, unit] of [
