@@ -1,18 +1,32 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { DirectEditWorker, type DirectEditRequester } from "../src/agent/directEditWorker.js";
+import {
+  DirectEditWorker,
+  directEditRequestTimeoutMs,
+  type DirectEditRequester,
+} from "../src/agent/directEditWorker.js";
 import type { CodingWorkerInput } from "../src/agent/codingWorker.js";
 import { Budget } from "../src/openrouter/usage.js";
 import { Logger } from "../src/telemetry/logger.js";
 
-const input = (repoPath: string, target = "tests/controlPolicy.test.ts"): CodingWorkerInput => ({
+const input = (
+  repoPath: string,
+  target = "tests/controlPolicy.test.ts",
+): CodingWorkerInput => ({
   repoPath,
   attemptId: "direct",
-  task: "Add a deterministic regression test proving recovery stops when maxCodingAttempts is reached.",
+  task:
+    "Add a deterministic regression test proving recovery stops when maxCodingAttempts is reached.",
   model: "vendor/direct-model",
   budgetUsd: 0.05,
   maxTokens: 12_000,
@@ -24,16 +38,27 @@ const input = (repoPath: string, target = "tests/controlPolicy.test.ts"): Coding
   maxToolOutputBytes: 4_000,
   promptPricePerMillion: 1,
   completionPricePerMillion: 2,
-  baseUrl: "https://openrouter.ai/api/v1",
-  sessionId: "run/direct/vendor-direct-model",
+  baseUrl:
+    "https://openrouter.ai/api/v1",
+  sessionId:
+    "run/direct/vendor-direct-model",
   writeScope: [target],
   returnOnMutation: true,
   context: {
-    relevantFiles: [target, "src/router/controlPolicy.ts"],
-    sourceFiles: [{
-      path: "src/router/controlPolicy.ts",
-      snippet: "export function chooseAdaptiveRecovery(policy, attempted) {\n  if (attempted.size >= policy.maxCodingAttempts) return undefined;\n}",
-    }],
+    relevantFiles: [
+      target,
+      "src/router/controlPolicy.ts",
+    ],
+    sourceFiles: [
+      {
+        path:
+          "src/router/controlPolicy.ts",
+        snippet:
+          "export function chooseAdaptiveRecovery(policy, attempted) {\n" +
+          "  if (attempted.size >= policy.maxCodingAttempts) return undefined;\n" +
+          "}\n",
+      },
+    ],
   },
 });
 
@@ -41,216 +66,990 @@ const usage = {
   prompt_tokens: 120,
   completion_tokens: 60,
   cost: 0.001,
-  prompt_tokens_details: { cached_tokens: 20 },
+  prompt_tokens_details: {
+    cached_tokens: 20,
+  },
 };
 
-test("DIRECT edit worker performs one structured call, mutates only the locked target and returns immediately", async () => {
-  const root = await mkdtemp(join(tmpdir(), "koda-direct-edit-"));
-  const logs = await mkdtemp(join(tmpdir(), "koda-direct-edit-logs-"));
-  await mkdir(join(root, "tests"), { recursive: true });
-  await mkdir(join(root, "src/router"), { recursive: true });
-  await writeFile(join(root, "tests/controlPolicy.test.ts"),
-    "import { test } from 'node:test';\n\ntest('existing', () => {});\n");
-  await writeFile(join(root, "src/router/controlPolicy.ts"), "export const maxCodingAttempts = 2;\n");
-  let calls = 0;
-  const requester: DirectEditRequester = async (_input, messages, tool, maxOutputTokens) => {
-    calls++;
-    assert.equal(tool.type, "function");
-    assert.equal(tool.function.name, "submit_direct_edit");
-    assert.ok(maxOutputTokens <= 2048);
-    const serialized = JSON.stringify(messages);
-    assert.match(serialized, /controlPolicy\.test\.ts/);
-    assert.match(serialized, /attempted\.size >= policy\.maxCodingAttempts/,
-      "DIRECT must ground the named policy field from the implementation reference");
-    return {
-      model: "vendor/direct-model",
-      usage,
-      toolCalls: [{
-        type: "function",
-        function: {
-          name: "submit_direct_edit",
-          arguments: JSON.stringify({
-            path: "tests/controlPolicy.test.ts",
-            edits: [{
-              oldText: "test('existing', () => {});",
-              newText: "test('existing', () => {});\n\ntest('recovery stops at maxCodingAttempts', () => {});",
-            }],
+const validEditResponse = () => ({
+  model: "vendor/direct-model",
+  usage,
+  content: null,
+  toolCalls: [
+    {
+      type: "function",
+      function: {
+        name:
+          "submit_direct_edit",
+        arguments:
+          JSON.stringify({
+            path:
+              "tests/controlPolicy.test.ts",
+            edits: [
+              {
+                oldText:
+                  "test('existing', () => {});",
+                newText:
+                  "test('existing', () => {});\n\n" +
+                  "test('recovery stops at maxCodingAttempts', () => {});",
+              },
+            ],
           }),
+      },
+    },
+  ],
+});
+
+test(
+  "DIRECT uses the coding-attempt timeout instead of silently shortening it to the generic model timeout",
+  () => {
+    const request = input("/tmp/repo");
+
+    assert.equal(
+      request.timeoutMs,
+      45_000,
+    );
+
+    assert.equal(
+      request.requestTimeoutMs,
+      30_000,
+    );
+
+    assert.equal(
+      directEditRequestTimeoutMs(
+        request,
+      ),
+      45_000,
+    );
+  },
+);
+
+test(
+  "DIRECT edit worker performs one structured call, mutates only the locked target and returns immediately",
+  async () => {
+    const root =
+      await mkdtemp(
+        join(
+          tmpdir(),
+          "koda-direct-edit-",
+        ),
+      );
+
+    const logs =
+      await mkdtemp(
+        join(
+          tmpdir(),
+          "koda-direct-edit-logs-",
+        ),
+      );
+
+    await mkdir(
+      join(root, "tests"),
+      {
+        recursive: true,
+      },
+    );
+
+    await mkdir(
+      join(root, "src/router"),
+      {
+        recursive: true,
+      },
+    );
+
+    await writeFile(
+      join(
+        root,
+        "tests/controlPolicy.test.ts",
+      ),
+      "import { test } from 'node:test';\n\n" +
+        "test('existing', () => {});\n",
+    );
+
+    await writeFile(
+      join(
+        root,
+        "src/router/controlPolicy.ts",
+      ),
+      "export const maxCodingAttempts = 2;\n",
+    );
+
+    let calls = 0;
+
+    const requester: DirectEditRequester =
+      async (
+        _input,
+        messages,
+        tool,
+        maxOutputTokens,
+      ) => {
+        calls++;
+
+        assert.equal(
+          tool.type,
+          "function",
+        );
+
+        assert.equal(
+          tool.function.name,
+          "submit_direct_edit",
+        );
+
+        assert.ok(
+          maxOutputTokens <= 2048,
+        );
+
+        const serialized =
+          JSON.stringify(messages);
+
+        assert.match(
+          serialized,
+          /controlPolicy\.test\.ts/,
+        );
+
+        assert.match(
+          serialized,
+          /attempted\.size >= policy\.maxCodingAttempts/,
+        );
+
+        return validEditResponse();
+      };
+
+    try {
+      const logger =
+        new Logger(
+          logs,
+          "direct-one-shot",
+          true,
+        );
+
+      const worker =
+        new DirectEditWorker(
+          new Budget(
+            1,
+            100_000,
+            60_000,
+          ),
+          logger,
+          requester,
+        );
+
+      const result =
+        await worker.run(
+          input(root),
+        );
+
+      assert.equal(calls, 1);
+
+      assert.equal(
+        result.exitStatus,
+        "completed",
+      );
+
+      assert.equal(
+        result.engine,
+        "direct-edit",
+      );
+
+      assert.equal(
+        result.steps,
+        1,
+      );
+
+      assert.equal(
+        result.progressPhase,
+        "MUTATION_OBSERVED",
+      );
+
+      assert.deepEqual(
+        result.changedPaths,
+        [
+          "tests/controlPolicy.test.ts",
+        ],
+      );
+
+      assert.match(
+        await readFile(
+          join(
+            root,
+            "tests/controlPolicy.test.ts",
+          ),
+          "utf8",
+        ),
+        /recovery stops at maxCodingAttempts/,
+      );
+
+      assert.equal(
+        await readFile(
+          join(
+            root,
+            "src/router/controlPolicy.ts",
+          ),
+          "utf8",
+        ),
+        "export const maxCodingAttempts = 2;\n",
+      );
+
+      const providerPolicy =
+        logger.events.find(
+          (event) =>
+            event.type ===
+            "provider_policy",
+        );
+
+      assert.deepEqual(
+        providerPolicy?.provider?.sort,
+        {
+          by: "price",
+          partition: "none",
         },
-      }],
-    };
-  };
+      );
 
-  try {
-    const logger = new Logger(logs, "direct-one-shot", true);
-    const worker = new DirectEditWorker(
-      new Budget(1, 100_000, 60_000),
-      logger,
-      requester,
-    );
-    const result = await worker.run(input(root));
-    assert.equal(calls, 1);
-    assert.equal(result.exitStatus, "completed");
-    assert.equal(result.engine, "direct-edit");
-    assert.equal(result.steps, 1);
-    assert.equal(result.progressPhase, "MUTATION_OBSERVED");
-    assert.deepEqual(result.changedPaths, ["tests/controlPolicy.test.ts"]);
-    assert.match(await readFile(join(root, "tests/controlPolicy.test.ts"), "utf8"),
-      /recovery stops at maxCodingAttempts/);
-    assert.equal(await readFile(join(root, "src/router/controlPolicy.ts"), "utf8"),
-      "export const maxCodingAttempts = 2;\n");
-    const providerPolicy = logger.events.find((event) => event.type === "provider_policy");
-    assert.deepEqual(providerPolicy?.provider?.sort, { by: "price", partition: "none" });
-    assert.deepEqual(providerPolicy?.provider?.preferred_max_latency, { p90: 3 });
-  } finally {
-    await Promise.all([root, logs].map((path) => rm(path, { recursive: true, force: true })));
-  }
-});
+      assert.deepEqual(
+        providerPolicy?.provider
+          ?.preferred_max_latency,
+        {
+          p90: 3,
+        },
+      );
+    } finally {
+      await Promise.all(
+        [root, logs].map(
+          (path) =>
+            rm(path, {
+              recursive: true,
+              force: true,
+            }),
+        ),
+      );
+    }
+  },
+);
 
-test("DIRECT edit worker rejects a model attempt to write outside the locked target", async () => {
-  const root = await mkdtemp(join(tmpdir(), "koda-direct-edit-scope-"));
-  const logs = await mkdtemp(join(tmpdir(), "koda-direct-edit-scope-logs-"));
-  await mkdir(join(root, "tests"), { recursive: true });
-  await mkdir(join(root, "src"), { recursive: true });
-  await writeFile(join(root, "tests/controlPolicy.test.ts"), "test('safe', () => {});\n");
-  await writeFile(join(root, "src/other.ts"), "export const safe = true;\n");
-  const requester: DirectEditRequester = async () => ({
-    model: "vendor/direct-model",
-    usage,
-    toolCalls: [{
-      type: "function",
-      function: {
-        name: "submit_direct_edit",
-        arguments: JSON.stringify({
-          path: "src/other.ts",
-          edits: [{ oldText: "true", newText: "false" }],
-        }),
+test(
+  "DIRECT repairs one missing tool call on the same model before escalating",
+  async () => {
+    const root =
+      await mkdtemp(
+        join(
+          tmpdir(),
+          "koda-direct-repair-",
+        ),
+      );
+
+    const logs =
+      await mkdtemp(
+        join(
+          tmpdir(),
+          "koda-direct-repair-logs-",
+        ),
+      );
+
+    await mkdir(
+      join(root, "tests"),
+      {
+        recursive: true,
       },
-    }],
-  });
-
-  try {
-    const worker = new DirectEditWorker(
-      new Budget(1, 100_000, 60_000),
-      new Logger(logs, "direct-scope", true),
-      requester,
     );
-    const result = await worker.run(input(root));
-    assert.equal(result.exitStatus, "failed");
-    assert.equal(result.terminationReason, "direct_edit_protocol_error");
-    assert.equal(await readFile(join(root, "src/other.ts"), "utf8"),
-      "export const safe = true;\n");
-  } finally {
-    await Promise.all([root, logs].map((path) => rm(path, { recursive: true, force: true })));
-  }
-});
 
-test("DIRECT edit worker can create a new locked target without repository discovery", async () => {
-  const root = await mkdtemp(join(tmpdir(), "koda-direct-create-"));
-  const logs = await mkdtemp(join(tmpdir(), "koda-direct-create-logs-"));
-  await mkdir(join(root, "src"), { recursive: true });
-  const requester: DirectEditRequester = async () => ({
-    model: "vendor/direct-model",
-    usage,
-    toolCalls: [{
-      type: "function",
-      function: {
-        name: "submit_direct_edit",
-        arguments: JSON.stringify({
-          path: "src/newHelper.ts",
-          createContent: "export const answer = 42;\n",
-        }),
+    await writeFile(
+      join(
+        root,
+        "tests/controlPolicy.test.ts",
+      ),
+      "test('existing', () => {});\n",
+    );
+
+    let calls = 0;
+
+    const requester: DirectEditRequester =
+      async (
+        _input,
+        messages,
+      ) => {
+        calls++;
+
+        if (calls === 1) {
+          return {
+            model:
+              "vendor/direct-model",
+            usage,
+            content:
+              "I will add the regression test.",
+            toolCalls: [],
+          };
+        }
+
+        assert.equal(
+          calls,
+          2,
+        );
+
+        assert.match(
+          JSON.stringify(messages),
+          /PROTOCOL REPAIR/,
+        );
+
+        assert.match(
+          JSON.stringify(messages),
+          /submit_direct_edit exactly once/,
+        );
+
+        return validEditResponse();
+      };
+
+    try {
+      const logger =
+        new Logger(
+          logs,
+          "direct-protocol-repair",
+          true,
+        );
+
+      const worker =
+        new DirectEditWorker(
+          new Budget(
+            1,
+            100_000,
+            60_000,
+          ),
+          logger,
+          requester,
+        );
+
+      const result =
+        await worker.run(
+          input(root),
+        );
+
+      assert.equal(
+        calls,
+        2,
+      );
+
+      assert.equal(
+        result.exitStatus,
+        "completed",
+      );
+
+      assert.equal(
+        result.steps,
+        2,
+      );
+
+      assert.deepEqual(
+        result.changedPaths,
+        [
+          "tests/controlPolicy.test.ts",
+        ],
+      );
+
+      assert.match(
+        await readFile(
+          join(
+            root,
+            "tests/controlPolicy.test.ts",
+          ),
+          "utf8",
+        ),
+        /maxCodingAttempts/,
+      );
+
+      assert.ok(
+        logger.events.some(
+          (event) =>
+            event.type ===
+            "direct_edit_protocol_repair",
+        ),
+      );
+    } finally {
+      await Promise.all(
+        [root, logs].map(
+          (path) =>
+            rm(path, {
+              recursive: true,
+              force: true,
+            }),
+        ),
+      );
+    }
+  },
+);
+
+test(
+  "DIRECT stops after one bounded protocol repair if the model still refuses the tool contract",
+  async () => {
+    const root =
+      await mkdtemp(
+        join(
+          tmpdir(),
+          "koda-direct-repair-fail-",
+        ),
+      );
+
+    const logs =
+      await mkdtemp(
+        join(
+          tmpdir(),
+          "koda-direct-repair-fail-logs-",
+        ),
+      );
+
+    await mkdir(
+      join(root, "tests"),
+      {
+        recursive: true,
       },
-    }],
-  });
-
-  try {
-    const worker = new DirectEditWorker(
-      new Budget(1, 100_000, 60_000),
-      new Logger(logs, "direct-create", true),
-      requester,
     );
-    const request = input(root, "src/newHelper.ts");
-    request.task = "Create src/newHelper.ts exporting answer = 42.";
-    const result = await worker.run(request);
-    assert.equal(result.exitStatus, "completed");
-    assert.equal(await readFile(join(root, "src/newHelper.ts"), "utf8"),
-      "export const answer = 42;\n");
-  } finally {
-    await Promise.all([root, logs].map((path) => rm(path, { recursive: true, force: true })));
-  }
-});
 
-test("DIRECT edit worker tolerates neutral optional tool defaults on an existing target", async () => {
-  const root = await mkdtemp(join(tmpdir(), "koda-direct-neutral-"));
-  const logs = await mkdtemp(join(tmpdir(), "koda-direct-neutral-logs-"));
-  await mkdir(join(root, "tests"), { recursive: true });
-  await writeFile(join(root, "tests/controlPolicy.test.ts"), "test('existing', () => {});\n");
-  const requester: DirectEditRequester = async () => ({
-    model: "vendor/direct-model",
-    usage,
-    toolCalls: [{
-      type: "function",
-      function: {
-        name: "submit_direct_edit",
-        arguments: JSON.stringify({
-          path: "tests/controlPolicy.test.ts",
-          edits: [{ oldText: "existing", newText: "updated" }],
-          createContent: "",
-          delete: false,
-        }),
+    await writeFile(
+      join(
+        root,
+        "tests/controlPolicy.test.ts",
+      ),
+      "test('existing', () => {});\n",
+    );
+
+    let calls = 0;
+
+    const requester: DirectEditRequester =
+      async () => {
+        calls++;
+
+        return {
+          model:
+            "vendor/direct-model",
+          usage,
+          content:
+            "I cannot provide the requested tool call.",
+          toolCalls: [],
+        };
+      };
+
+    try {
+      const worker =
+        new DirectEditWorker(
+          new Budget(
+            1,
+            100_000,
+            60_000,
+          ),
+          new Logger(
+            logs,
+            "direct-protocol-repair-fail",
+            true,
+          ),
+          requester,
+        );
+
+      const result =
+        await worker.run(
+          input(root),
+        );
+
+      assert.equal(
+        calls,
+        2,
+      );
+
+      assert.equal(
+        result.exitStatus,
+        "failed",
+      );
+
+      assert.equal(
+        result.terminationReason,
+        "direct_edit_protocol_error",
+      );
+
+      assert.match(
+        result.fatalError ?? "",
+        /after bounded protocol repair/,
+      );
+    } finally {
+      await Promise.all(
+        [root, logs].map(
+          (path) =>
+            rm(path, {
+              recursive: true,
+              force: true,
+            }),
+        ),
+      );
+    }
+  },
+);
+
+test(
+  "DIRECT edit worker rejects a model attempt to write outside the locked target",
+  async () => {
+    const root =
+      await mkdtemp(
+        join(
+          tmpdir(),
+          "koda-direct-edit-scope-",
+        ),
+      );
+
+    const logs =
+      await mkdtemp(
+        join(
+          tmpdir(),
+          "koda-direct-edit-scope-logs-",
+        ),
+      );
+
+    await mkdir(
+      join(root, "tests"),
+      {
+        recursive: true,
       },
-    }],
-  });
-
-  try {
-    const worker = new DirectEditWorker(
-      new Budget(1, 100_000, 60_000),
-      new Logger(logs, "direct-neutral", true),
-      requester,
     );
-    const result = await worker.run(input(root));
-    assert.equal(result.exitStatus, "completed");
-    assert.match(await readFile(join(root, "tests/controlPolicy.test.ts"), "utf8"), /updated/);
-  } finally {
-    await Promise.all([root, logs].map((path) => rm(path, { recursive: true, force: true })));
-  }
-});
 
-test("DIRECT edit worker still rejects a non-empty createContent combined with edits", async () => {
-  const root = await mkdtemp(join(tmpdir(), "koda-direct-conflict-"));
-  const logs = await mkdtemp(join(tmpdir(), "koda-direct-conflict-logs-"));
-  await mkdir(join(root, "tests"), { recursive: true });
-  await writeFile(join(root, "tests/controlPolicy.test.ts"), "test('existing', () => {});\n");
-  const requester: DirectEditRequester = async () => ({
-    model: "vendor/direct-model",
-    usage,
-    toolCalls: [{
-      type: "function",
-      function: {
-        name: "submit_direct_edit",
-        arguments: JSON.stringify({
-          path: "tests/controlPolicy.test.ts",
-          edits: [{ oldText: "existing", newText: "updated" }],
-          createContent: "not allowed for an existing file",
-          delete: false,
-        }),
+    await mkdir(
+      join(root, "src"),
+      {
+        recursive: true,
       },
-    }],
-  });
-
-  try {
-    const worker = new DirectEditWorker(
-      new Budget(1, 100_000, 60_000),
-      new Logger(logs, "direct-conflict", true),
-      requester,
     );
-    const result = await worker.run(input(root));
-    assert.equal(result.exitStatus, "failed");
-    assert.equal(result.terminationReason, "direct_edit_protocol_error");
-    assert.equal(await readFile(join(root, "tests/controlPolicy.test.ts"), "utf8"),
-      "test('existing', () => {});\n");
-  } finally {
-    await Promise.all([root, logs].map((path) => rm(path, { recursive: true, force: true })));
-  }
-});
+
+    await writeFile(
+      join(
+        root,
+        "tests/controlPolicy.test.ts",
+      ),
+      "test('safe', () => {});\n",
+    );
+
+    await writeFile(
+      join(root, "src/other.ts"),
+      "export const safe = true;\n",
+    );
+
+    const requester: DirectEditRequester =
+      async () => ({
+        model:
+          "vendor/direct-model",
+        usage,
+        toolCalls: [
+          {
+            type: "function",
+            function: {
+              name:
+                "submit_direct_edit",
+              arguments:
+                JSON.stringify({
+                  path:
+                    "src/other.ts",
+                  edits: [
+                    {
+                      oldText:
+                        "true",
+                      newText:
+                        "false",
+                    },
+                  ],
+                }),
+            },
+          },
+        ],
+      });
+
+    try {
+      const worker =
+        new DirectEditWorker(
+          new Budget(
+            1,
+            100_000,
+            60_000,
+          ),
+          new Logger(
+            logs,
+            "direct-scope",
+            true,
+          ),
+          requester,
+        );
+
+      const result =
+        await worker.run(
+          input(root),
+        );
+
+      assert.equal(
+        result.exitStatus,
+        "failed",
+      );
+
+      assert.equal(
+        result.terminationReason,
+        "direct_edit_protocol_error",
+      );
+
+      assert.equal(
+        await readFile(
+          join(
+            root,
+            "src/other.ts",
+          ),
+          "utf8",
+        ),
+        "export const safe = true;\n",
+      );
+    } finally {
+      await Promise.all(
+        [root, logs].map(
+          (path) =>
+            rm(path, {
+              recursive: true,
+              force: true,
+            }),
+        ),
+      );
+    }
+  },
+);
+
+test(
+  "DIRECT edit worker can create a new locked target without repository discovery",
+  async () => {
+    const root =
+      await mkdtemp(
+        join(
+          tmpdir(),
+          "koda-direct-create-",
+        ),
+      );
+
+    const logs =
+      await mkdtemp(
+        join(
+          tmpdir(),
+          "koda-direct-create-logs-",
+        ),
+      );
+
+    await mkdir(
+      join(root, "src"),
+      {
+        recursive: true,
+      },
+    );
+
+    const requester: DirectEditRequester =
+      async () => ({
+        model:
+          "vendor/direct-model",
+        usage,
+        toolCalls: [
+          {
+            type: "function",
+            function: {
+              name:
+                "submit_direct_edit",
+              arguments:
+                JSON.stringify({
+                  path:
+                    "src/newHelper.ts",
+                  createContent:
+                    "export const answer = 42;\n",
+                }),
+            },
+          },
+        ],
+      });
+
+    try {
+      const worker =
+        new DirectEditWorker(
+          new Budget(
+            1,
+            100_000,
+            60_000,
+          ),
+          new Logger(
+            logs,
+            "direct-create",
+            true,
+          ),
+          requester,
+        );
+
+      const request =
+        input(
+          root,
+          "src/newHelper.ts",
+        );
+
+      request.task =
+        "Create src/newHelper.ts exporting answer = 42.";
+
+      const result =
+        await worker.run(
+          request,
+        );
+
+      assert.equal(
+        result.exitStatus,
+        "completed",
+      );
+
+      assert.equal(
+        await readFile(
+          join(
+            root,
+            "src/newHelper.ts",
+          ),
+          "utf8",
+        ),
+        "export const answer = 42;\n",
+      );
+    } finally {
+      await Promise.all(
+        [root, logs].map(
+          (path) =>
+            rm(path, {
+              recursive: true,
+              force: true,
+            }),
+        ),
+      );
+    }
+  },
+);
+
+test(
+  "DIRECT edit worker tolerates neutral optional tool defaults on an existing target",
+  async () => {
+    const root =
+      await mkdtemp(
+        join(
+          tmpdir(),
+          "koda-direct-neutral-",
+        ),
+      );
+
+    const logs =
+      await mkdtemp(
+        join(
+          tmpdir(),
+          "koda-direct-neutral-logs-",
+        ),
+      );
+
+    await mkdir(
+      join(root, "tests"),
+      {
+        recursive: true,
+      },
+    );
+
+    await writeFile(
+      join(
+        root,
+        "tests/controlPolicy.test.ts",
+      ),
+      "test('existing', () => {});\n",
+    );
+
+    const requester: DirectEditRequester =
+      async () => ({
+        model:
+          "vendor/direct-model",
+        usage,
+        toolCalls: [
+          {
+            type: "function",
+            function: {
+              name:
+                "submit_direct_edit",
+              arguments:
+                JSON.stringify({
+                  path:
+                    "tests/controlPolicy.test.ts",
+                  edits: [
+                    {
+                      oldText:
+                        "existing",
+                      newText:
+                        "updated",
+                    },
+                  ],
+                  createContent: "",
+                  delete: false,
+                }),
+            },
+          },
+        ],
+      });
+
+    try {
+      const worker =
+        new DirectEditWorker(
+          new Budget(
+            1,
+            100_000,
+            60_000,
+          ),
+          new Logger(
+            logs,
+            "direct-neutral",
+            true,
+          ),
+          requester,
+        );
+
+      const result =
+        await worker.run(
+          input(root),
+        );
+
+      assert.equal(
+        result.exitStatus,
+        "completed",
+      );
+
+      assert.match(
+        await readFile(
+          join(
+            root,
+            "tests/controlPolicy.test.ts",
+          ),
+          "utf8",
+        ),
+        /updated/,
+      );
+    } finally {
+      await Promise.all(
+        [root, logs].map(
+          (path) =>
+            rm(path, {
+              recursive: true,
+              force: true,
+            }),
+        ),
+      );
+    }
+  },
+);
+
+test(
+  "DIRECT edit worker still rejects a non-empty createContent combined with edits",
+  async () => {
+    const root =
+      await mkdtemp(
+        join(
+          tmpdir(),
+          "koda-direct-conflict-",
+        ),
+      );
+
+    const logs =
+      await mkdtemp(
+        join(
+          tmpdir(),
+          "koda-direct-conflict-logs-",
+        ),
+      );
+
+    await mkdir(
+      join(root, "tests"),
+      {
+        recursive: true,
+      },
+    );
+
+    await writeFile(
+      join(
+        root,
+        "tests/controlPolicy.test.ts",
+      ),
+      "test('existing', () => {});\n",
+    );
+
+    const requester: DirectEditRequester =
+      async () => ({
+        model:
+          "vendor/direct-model",
+        usage,
+        toolCalls: [
+          {
+            type: "function",
+            function: {
+              name:
+                "submit_direct_edit",
+              arguments:
+                JSON.stringify({
+                  path:
+                    "tests/controlPolicy.test.ts",
+                  edits: [
+                    {
+                      oldText:
+                        "existing",
+                      newText:
+                        "updated",
+                    },
+                  ],
+                  createContent:
+                    "not allowed for an existing file",
+                  delete: false,
+                }),
+            },
+          },
+        ],
+      });
+
+    try {
+      const worker =
+        new DirectEditWorker(
+          new Budget(
+            1,
+            100_000,
+            60_000,
+          ),
+          new Logger(
+            logs,
+            "direct-conflict",
+            true,
+          ),
+          requester,
+        );
+
+      const result =
+        await worker.run(
+          input(root),
+        );
+
+      assert.equal(
+        result.exitStatus,
+        "failed",
+      );
+
+      assert.equal(
+        result.terminationReason,
+        "direct_edit_protocol_error",
+      );
+
+      assert.equal(
+        await readFile(
+          join(
+            root,
+            "tests/controlPolicy.test.ts",
+          ),
+          "utf8",
+        ),
+        "test('existing', () => {});\n",
+      );
+    } finally {
+      await Promise.all(
+        [root, logs].map(
+          (path) =>
+            rm(path, {
+              recursive: true,
+              force: true,
+            }),
+        ),
+      );
+    }
+  },
+);
