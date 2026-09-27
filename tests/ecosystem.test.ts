@@ -24,8 +24,41 @@ import { extractFeatures, featureKey } from "../src/router/features.js";
 import { config } from "../src/config.js";
 import { bridgeDependencies } from "../src/repo/dependencies.js";
 import { finalVerificationScope } from "../src/run.js";
+import { workerChecksAreTaskSpecific } from "../src/verifier/selection.js";
 const pkg = (scripts: Record<string, string> = {}, extra: object = {}) =>
   JSON.stringify({ scripts, ...extra });
+
+test("task-specific verification follows transitive inspected imports", () => {
+  const command = "node --test test/transfer.test.js";
+  const subtask = {
+    id: "transfer", title: "Fix transfer", objective: "Fix transfer",
+    likelyReadPaths: ["src/service.js", "src/store.js"],
+    likelyWritePaths: ["src/store.js"], dependsOn: [],
+    integrationContract: "Preserve transfer behavior",
+    verificationCommands: [command], estimatedDifficulty: "normal",
+    parallelSafe: false,
+  } as const;
+  const candidate = {
+    command, kind: "test", cwd: ".", source: "scripts.test",
+    confidence: 1, available: true, mutatesSource: false,
+    requiresInstalledDependencies: false, requirement: "required",
+  } as const;
+  const profile = {
+    root: "/repo", files: ["test/transfer.test.js", "src/service.js", "src/store.js"],
+    scripts: { test: command }, verificationCommands: [command],
+    ecosystem: { projectUnits: [{ root: ".", scripts: { test: command }, verification: [candidate] }] },
+  } as any;
+  const context = {
+    repoMap: profile.files, localDependencies: ["src/service.js", "src/store.js"],
+    completePaths: profile.files,
+    files: [
+      { path: "test/transfer.test.js", snippet: "import { transfer } from '../src/service.js';\n" },
+      { path: "src/service.js", snippet: "import { commit } from './store.js';\nexport const transfer = commit;\n" },
+      { path: "src/store.js", snippet: "export function commit() {}\n" },
+    ],
+  };
+  assert.equal(workerChecksAreTaskSpecific(subtask as any, profile, context), true);
+});
 async function fixture(files: Record<string, string>) {
   const root = await mkdtemp(join(tmpdir(), "koda-ecosystem-"));
   for (const [p, s] of Object.entries(files)) {
@@ -133,7 +166,7 @@ test("baseline comparison uses stable pytest test identities instead of volatile
   ].join("\n"));
   assert.equal(verificationRegressed(baseline, sameFailures), false);
   assert.equal(verificationAgainstBaseline(baseline, sameFailures).status,
-    "VERIFIED_SUCCESS");
+    "CANDIDATE_NEUTRAL");
   assert.equal(verificationRegressed(baseline, regression), true);
 });
 
@@ -1079,9 +1112,9 @@ test(`workspace DIRECT final verification: ${baselineFails ? "unchanged baseline
     assert.equal(result.execution_strategy, "direct");
     assert.equal(result.plannerModelCalls, 0);
     assert.equal(calls, 1);
-    assert.equal(result.status, baselineFails ? "VERIFIED_SUCCESS" : "FAILED");
+    assert.equal(result.status, baselineFails ? "CANDIDATE_IMPROVEMENT" : "FAILED");
     assert.equal(result.verificationDimensions!.test, "PASS");
-    assert.equal(result.verificationDimensions!.check, baselineFails ? "PASS" : "FAIL");
+    assert.equal(result.verificationDimensions!.check, "FAIL");
     assert.equal(
       await readFile(
         join(result.integration!.path, "packages/calc/src/calc.js"),

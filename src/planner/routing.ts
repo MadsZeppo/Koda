@@ -1,9 +1,10 @@
 import type { Config } from "../config.js";
 import type { PoolRouter } from "../router/modelRouter.js";
 import type { PoolModel, Metadata } from "../router/pool.js";
-import type { Attempt } from "../router/history.js";
+import type { Attempt, OperationalCall } from "../router/history.js";
 import type { Features } from "../router/features.js";
 import type { PlannerComplexity } from "./policy.js";
+import { supportsParameters } from "../router/pool.js";
 export interface PlannerCandidate {
   model: PoolModel;
   quality: number;
@@ -23,6 +24,7 @@ export function rankPlanners(
   outputBound: number,
   remainingBudgetUsd = Infinity,
   remainingTokens = Infinity,
+  operations: OperationalCall[] = [],
 ): PlannerCandidate[] {
   return models
     .map((model) => {
@@ -56,12 +58,23 @@ export function rankPlanners(
             (p) => p === "structured_outputs" || p === "response_format",
           )
         : model.strengths.includes("structured_output");
+      // compileTask sends a required submit_plan function call. A model-level
+      // parameter union is insufficient; one concrete endpoint must support
+      // the complete protocol together.
+      const planningProtocol = supportsParameters(md, ["tools", "tool_choice"]);
+      const observedProtocolFailure = operations.some((operation) =>
+        operation.modelRequested === model.id &&
+        operation.failureKind === "tool_protocol_incompatible");
       const rejected = !model.enabled
         ? "disabled"
         : md.available === false
           ? "unavailable"
           : !structured
             ? "structured output unsupported"
+            : !planningProtocol
+              ? "required planning tool protocol unsupported"
+            : observedProtocolFailure
+              ? "observed planning tool protocol incompatible"
             : !Number.isFinite(estimate)
               ? "unknown pricing"
               : md.contextLength && inputBound + outputBound > md.contextLength
@@ -113,6 +126,7 @@ export async function selectPlanner(
     Math.min(settings.maxOutputTokens, config.maxOutputTokens),
     remainingBudgetUsd,
     remainingTokens,
+    pool.history.readOperations?.() ?? [],
   );
   const available = candidates.filter(
     (c) => !excluded.includes(c.model.id) && !pool.disabled.has(c.model.id),
@@ -125,20 +139,37 @@ export async function selectPlanner(
           ? ["cheap", "fast"].includes(c.model.tier)
           : ["strong", "frontier"].includes(c.model.tier)),
     );
-  // Durable failures may lower an estimate below the normal quality gate, but
-  // they must not permanently prevent a fresh run from gathering new evidence.
-  // This recovery still honors every capability/availability/price rejection;
-  // the caller's run-local excluded set prevents retrying the same planner.
-  const recoverQuality = (tier: "fast" | "strong") =>
-    available.find(
-      (c) =>
-        c.rejected === "below planner quality threshold" &&
-        (c.model.plannerQualityPrior ?? settings.qualityPrior) >=
-          settings.minimumQuality &&
-        (tier === "fast"
-          ? ["cheap", "fast"].includes(c.model.tier)
-          : ["strong", "frontier"].includes(c.model.tier)),
-    );
+  // Durable failures may lower every estimate below the normal quality gate,
+  // but they must not permanently prevent a fresh run from gathering evidence.
+  // Recovery still honors every capability/availability/price rejection and
+  // the caller's run-local exclusions keep attempts unique inside the run.
+  const recoverable = available.filter(
+    (candidate) =>
+      candidate.rejected === "below planner quality threshold" &&
+      (candidate.model.plannerQualityPrior ?? settings.qualityPrior) >=
+        settings.minimumQuality,
+  );
+  const attainableQuality = Math.max(
+    -Infinity,
+    ...recoverable.map((candidate) => candidate.quality),
+  );
+  // When all planners have fallen below the configured absolute floor, use
+  // their current evidence comparatively. Recovery remains quality-first, but
+  // equivalent candidates form a small plateau where completion economics
+  // decide. This prevents every fresh run from retrying a known-invalid,
+  // expensive planner merely because its configured tier is "strong".
+  const recoveryRegret = phase === "strong" ? 0.025 : 0.06;
+  const recoverQuality = recoverable
+    .filter(
+      (candidate) =>
+        candidate.quality + 1e-9 >= attainableQuality - recoveryRegret,
+    )
+    .sort(
+      (a, b) =>
+        a.score - b.score ||
+        b.quality - a.quality ||
+        a.model.id.localeCompare(b.model.id),
+    )[0];
   const selected = config.forceModel
     ? available.find(
         (c) =>
@@ -147,10 +178,7 @@ export async function selectPlanner(
       )
     : (pick(phase) ??
       (phase === "fast" ? pick("strong") : pick("fast")) ??
-      recoverQuality(phase) ??
-      (phase === "fast"
-        ? recoverQuality("strong")
-        : recoverQuality("fast")));
+      recoverQuality);
   pool.logger.log("planner_route", {
     subtaskId: "planner",
     planner_model: selected?.model.id ?? null,
@@ -159,7 +187,7 @@ export async function selectPlanner(
     routing_reason: config.forceModel
       ? "forced evaluation"
       : selected?.rejected === "below planner quality threshold"
-        ? "fresh-run retry of planner rejected only by durable quality history"
+        ? "attainable planner quality plateau; lowest completion economics"
       : phase === "strong" &&
           selected &&
           ["cheap", "fast"].includes(selected.model.tier)

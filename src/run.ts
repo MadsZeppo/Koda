@@ -6,7 +6,11 @@ import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { tmpdir, homedir } from "node:os";
 import type { Config } from "./config.js";
-import { bootstrapDependencies, bridgeDependencies, inheritDependencyEnvironment } from "./repo/dependencies.js";
+import {
+  bootstrapDependencies,
+  bridgeDependencies,
+  inheritDependencyEnvironment,
+} from "./repo/dependencies.js";
 import { raceVerified } from "./orchestrator/race.js";
 import { profileRepo } from "./repo/profiler.js";
 import { git, command } from "./repo/commands.js";
@@ -34,8 +38,17 @@ import { truncateBytes } from "./context/bounds.js";
 import { AttemptCheckpoint } from "./agent/attemptCheckpoint.js";
 import { WriteScope } from "./repo/writeScope.js";
 import { discover } from "./agent/discovery.js";
-import { advisoryInfrastructureOnly, verify, verificationAgainstBaseline, verificationResult, verificationRegressions } from "./verifier/verifier.js";
-import { focusedLocalReproduction, optionalUnavailableCheck } from "./verifier/recovery.js";
+import {
+  advisoryInfrastructureOnly,
+  verify,
+  verificationAgainstBaseline,
+  verificationResult,
+  verificationRegressions,
+} from "./verifier/verifier.js";
+import {
+  focusedLocalReproduction,
+  optionalUnavailableCheck,
+} from "./verifier/recovery.js";
 import {
   repoBackedVerificationCommands,
   impactAwareVerificationSelection,
@@ -57,7 +70,10 @@ import { taskRelevantMutationPaths } from "./agent/mutationInvariant.js";
 import { stableNoChangePreflight } from "./agent/stableNoChangePreflight.js";
 import type { CodingWorker } from "./agent/codingWorker.js";
 import { extractFeatures } from "./router/features.js";
-import { buildTaskResume, type DeterministicTaskProfile } from "./router/taskProfiler.js";
+import {
+  buildTaskResume,
+  type DeterministicTaskProfile,
+} from "./router/taskProfiler.js";
 export interface RunOptions {
   repo: string;
   /** Calibration may freeze source separately while reusing original installed dependencies. */
@@ -78,7 +94,13 @@ export function finalVerificationScope(
   stableScope: readonly string[] = [],
   directScope: readonly string[] = [],
 ) {
-  return [...(changed.length ? changed : stableScope.length ? stableScope : directScope)];
+  return [
+    ...(changed.length
+      ? changed
+      : stableScope.length
+        ? stableScope
+        : directScope),
+  ];
 }
 
 async function assertWriteResponsibility(path: string, subtask: Subtask) {
@@ -103,7 +125,8 @@ async function assertWriteResponsibility(path: string, subtask: Subtask) {
 function combineEvidence(packets: EvidencePacket[]) {
   if (!packets.length) return undefined;
   const unique = (values: string[]) => [...new Set(values)];
-  const joined = (values: string[]) => values.filter((value) => value.trim()).join("\n");
+  const joined = (values: string[]) =>
+    values.filter((value) => value.trim()).join("\n");
   return {
     relevantFiles: unique(packets.flatMap((packet) => packet.relevantFiles)),
     symbols: unique(packets.flatMap((packet) => packet.symbols)),
@@ -116,7 +139,9 @@ function combineEvidence(packets: EvidencePacket[]) {
       : packets.some((packet) => packet.uncertainty === "medium")
         ? ("medium" as const)
         : ("low" as const),
-    suggestedApproach: joined(packets.map((packet) => packet.suggestedApproach)),
+    suggestedApproach: joined(
+      packets.map((packet) => packet.suggestedApproach),
+    ),
     evidence: unique(packets.flatMap((packet) => packet.evidence)),
   };
 }
@@ -179,11 +204,23 @@ export async function run(options: RunOptions) {
       throw Error(`Sandbox preflight failed: ${sandboxCheck.stderr}`);
     integration = await backend.initialize();
     let profile = await profileRepo(integration.path);
-    if (await bridgeDependencies(
-      options.dependencyRoot ?? repo, integration.path, profile.ecosystem))
+    if (
+      await bridgeDependencies(
+        options.dependencyRoot ?? repo,
+        integration.path,
+        profile.ecosystem,
+      )
+    )
       profile = await profileRepo(integration.path);
-    if (profile.ecosystem && await bootstrapDependencies(
-      integration.path, integration.path, profile.ecosystem, logger))
+    if (
+      profile.ecosystem &&
+      (await bootstrapDependencies(
+        integration.path,
+        integration.path,
+        profile.ecosystem,
+        logger,
+      ))
+    )
       profile = await profileRepo(integration.path);
     logger.log("worktree", {
       stage: "integration",
@@ -207,81 +244,190 @@ export async function run(options: RunOptions) {
       execution_effort: strategy.execution_effort,
       strategy_reason: strategy.strategy_reason,
     });
-    const routingResume = await buildTaskResume(options.task, profile, strategy, {
-      globalBudgetUsd: options.config.budgetUsd,
-      absoluteCapUsd: options.config.routing.researchAbsoluteCapUsd,
-      fraction: options.config.routing.researchBudgetFraction,
-    }, async (taskProfile: DeterministicTaskProfile, capUsd: number) => {
-      if (!gateway.modelRouter) return undefined;
-      const context = {
-        task: options.task,
-        likelyPaths: taskProfile.likelyPaths,
-        repositoryFiles: profile.files.slice(0, 240),
-        symbols: profile.symbols.slice(0, 80),
-        verificationCommands: profile.verificationCommands,
-      };
-      const tools = [{ type: "function" as const, function: {
-        name: "submit_routing_scout",
-        description: "Return read-only, repository-backed routing evidence.",
-        parameters: { type: "object", additionalProperties: false,
-          properties: {
-            paths: { type: "array", items: { type: "string" }, maxItems: 12 },
-            symbols: { type: "array", items: { type: "string" }, maxItems: 12 },
-            evidence: { type: "array", items: { type: "string" }, maxItems: 16 },
-            reproduction: { type: "string" },
-          }, required: ["paths", "symbols", "evidence"] },
-      }}];
-      const messages = [{ role: "system" as const,
-        content: "Localize the task using only the supplied repository inventory. Read only. Cite concrete listed paths/symbols; never invent a path. Submit the structured tool once." },
-      { role: "user" as const, content: JSON.stringify(context) }];
-      const inputTokens = Buffer.byteLength(JSON.stringify({ messages, tools })) + 256;
-      const scoutSubtask: Subtask = {
-        id: "routing-scout", title: options.task, objective: options.task,
-        dependsOn: [], likelyReadPaths: taskProfile.likelyPaths,
-        likelyWritePaths: taskProfile.likelyPaths, readOnly: true,
-        integrationContract: "Read-only routing evidence", verificationCommands: [],
-        estimatedDifficulty: "low", parallelSafe: false,
-      };
-      const features = extractFeatures(scoutSubtask, profile, inputTokens, undefined, "planned");
-      features.taskKind = "planning";
-      let selected;
-      try {
-        selected = await gateway.modelRouter.select(features, "routing-scout", [], undefined,
-          false, undefined, { budgetUsd: capUsd, inputTokens,
-            outputTokens: options.config.routing.researchMaxOutputTokens });
-      } catch {
-        logger.log("routing_research_skipped", { reason: "no compatible scout fits research budget", cap_usd: capUsd });
-        return undefined;
-      }
-      const md = selected.metadata;
-      if (md.inputPrice === undefined || md.outputPrice === undefined ||
-          (inputTokens * md.inputPrice + options.config.routing.researchMaxOutputTokens * md.outputPrice) / 1e6 > capUsd)
-        return undefined;
-      const since = logger.events.length;
-      const response = await gateway.call(selected.model.id, messages, "routing-scout", "inspect", 0,
-        tools, { requireTool: true, maxOutputTokens: options.config.routing.researchMaxOutputTokens,
-          timeoutMs: options.config.routing.researchTimeoutMs });
-      const call = logger.events.slice(since).find((event) => event.type === "model_call");
-      const control = response.tool_calls?.find((item) => item.type === "function" &&
-        item.function.name === "submit_routing_scout");
-      if (!control || control.type !== "function") return undefined;
-      const parsed = JSON.parse(control.function.arguments);
-      return { result: {
-        paths: Array.isArray(parsed.paths) ? parsed.paths.filter((path: unknown): path is string => typeof path === "string") : [],
-        symbols: Array.isArray(parsed.symbols) ? parsed.symbols.filter((symbol: unknown): symbol is string => typeof symbol === "string") : [],
-        evidence: Array.isArray(parsed.evidence) ? parsed.evidence.filter((item: unknown): item is string => typeof item === "string") : [],
-        reproduction: typeof parsed.reproduction === "string" ? parsed.reproduction : undefined,
-      }, costUsd: call?.costUsd ?? capUsd, tokens: call ? call.promptTokens + call.completionTokens : 0 };
-    });
-    const routingResearchCalls = logger.events.filter((event) =>
-      event.type === "model_call" && event.subtaskId === "routing-scout");
-    logger.log("task_profile", { profile: routingResume.profile,
+    const routingResume = await buildTaskResume(
+      options.task,
+      profile,
+      strategy,
+      {
+        globalBudgetUsd: options.config.budgetUsd,
+        absoluteCapUsd: options.config.routing.researchAbsoluteCapUsd,
+        fraction: options.config.routing.researchBudgetFraction,
+      },
+      async (taskProfile: DeterministicTaskProfile, capUsd: number) => {
+        if (!gateway.modelRouter) return undefined;
+        const context = {
+          task: options.task,
+          likelyPaths: taskProfile.likelyPaths,
+          repositoryFiles: profile.files.slice(0, 240),
+          symbols: profile.symbols.slice(0, 80),
+          verificationCommands: profile.verificationCommands,
+        };
+        const tools = [
+          {
+            type: "function" as const,
+            function: {
+              name: "submit_routing_scout",
+              description:
+                "Return read-only, repository-backed routing evidence.",
+              parameters: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  paths: {
+                    type: "array",
+                    items: { type: "string" },
+                    maxItems: 12,
+                  },
+                  symbols: {
+                    type: "array",
+                    items: { type: "string" },
+                    maxItems: 12,
+                  },
+                  evidence: {
+                    type: "array",
+                    items: { type: "string" },
+                    maxItems: 16,
+                  },
+                  reproduction: { type: "string" },
+                },
+                required: ["paths", "symbols", "evidence"],
+              },
+            },
+          },
+        ];
+        const messages = [
+          {
+            role: "system" as const,
+            content:
+              "Localize the task using only the supplied repository inventory. Read only. Cite concrete listed paths/symbols; never invent a path. Submit the structured tool once.",
+          },
+          { role: "user" as const, content: JSON.stringify(context) },
+        ];
+        const inputTokens =
+          Buffer.byteLength(JSON.stringify({ messages, tools })) + 256;
+        const scoutSubtask: Subtask = {
+          id: "routing-scout",
+          title: options.task,
+          objective: options.task,
+          dependsOn: [],
+          likelyReadPaths: taskProfile.likelyPaths,
+          likelyWritePaths: taskProfile.likelyPaths,
+          readOnly: true,
+          integrationContract: "Read-only routing evidence",
+          verificationCommands: [],
+          estimatedDifficulty: "low",
+          parallelSafe: false,
+        };
+        const features = extractFeatures(
+          scoutSubtask,
+          profile,
+          inputTokens,
+          undefined,
+          "planned",
+        );
+        features.taskKind = "planning";
+        let selected;
+        try {
+          selected = await gateway.modelRouter.select(
+            features,
+            "routing-scout",
+            [],
+            undefined,
+            false,
+            undefined,
+            {
+              budgetUsd: capUsd,
+              inputTokens,
+              outputTokens: options.config.routing.researchMaxOutputTokens,
+            },
+          );
+        } catch {
+          logger.log("routing_research_skipped", {
+            reason: "no compatible scout fits research budget",
+            cap_usd: capUsd,
+          });
+          return undefined;
+        }
+        const md = selected.metadata;
+        if (
+          md.inputPrice === undefined ||
+          md.outputPrice === undefined ||
+          (inputTokens * md.inputPrice +
+            options.config.routing.researchMaxOutputTokens * md.outputPrice) /
+            1e6 >
+            capUsd
+        )
+          return undefined;
+        const since = logger.events.length;
+        const response = await gateway.call(
+          selected.model.id,
+          messages,
+          "routing-scout",
+          "inspect",
+          0,
+          tools,
+          {
+            requireTool: true,
+            maxOutputTokens: options.config.routing.researchMaxOutputTokens,
+            timeoutMs: options.config.routing.researchTimeoutMs,
+          },
+        );
+        const call = logger.events
+          .slice(since)
+          .find((event) => event.type === "model_call");
+        const control = response.tool_calls?.find(
+          (item) =>
+            item.type === "function" &&
+            item.function.name === "submit_routing_scout",
+        );
+        if (!control || control.type !== "function") return undefined;
+        const parsed = JSON.parse(control.function.arguments);
+        return {
+          result: {
+            paths: Array.isArray(parsed.paths)
+              ? parsed.paths.filter(
+                  (path: unknown): path is string => typeof path === "string",
+                )
+              : [],
+            symbols: Array.isArray(parsed.symbols)
+              ? parsed.symbols.filter(
+                  (symbol: unknown): symbol is string =>
+                    typeof symbol === "string",
+                )
+              : [],
+            evidence: Array.isArray(parsed.evidence)
+              ? parsed.evidence.filter(
+                  (item: unknown): item is string => typeof item === "string",
+                )
+              : [],
+            reproduction:
+              typeof parsed.reproduction === "string"
+                ? parsed.reproduction
+                : undefined,
+          },
+          costUsd: call?.costUsd ?? capUsd,
+          tokens: call ? call.promptTokens + call.completionTokens : 0,
+        };
+      },
+    );
+    const routingResearchCalls = logger.events.filter(
+      (event) =>
+        event.type === "model_call" && event.subtaskId === "routing-scout",
+    );
+    logger.log("task_profile", {
+      profile: routingResume.profile,
       micro_scout_used: routingResume.microScoutUsed,
       routing_research_calls: routingResearchCalls.length,
-      routing_research_cost_usd: routingResearchCalls.some((call) => call.costUsd === null)
-        ? null : routingResearchCalls.reduce((sum, call) => sum + call.costUsd, 0),
-      routing_research_tokens: routingResearchCalls.reduce((sum, call) =>
-        sum + call.promptTokens + call.completionTokens, 0) });
+      routing_research_cost_usd: routingResearchCalls.some(
+        (call) => call.costUsd === null,
+      )
+        ? null
+        : routingResearchCalls.reduce((sum, call) => sum + call.costUsd, 0),
+      routing_research_tokens: routingResearchCalls.reduce(
+        (sum, call) => sum + call.promptTokens + call.completionTokens,
+        0,
+      ),
+    });
     const sharedRoutingEvidence: EvidencePacket = {
       relevantFiles: routingResume.relevantPaths,
       symbols: routingResume.scout?.symbols ?? [],
@@ -289,9 +435,14 @@ export async function run(options: RunOptions) {
       failingTests: routingResume.profile.likelyTests,
       likelyRootCause: "",
       dependencies: [],
-      uncertainty: routingResume.profile.scopeConfidence === "high" ? "low"
-        : routingResume.profile.scopeConfidence === "medium" ? "medium" : "high",
-      suggestedApproach: "Use repository-backed paths and inspect current definitions before mutation.",
+      uncertainty:
+        routingResume.profile.scopeConfidence === "high"
+          ? "low"
+          : routingResume.profile.scopeConfidence === "medium"
+            ? "medium"
+            : "high",
+      suggestedApproach:
+        "Use repository-backed paths and inspect current definitions before mutation.",
       evidence: routingResume.evidence,
     };
     let taskVerificationCommands: string[] = [];
@@ -345,24 +496,43 @@ export async function run(options: RunOptions) {
         options.task,
         profile,
         () => Math.min(options.config.commandTimeoutMs, budget.remainingMs()),
-        (check) => logger.log("verification", { subtaskId: subtask.id, ...check }),
+        (check) =>
+          logger.log("verification", { subtaskId: subtask.id, ...check }),
       );
       logger.log("latency", {
         stable_no_change_preflight_ms: Date.now() - preflightStarted,
       });
       if (preflight.satisfied)
-        logger.log("no_changes_required", { subtaskId: subtask.id,
-          status: "VERIFIED_SUCCESS", reason: "acceptance_checks_already_pass",
-          diffBytes: 0, verificationCommands: preflight.verification.checks.map((check) => check.command),
-          evidence_paths: preflight.evidencePaths });
+        logger.log("no_changes_required", {
+          subtaskId: subtask.id,
+          status: "VERIFIED_SUCCESS",
+          reason: "acceptance_checks_already_pass",
+          diffBytes: 0,
+          verificationCommands: preflight.verification.checks.map(
+            (check) => check.command,
+          ),
+          evidence_paths: preflight.evidencePaths,
+        });
 
       const result = preflight.satisfied
-        ? { verification: preflight.verification, evidence: {
-            relevantFiles: preflight.evidencePaths, symbols: [], reproduction: "Passing repository test",
-            failingTests: [], likelyRootCause: "Already satisfied", dependencies: [],
-            uncertainty: "low" as const, suggestedApproach: "No mutation required",
-            evidence: preflight.evidencePaths.map((path) => `assertion_code:${path}`),
-          }, noChangesRequired: true, role: "CHEAP_CODER_A" as const }
+        ? {
+            verification: preflight.verification,
+            evidence: {
+              relevantFiles: preflight.evidencePaths,
+              symbols: [],
+              reproduction: "Passing repository test",
+              failingTests: [],
+              likelyRootCause: "Already satisfied",
+              dependencies: [],
+              uncertainty: "low" as const,
+              suggestedApproach: "No mutation required",
+              evidence: preflight.evidencePaths.map(
+                (path) => `assertion_code:${path}`,
+              ),
+            },
+            noChangesRequired: true,
+            role: "CHEAP_CODER_A" as const,
+          }
         : await implement(
             gateway,
             integration.path,
@@ -370,8 +540,12 @@ export async function run(options: RunOptions) {
             subtask,
             { acceptanceCriteria: [options.task] },
             profile,
-            { codingWorker, compiledContext: context, finalVerificationOnly: true,
-              evidence: sharedRoutingEvidence },
+            {
+              codingWorker,
+              compiledContext: context,
+              finalVerificationOnly: true,
+              evidence: sharedRoutingEvidence,
+            },
           );
 
       const operationalFailure = result.verification.checks.find(
@@ -579,19 +753,33 @@ export async function run(options: RunOptions) {
       directRepairContext = { subtask, context };
       const directTestTargets = subtask.likelyWritePaths.filter(isTestPath);
       const directFocusedChecks = result.verification.checks
-        .filter((check) => directTestTargets.some((path) => check.command.includes(path)))
+        .filter((check) =>
+          directTestTargets.some((path) => check.command.includes(path)),
+        )
         .map((check) => check.command);
-      if (directTestTargets.length === subtask.likelyWritePaths.length &&
-          directFocusedChecks.length) {
+      if (
+        directTestTargets.length === subtask.likelyWritePaths.length &&
+        directFocusedChecks.length
+      ) {
         taskVerificationCommands = [...new Set(directFocusedChecks)];
         taskVerificationIsFocused = true;
       }
-      if (result.verification.checks.some((check) =>
-        check.outcome === "INFRA_FAILURE" || check.outcome === "CHECK_UNAVAILABLE")) {
+      if (
+        result.verification.checks.some(
+          (check) =>
+            check.outcome === "INFRA_FAILURE" ||
+            check.outcome === "CHECK_UNAVAILABLE",
+        )
+      ) {
         status = "NOT_FULLY_VERIFIED";
-        const failed = result.verification.checks.find((check) =>
-          check.outcome === "INFRA_FAILURE" || check.outcome === "CHECK_UNAVAILABLE");
-        throw Error(`Verification infrastructure unavailable: ${failed?.command}: ${failed?.unavailable ?? failed?.stderr ?? "verification could not execute"}`);
+        const failed = result.verification.checks.find(
+          (check) =>
+            check.outcome === "INFRA_FAILURE" ||
+            check.outcome === "CHECK_UNAVAILABLE",
+        );
+        throw Error(
+          `Verification infrastructure unavailable: ${failed?.command}: ${failed?.unavailable ?? failed?.stderr ?? "verification could not execute"}`,
+        );
       }
       if (
         result.verification.status !== "VERIFIED_SUCCESS" &&
@@ -625,7 +813,12 @@ export async function run(options: RunOptions) {
             : result.verification.status,
       });
     } else {
-      const rawPlan = await compileTask(gateway, options.task, profile, routingResume);
+      const rawPlan = await compileTask(
+        gateway,
+        options.task,
+        profile,
+        routingResume,
+      );
       const normalized = normalizePlan(rawPlan);
       const plan = normalized.plan;
       plannedSubtasks = normalized.before;
@@ -647,14 +840,23 @@ export async function run(options: RunOptions) {
         const inheritedEvidence = subtask.dependsOn
           .map((id) => discoveryEvidence.get(id))
           .filter((packet): packet is NonNullable<typeof packet> => !!packet);
-        const nodePaths = new Set([...subtask.likelyReadPaths, ...subtask.likelyWritePaths]);
+        const nodePaths = new Set([
+          ...subtask.likelyReadPaths,
+          ...subtask.likelyWritePaths,
+        ]);
         const nodeRoutingEvidence: EvidencePacket = {
           ...sharedRoutingEvidence,
-          relevantFiles: sharedRoutingEvidence.relevantFiles.filter((path) => nodePaths.has(path)),
-          failingTests: sharedRoutingEvidence.failingTests.filter((path) => nodePaths.has(path)),
-          evidence: sharedRoutingEvidence.evidence.filter((fact) =>
-            !profile.files.some((path) => fact.includes(path)) || nodePaths.has(
-              profile.files.find((path) => fact.includes(path))!)),
+          relevantFiles: sharedRoutingEvidence.relevantFiles.filter((path) =>
+            nodePaths.has(path),
+          ),
+          failingTests: sharedRoutingEvidence.failingTests.filter((path) =>
+            nodePaths.has(path),
+          ),
+          evidence: sharedRoutingEvidence.evidence.filter(
+            (fact) =>
+              !profile.files.some((path) => fact.includes(path)) ||
+              nodePaths.has(profile.files.find((path) => fact.includes(path))!),
+          ),
         };
         if (subtask.readOnly === true) {
           const wt = await backend!.createWorker(
@@ -683,14 +885,22 @@ export async function run(options: RunOptions) {
               // prevent a dependent coder from inspecting its own workspace.
               await assertWriteResponsibility(wt.path, subtask);
               evidence = {
-                relevantFiles: subtask.likelyReadPaths.filter((file) => profile.files.includes(file)),
-                symbols: [], reproduction: "", failingTests: [], likelyRootCause: "",
-                dependencies: [], uncertainty: "high",
-                suggestedApproach: "Inspect the relevant source before editing; discovery did not establish a finding.",
+                relevantFiles: subtask.likelyReadPaths.filter((file) =>
+                  profile.files.includes(file),
+                ),
+                symbols: [],
+                reproduction: "",
+                failingTests: [],
+                likelyRootCause: "",
+                dependencies: [],
+                uncertainty: "high",
+                suggestedApproach:
+                  "Inspect the relevant source before editing; discovery did not establish a finding.",
                 evidence: [],
               };
               logger.log("discovery_fallback", {
-                subtaskId: subtask.id, reason: String(failure),
+                subtaskId: subtask.id,
+                reason: String(failure),
                 relevantFiles: evidence.relevantFiles,
               });
             }
@@ -735,11 +945,18 @@ export async function run(options: RunOptions) {
                 initialRole,
                 stop,
                 raceGroup: suffix ? subtask.id : undefined,
-                evidence: combineEvidence([nodeRoutingEvidence, ...inheritedEvidence]),
+                evidence: combineEvidence([
+                  nodeRoutingEvidence,
+                  ...inheritedEvidence,
+                ]),
               },
             );
-            if (result.verification.status !== "VERIFIED_SUCCESS" &&
-                !advisoryInfrastructureOnly(result.verification)) {
+            if (
+              result.verification.status !== "VERIFIED_SUCCESS" &&
+              result.verification.status !== "CANDIDATE_NEUTRAL" &&
+              result.verification.status !== "CANDIDATE_IMPROVEMENT" &&
+              !advisoryInfrastructureOnly(result.verification)
+            ) {
               if (result.verification.status === "NOT_FULLY_VERIFIED")
                 status = "NOT_FULLY_VERIFIED";
               throw Error(`${subtask.id}: ${result.verification.status}`);
@@ -747,7 +964,9 @@ export async function run(options: RunOptions) {
             if (advisoryInfrastructureOnly(result.verification))
               logger.log("verification_advisory_unavailable", {
                 subtaskId: subtask.id,
-                checks: result.verification.checks.filter((check) => check.unavailable),
+                checks: result.verification.checks.filter(
+                  (check) => check.unavailable,
+                ),
               });
             await assertWriteResponsibility(wt.path, subtask);
             const revision = await backend!.finalizeWorker(
@@ -829,41 +1048,65 @@ export async function run(options: RunOptions) {
         });
         await backend!.cleanupWorker(winner.wt);
       };
-      const { peak: scheduledParallelPeak } = await schedule(plan.subtasks, options.config.maxParallel, execute, (t) =>
-        options.config.race &&
-        !options.config.forceModel &&
-        t.estimatedDifficulty === "high" &&
-        options.config.maxParallel >= 2
-          ? 2
-          : 1,
+      const { peak: scheduledParallelPeak } = await schedule(
+        plan.subtasks,
+        options.config.maxParallel,
+        execute,
+        (t) =>
+          options.config.race &&
+          !options.config.forceModel &&
+          t.estimatedDifficulty === "high" &&
+          options.config.maxParallel >= 2
+            ? 2
+            : 1,
       );
       scheduledTaskParallelPeak = scheduledParallelPeak;
       const routed = plan.subtasks.flatMap((subtask) => {
-        const event = [...logger.events].reverse().find((candidate) =>
-          candidate.type === "specialist_route" && candidate.subtaskId === subtask.id);
+        const event = [...logger.events]
+          .reverse()
+          .find(
+            (candidate) =>
+              candidate.type === "specialist_route" &&
+              candidate.subtaskId === subtask.id,
+          );
         return event ? [{ subtask, event }] : [];
       });
       if (routed.length) {
-        const critical = (field: "expected_completion_latency_p50_ms" | "expected_completion_latency_p90_ms") => {
+        const critical = (
+          field:
+            | "expected_completion_latency_p50_ms"
+            | "expected_completion_latency_p90_ms",
+        ) => {
           const totals = new Map<string, number>();
           for (const { subtask, event } of routed) {
             const parents = subtask.dependsOn.map((id) => totals.get(id) ?? 0);
-            totals.set(subtask.id, Math.max(0, ...parents) + Number(event[field] ?? 0));
+            totals.set(
+              subtask.id,
+              Math.max(0, ...parents) + Number(event[field] ?? 0),
+            );
           }
           return Math.max(0, ...totals.values());
         };
         logger.log("execution_plan_summary", {
           subtasks: routed.map(({ subtask, event }) => ({
-            subtask: subtask.id, initial_model: event.selected_model,
+            subtask: subtask.id,
+            initial_model: event.selected_model,
             approved_recovery_candidates: event.approved_recovery_candidates,
             expected_cost_usd: event.expected_completion_cost_usd,
             expected_latency_p50_ms: event.expected_completion_latency_p50_ms,
             expected_latency_p90_ms: event.expected_completion_latency_p90_ms,
           })),
-          expected_total_model_cost_usd: routed.reduce((sum, { event }) =>
-            sum + Number(event.expected_completion_cost_usd ?? 0), 0),
-          expected_dag_critical_path_p50_ms: critical("expected_completion_latency_p50_ms"),
-          expected_dag_critical_path_p90_ms: critical("expected_completion_latency_p90_ms"),
+          expected_total_model_cost_usd: routed.reduce(
+            (sum, { event }) =>
+              sum + Number(event.expected_completion_cost_usd ?? 0),
+            0,
+          ),
+          expected_dag_critical_path_p50_ms: critical(
+            "expected_completion_latency_p50_ms",
+          ),
+          expected_dag_critical_path_p90_ms: critical(
+            "expected_completion_latency_p90_ms",
+          ),
           max_expected_parallelism: scheduledParallelPeak,
         });
       }
@@ -876,9 +1119,11 @@ export async function run(options: RunOptions) {
     const changed = (await backend.changes(integration.path)).map(
       (c) => c.path,
     );
-    const verificationPaths = finalVerificationScope(changed,
+    const verificationPaths = finalVerificationScope(
+      changed,
       stableRepairContext?.subtask.likelyWritePaths ?? [],
-      directRepairContext?.subtask.likelyWritePaths ?? []);
+      directRepairContext?.subtask.likelyWritePaths ?? [],
+    );
     const currentPlan = verificationPlan(finalProfile, verificationPaths, true);
     const allFinalCandidates = [
       ...currentPlan,
@@ -887,14 +1132,21 @@ export async function run(options: RunOptions) {
       ),
     ];
     if (!allFinalCandidates.some((candidate) => candidate.available)) {
-      const recovered = await focusedLocalReproduction(finalProfile, options.task, verificationPaths);
+      const recovered = await focusedLocalReproduction(
+        finalProfile,
+        options.task,
+        verificationPaths,
+      );
       if (recovered) {
         for (let i = allFinalCandidates.length - 1; i >= 0; i--)
           if (optionalUnavailableCheck(allFinalCandidates[i]!))
             allFinalCandidates.splice(i, 1);
         allFinalCandidates.push(recovered);
-        logger.log("verification_recovery", { phase: "final", command: recovered.command,
-          source: recovered.source });
+        logger.log("verification_recovery", {
+          phase: "final",
+          command: recovered.command,
+          source: recovered.source,
+        });
       }
     }
     const tinyDocs =
@@ -915,7 +1167,15 @@ export async function run(options: RunOptions) {
         finalProfile,
       );
     const impact = impactAwareVerificationSelection({
-      changedPaths: changed,
+      changedPaths:
+        !changed.length &&
+        logger.events.some(
+          (event) =>
+            event.type === "no_changes_required" &&
+            event.status === "VERIFIED_SUCCESS",
+        )
+          ? verificationPaths
+          : changed,
       candidates: allFinalCandidates,
       focusedCommands: taskVerificationCommands,
     });
@@ -924,10 +1184,15 @@ export async function run(options: RunOptions) {
           documentCommands.has(candidate.command),
         )
       : impact.candidates;
-    logger.log("verification_plan", { phase: "final", candidates: finalPlan,
+    logger.log("verification_plan", {
+      phase: "final",
+      candidates: finalPlan,
       why_full_suite: documentCommands ? false : impact.whyFullSuite,
       impacted_tests: documentCommands ? changed : impact.impactedTests,
-      evidence: documentCommands ? ["documentation-only verified targets"] : impact.evidence });
+      evidence: documentCommands
+        ? ["documentation-only verified targets"]
+        : impact.evidence,
+    });
     const finalCommands = [
       ...finalPlan.map((c) => c.command),
       ...(tinyDocs ? [] : taskVerificationCommands),
@@ -955,15 +1220,20 @@ export async function run(options: RunOptions) {
       );
       if (executable.checks.some((check) => check.outcome !== "CHECK_PASS")) {
         finalBaseline ??= await verify(
-          backend!.baselinePath, finalCommands,
+          backend!.baselinePath,
+          finalCommands,
           () => Math.min(options.config.commandTimeoutMs, budget.remainingMs()),
           (check) => logger.log("final_baseline_verification", check as any),
-          undefined, finalCandidates,
+          undefined,
+          finalCandidates,
         );
         executable = verificationAgainstBaseline(finalBaseline, executable);
       }
-      const unavailableChecks = executable.checks.filter((check) =>
-        check.outcome === "INFRA_FAILURE" || check.outcome === "CHECK_UNAVAILABLE");
+      const unavailableChecks = executable.checks.filter(
+        (check) =>
+          check.outcome === "INFRA_FAILURE" ||
+          check.outcome === "CHECK_UNAVAILABLE",
+      );
       if (unavailableChecks.length)
         logger.log("verification_infrastructure_failure", {
           phase: "final",
@@ -980,14 +1250,17 @@ export async function run(options: RunOptions) {
       );
       const allowed = directRepairContext?.subtask.likelyWritePaths ?? [];
       const writes = logger.events.filter(
-        (event) => event.type === "write_success" && event.subtaskId === "direct",
+        (event) =>
+          event.type === "write_success" && event.subtaskId === "direct",
       );
       const valid =
         changedPaths.length > 0 &&
         changedPaths.every((file) => allowed.includes(file)) &&
         writes.some((event) => changedPaths.includes(event.path)) &&
         !logger.events.some(
-          (event) => event.type === "write_scope_violation" && event.subtaskId === "direct",
+          (event) =>
+            event.type === "write_scope_violation" &&
+            event.subtaskId === "direct",
         );
       const structural: CommandResult = {
         command: "internal:tiny-documentation-structure",
@@ -1033,51 +1306,119 @@ export async function run(options: RunOptions) {
         const uncommitted = await currentDiff(integration!.path);
         if (uncommitted.trim()) return uncommitted;
         const changes = await backend!.changes(integration!.path);
-        const entries = await Promise.all(changes.slice(0, 8).map(async (change) => {
-          const before = await readFile(join(backend!.baselinePath, change.path), "utf8").catch(() => "<new file>");
-          const after = await readFile(join(integration!.path, change.path), "utf8").catch(() => "<deleted file>");
-          const beforeLines = before.split("\n"), afterLines = after.split("\n");
-          let first = 0;
-          while (first < beforeLines.length && first < afterLines.length &&
-            beforeLines[first] === afterLines[first]) first++;
-          const start = Math.max(0, first - 10);
-          return `--- baseline/${change.path}\n+++ candidate/${change.path}\n@@ -${start + 1} +${start + 1} @@\n` +
-            truncateBytes(beforeLines.slice(start, first + 30).map((line) => `-${line}`).join("\n"), 3000) + "\n" +
-            truncateBytes(afterLines.slice(start, first + 30).map((line) => `+${line}`).join("\n"), 3000);
-        }));
+        const entries = await Promise.all(
+          changes.slice(0, 8).map(async (change) => {
+            const before = await readFile(
+              join(backend!.baselinePath, change.path),
+              "utf8",
+            ).catch(() => "<new file>");
+            const after = await readFile(
+              join(integration!.path, change.path),
+              "utf8",
+            ).catch(() => "<deleted file>");
+            const beforeLines = before.split("\n"),
+              afterLines = after.split("\n");
+            let first = 0;
+            while (
+              first < beforeLines.length &&
+              first < afterLines.length &&
+              beforeLines[first] === afterLines[first]
+            )
+              first++;
+            const start = Math.max(0, first - 10);
+            return (
+              `--- baseline/${change.path}\n+++ candidate/${change.path}\n@@ -${start + 1} +${start + 1} @@\n` +
+              truncateBytes(
+                beforeLines
+                  .slice(start, first + 30)
+                  .map((line) => `-${line}`)
+                  .join("\n"),
+                3000,
+              ) +
+              "\n" +
+              truncateBytes(
+                afterLines
+                  .slice(start, first + 30)
+                  .map((line) => `+${line}`)
+                  .join("\n"),
+                3000,
+              )
+            );
+          }),
+        );
         return entries.join("\n");
       };
       let failedChecks = verificationRegressions(finalBaseline, verification);
       const failureContext = async (checks: CommandResult[]) => {
-        const identities = checks.flatMap((check) => newFailureIds(check, finalBaseline!.checks));
-        const contexts = await Promise.all(identities.slice(0, 4).map(async (identity) => {
-          const [relativePath, ...parts] = identity.split("::");
-          if (!relativePath || !/^[\w./-]+\.py$/.test(relativePath) || relativePath.includes("..")) return undefined;
-          const content = await readFile(await safePath(integration!.path, relativePath), "utf8").catch(() => "");
-          if (!content) return undefined;
-          const symbol = parts.at(-1);
-          const lines = content.split("\n");
-          const index = symbol ? lines.findIndex((line) => new RegExp(`\\b(?:def|class)\\s+${symbol.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\b`).test(line)) : -1;
-          const start = Math.max(0, index < 0 ? 0 : index - 8);
-          return { path: relativePath, symbol,
-            content: truncateBytes(lines.slice(start, start + 60).join("\n"), 6000) };
-        }));
-        return contexts.filter((item): item is NonNullable<typeof item> => !!item);
+        const identities = checks.flatMap((check) =>
+          newFailureIds(check, finalBaseline!.checks),
+        );
+        const contexts = await Promise.all(
+          identities.slice(0, 4).map(async (identity) => {
+            const [relativePath, ...parts] = identity.split("::");
+            if (
+              !relativePath ||
+              !/^[\w./-]+\.py$/.test(relativePath) ||
+              relativePath.includes("..")
+            )
+              return undefined;
+            const content = await readFile(
+              await safePath(integration!.path, relativePath),
+              "utf8",
+            ).catch(() => "");
+            if (!content) return undefined;
+            const symbol = parts.at(-1);
+            const lines = content.split("\n");
+            const index = symbol
+              ? lines.findIndex((line) =>
+                  new RegExp(
+                    `\\b(?:def|class)\\s+${symbol.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\b`,
+                  ).test(line),
+                )
+              : -1;
+            const start = Math.max(0, index < 0 ? 0 : index - 8);
+            return {
+              path: relativePath,
+              symbol,
+              content: truncateBytes(
+                lines.slice(start, start + 60).join("\n"),
+                6000,
+              ),
+            };
+          }),
+        );
+        return contexts.filter(
+          (item): item is NonNullable<typeof item> => !!item,
+        );
       };
-      const regressionDiagnostics = (baseline: VerificationResult, checks: CommandResult[]) =>
+      const regressionDiagnostics = (
+        baseline: VerificationResult,
+        checks: CommandResult[],
+      ) =>
         checks.map((check) => {
-          const previous = baseline.checks.find((item) => item.command === check.command);
-          const priorLines = new Set(`${previous?.stdout ?? ""}\n${previous?.stderr ?? ""}`
-            .split("\n").map((line) => line.trim()).filter(Boolean));
-          const novel = `${check.stdout}\n${check.stderr}`.split("\n")
+          const previous = baseline.checks.find(
+            (item) => item.command === check.command,
+          );
+          const priorLines = new Set(
+            `${previous?.stdout ?? ""}\n${previous?.stderr ?? ""}`
+              .split("\n")
+              .map((line) => line.trim())
+              .filter(Boolean),
+          );
+          const novel = `${check.stdout}\n${check.stderr}`
+            .split("\n")
             .filter((line) => line.trim() && !priorLines.has(line.trim()))
-            .filter((line) => /FAIL|Error|Assertion|expected|actual|\bE\s+|✖/i.test(line))
+            .filter((line) =>
+              /FAIL|Error|Assertion|expected|actual|\bE\s+|✖/i.test(line),
+            )
             .slice(0, 30);
           return `${check.command}\n${novel.join("\n")}`;
         });
       if (!failedChecks.length) {
         logger.log("stable_final_baseline_unchanged", {
-          checks: verification.checks.filter((check) => check.outcome === "CHECK_FAIL"),
+          checks: verification.checks.filter(
+            (check) => check.outcome === "CHECK_FAIL",
+          ),
         });
       }
       const failureSignature = (checks: CommandResult[]) =>
@@ -1096,22 +1437,48 @@ export async function run(options: RunOptions) {
         });
         // Execute the focused regression before repair. Never label broad-suite
         // stdout as if it came from a focused command.
-        const repairChecks = await prepareRepairChecks(failedChecks, finalBaseline.checks,
+        const repairChecks = await prepareRepairChecks(
+          failedChecks,
+          finalBaseline.checks,
           async (focusedCommand) => {
-            const focused = await verify(integration!.path, [focusedCommand],
-              () => Math.min(options.config.commandTimeoutMs, gateway.budget.remainingMs()),
-              (result) => logger.log("stable_repair_diagnostic", result), undefined,
-              [{ command: focusedCommand, kind: "test", available: true,
-                source: "repo-check:focused-new-regression", cwd: ".", confidence: 1,
-                mutatesSource: false, requiresInstalledDependencies: true }]);
+            const focused = await verify(
+              integration!.path,
+              [focusedCommand],
+              () =>
+                Math.min(
+                  options.config.commandTimeoutMs,
+                  gateway.budget.remainingMs(),
+                ),
+              (result) => logger.log("stable_repair_diagnostic", result),
+              undefined,
+              [
+                {
+                  command: focusedCommand,
+                  kind: "test",
+                  available: true,
+                  source: "repo-check:focused-new-regression",
+                  cwd: ".",
+                  confidence: 1,
+                  mutatesSource: false,
+                  requiresInstalledDependencies: true,
+                },
+              ],
+            );
             return focused.checks[0];
-          });
+          },
+        );
         const beforeRepair = JSON.stringify(
           await backend.changes(integration.path),
         );
-        const repairScope = new WriteScope(stableRepairContext.subtask.likelyWritePaths,
-          logger, stableRepairContext.subtask.id);
-        const repairCheckpoint = await AttemptCheckpoint.capture(integration.path, repairScope);
+        const repairScope = new WriteScope(
+          stableRepairContext.subtask.likelyWritePaths,
+          logger,
+          stableRepairContext.subtask.id,
+        );
+        const repairCheckpoint = await AttemptCheckpoint.capture(
+          integration.path,
+          repairScope,
+        );
         const modelEventStart = logger.events.length;
         let repair;
         try {
@@ -1142,7 +1509,10 @@ export async function run(options: RunOptions) {
                 failedDiff: await failedPatchContext(),
                 implicatedSymbols: stableRepairContext.evidence.symbols,
                 baselineChecks: finalBaseline.checks,
-                regressionDiagnostics: regressionDiagnostics(finalBaseline, failedChecks),
+                regressionDiagnostics: regressionDiagnostics(
+                  finalBaseline,
+                  failedChecks,
+                ),
                 failureContext: await failureContext(failedChecks),
               },
               extra: {
@@ -1208,8 +1578,10 @@ export async function run(options: RunOptions) {
           throw Error(`Stable final repair ${attempt} failed`);
         }
         try {
-          await assertWriteResponsibility(integration.path,
-            stableRepairContext.subtask);
+          await assertWriteResponsibility(
+            integration.path,
+            stableRepairContext.subtask,
+          );
         } catch (error) {
           await repairCheckpoint.restore(integration.path, repairScope);
           throw error;
@@ -1260,36 +1632,70 @@ export async function run(options: RunOptions) {
             break;
           continue;
         }
-        const verifiedRepairState = JSON.stringify(await backend.changes(integration.path));
+        const verifiedRepairState = JSON.stringify(
+          await backend.changes(integration.path),
+        );
         if (verifiedRepairState === "[]")
-          throw Error("Stable repair removed all task changes; baseline restoration is not verified completion");
-        const rawFinalVerification = await runFinalVerification().catch(async (error) => {
-          await repairCheckpoint.restore(integration!.path, repairScope);
-          throw error;
-        });
-        verification = verificationAgainstBaseline(finalBaseline, rawFinalVerification);
+          throw Error(
+            "Stable repair removed all task changes; baseline restoration is not verified completion",
+          );
+        const finalRepairVerification = await runFinalVerification().catch(
+          async (error) => {
+            await repairCheckpoint.restore(integration!.path, repairScope);
+            throw error;
+          },
+        );
+        // runFinalVerification is the single differential boundary. Applying
+        // the baseline a second time turns its preserved neutral CHECK_FAIL
+        // rows into a fabricated neutral terminal result even when the repair
+        // made every raw required check pass.
+        verification = finalRepairVerification;
         logger.log("stable_final_verification_relative_to_baseline", {
           status: verification.status,
-          regressions: verificationRegressions(finalBaseline, rawFinalVerification),
+          regressions: verification.checks.filter(
+            (check) =>
+              check.outcome === "CHECK_FAIL" &&
+              !check.source?.endsWith(":baseline_unchanged"),
+          ),
         });
         if (verification.status === "VERIFIED_SUCCESS") {
-          if (JSON.stringify(await backend.changes(integration.path)) !== verifiedRepairState)
-            throw Error("Verified repair state changed during final verification");
-          await backend.finalizeWorker(integration,
-            `agent: stable final repair ${attempt}`);
-          if (JSON.stringify(await backend.changes(integration.path)) !== verifiedRepairState)
-            throw Error("Verified repair state disappeared or changed during promotion");
+          if (
+            JSON.stringify(await backend.changes(integration.path)) !==
+            verifiedRepairState
+          )
+            throw Error(
+              "Verified repair state changed during final verification",
+            );
+          await backend.finalizeWorker(
+            integration,
+            `agent: stable final repair ${attempt}`,
+          );
+          if (
+            JSON.stringify(await backend.changes(integration.path)) !==
+            verifiedRepairState
+          )
+            throw Error(
+              "Verified repair state disappeared or changed during promotion",
+            );
           acceptedRepairState = verifiedRepairState;
           logger.log("stable_final_repair_success", { attempt });
           break;
         }
-        if (verification.status === "NOT_FULLY_VERIFIED" &&
-            verification.checks.some((check) =>
-              check.outcome === "INFRA_FAILURE" || check.outcome === "CHECK_UNAVAILABLE")) {
+        if (
+          verification.status === "NOT_FULLY_VERIFIED" &&
+          verification.checks.some(
+            (check) =>
+              check.outcome === "INFRA_FAILURE" ||
+              check.outcome === "CHECK_UNAVAILABLE",
+          )
+        ) {
           logger.log("stable_final_repair_operational_failure", {
             attempt,
-            checks: verification.checks.filter((check) =>
-              check.outcome === "INFRA_FAILURE" || check.outcome === "CHECK_UNAVAILABLE"),
+            checks: verification.checks.filter(
+              (check) =>
+                check.outcome === "INFRA_FAILURE" ||
+                check.outcome === "CHECK_UNAVAILABLE",
+            ),
           });
           break;
         }
@@ -1420,8 +1826,10 @@ export async function run(options: RunOptions) {
         ...applyResult,
         changes: await backend.persistCandidate(output, integration),
       };
-      if (acceptedRepairState !== undefined &&
-          JSON.stringify(applyResult.changes) !== acceptedRepairState) {
+      if (
+        acceptedRepairState !== undefined &&
+        JSON.stringify(applyResult.changes) !== acceptedRepairState
+      ) {
         await backend.apply(output, integration, false);
         throw Error("Accepted verified repair state changed before apply");
       }
@@ -1430,7 +1838,11 @@ export async function run(options: RunOptions) {
         integration,
         status === "VERIFIED_SUCCESS",
       );
-      if (options.apply && status === "VERIFIED_SUCCESS" && applyResult.status !== "applied")
+      if (
+        options.apply &&
+        status === "VERIFIED_SUCCESS" &&
+        applyResult.status !== "applied"
+      )
         throw Error("Verified state was not applied to the target repository");
     } catch (e) {
       status = "FAILED";

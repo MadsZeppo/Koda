@@ -76,7 +76,11 @@ for (const scenario of [
                       prompt: m.id === "cheap" ? "0.0000001" : "0.000001",
                       completion: m.id === "cheap" ? "0.0000002" : "0.000002",
                     },
-              supported_parameters: ["tools", "structured_outputs"],
+              supported_parameters: [
+                "tools",
+                "tool_choice",
+                "structured_outputs",
+              ],
             })),
           }),
         );

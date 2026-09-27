@@ -7,6 +7,7 @@ import type { TaskFingerprint } from "../router/taskFingerprint.js";
 import {
   isSourcePath,
   isTestPath,
+  resolveImports,
   type WorkerContext,
 } from "../context/compiler.js";
 
@@ -61,38 +62,91 @@ export function impactAwareVerificationSelection(options: {
   const focused = [...new Set(options.focusedCommands)];
   const relationships = options.relationships ?? [];
   const riskyPath = changed.some((path) =>
-    /(?:^|\/)(?:package(?:-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|pyproject\.toml|poetry\.lock|uv\.lock|requirements[^/]*\.txt|tsconfig[^/]*\.json|vite\.config\.|webpack\.config\.|rollup\.config\.|\.github\/workflows\/|migrations?\/|schemas?\/)/i.test(path));
+    /(?:^|\/)(?:package(?:-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|pyproject\.toml|poetry\.lock|uv\.lock|requirements[^/]*\.txt|tsconfig[^/]*\.json|vite\.config\.|webpack\.config\.|rollup\.config\.|\.github\/workflows\/|migrations?\/|schemas?\/)/i.test(
+      path,
+    ),
+  );
   const fp = options.fingerprint;
-  const riskyFingerprint = !!fp && (fp.publicApiRisk || fp.schemaRisk || fp.configRisk ||
-    fp.concurrencyRisk || fp.architectureHeavy || fp.crossComponent ||
-    fp.scope === "cross-component" || fp.difficulty.changeRisk === "high" ||
-    fp.difficulty.architecturalComplexity === "high");
+  const riskyFingerprint =
+    !!fp &&
+    (fp.publicApiRisk ||
+      fp.schemaRisk ||
+      fp.configRisk ||
+      fp.concurrencyRisk ||
+      fp.architectureHeavy ||
+      fp.crossComponent ||
+      fp.scope === "cross-component" ||
+      fp.difficulty.changeRisk === "high" ||
+      fp.difficulty.architecturalComplexity === "high");
   const testOnly = changed.length > 0 && changed.every(isTestPath);
-  const exactChangedTests = testOnly && changed.every((path) =>
-    focused.some((command) => commandMentions(command, path)));
+  const exactChangedTests =
+    testOnly &&
+    changed.every((path) =>
+      focused.some((command) => commandMentions(command, path)),
+    );
   const sourcePaths = changed.filter((path) => !isTestPath(path));
-  const backed = sourcePaths.length > 0 && sourcePaths.every((source) => {
-    const relation = relationships.find((entry) => entry.source === source && entry.tests.length);
-    return relation?.tests.every((test) => focused.some((command) => commandMentions(command, test)));
-  });
-  const impactedTests = testOnly ? changed : backed
-    ? [...new Set(relationships.filter((entry) => sourcePaths.includes(entry.source))
-      .flatMap((entry) => entry.tests))] : [];
-  const whyFullSuite = !changed.length || riskyPath || riskyFingerprint ||
+  const backed =
+    sourcePaths.length > 0 &&
+    sourcePaths.every((source) => {
+      const relation = relationships.find(
+        (entry) => entry.source === source && entry.tests.length,
+      );
+      return relation?.tests.every((test) =>
+        focused.some((command) => commandMentions(command, test)),
+      );
+    });
+  const impactedTests = testOnly
+    ? changed
+    : backed
+      ? [
+          ...new Set(
+            relationships
+              .filter((entry) => sourcePaths.includes(entry.source))
+              .flatMap((entry) => entry.tests),
+          ),
+        ]
+      : [];
+  const whyFullSuite =
+    !changed.length ||
+    riskyPath ||
+    riskyFingerprint ||
     !(exactChangedTests || backed);
-  const evidence = riskyPath ? ["risky repository contract changed"]
-    : riskyFingerprint ? ["task fingerprint requires broad verification"]
-      : exactChangedTests ? changed.map((path) => `exact changed test executed: ${path}`)
-        : backed ? relationships.filter((entry) => sourcePaths.includes(entry.source))
-          .map((entry) => `${entry.basis}:${entry.source}->${entry.tests.join(",")}`)
-          : ["test impact could not be established from inspected repository relationships"];
-  if (whyFullSuite) return { candidates: [...options.candidates], whyFullSuite,
-    impactedTests, evidence };
+  const evidence = riskyPath
+    ? ["risky repository contract changed"]
+    : riskyFingerprint
+      ? ["task fingerprint requires broad verification"]
+      : exactChangedTests
+        ? changed.map((path) => `exact changed test executed: ${path}`)
+        : backed
+          ? relationships
+              .filter((entry) => sourcePaths.includes(entry.source))
+              .map(
+                (entry) =>
+                  `${entry.basis}:${entry.source}->${entry.tests.join(",")}`,
+              )
+          : [
+              "test impact could not be established from inspected repository relationships",
+            ];
+  if (whyFullSuite)
+    return {
+      candidates: [...options.candidates],
+      whyFullSuite,
+      impactedTests,
+      evidence,
+    };
   return {
-    candidates: options.candidates.filter((candidate) =>
-      candidate.kind !== "test" || candidate.requirement === "required" ||
-      focused.includes(candidate.command) ||
-      impactedTests.some((path) => commandMentions(candidate.command, path))),
+    candidates: options.candidates.filter(
+      (candidate) =>
+        // The exact focused command below remains required and executes the
+        // changed test through the repository's own runner. In this narrowly
+        // proven test-only case it covers the declared test dimension, so do not
+        // repeat the aggregate suite merely because its package script was
+        // discovered as a required candidate. Explicit user/benchmark commands
+        // are appended separately by run.ts and are never removed here.
+        candidate.kind !== "test" ||
+        focused.includes(candidate.command) ||
+        impactedTests.some((path) => commandMentions(candidate.command, path)),
+    ),
     whyFullSuite,
     impactedTests,
     evidence,
@@ -190,9 +244,13 @@ function targetedNativeCheck(
     return undefined;
   }
 
-  const directTests = subtask.likelyWritePaths.filter((path) =>
-    isTestPath(path) && /\.[cm]?[jt]s$/.test(path));
-  if (directTests.length && directTests.length === subtask.likelyWritePaths.length)
+  const directTests = subtask.likelyWritePaths.filter(
+    (path) => isTestPath(path) && /\.[cm]?[jt]s$/.test(path),
+  );
+  if (
+    directTests.length &&
+    directTests.length === subtask.likelyWritePaths.length
+  )
     return "node --test " + directTests.map(quote).join(" ");
 
   const targets = subtask.likelyWritePaths.filter(isSourcePath);
@@ -216,14 +274,28 @@ function targetedNativeCheck(
     : undefined;
 }
 
-function targetedTsxCheck(subtask: Subtask, profile: RepoProfile, context: WorkerContext) {
-  if (profile.scripts.pretest || profile.scripts.posttest ||
-      !/^tsx --test tests\/\*\.test\.ts$/.test(profile.scripts.test ?? "") ||
-      profile.packageManager !== "pnpm") return undefined;
-  const tests = context.files.map((file) => file.path)
-    .filter((file) => subtask.likelyWritePaths.includes(file) &&
-      /^tests\/[\w./-]+\.test\.ts$/.test(file));
-  return tests.length ? `pnpm exec tsx --test ${tests.map(quote).join(" ")}` : undefined;
+function targetedTsxCheck(
+  subtask: Subtask,
+  profile: RepoProfile,
+  context: WorkerContext,
+) {
+  if (
+    profile.scripts.pretest ||
+    profile.scripts.posttest ||
+    !/^tsx --test tests\/\*\.test\.ts$/.test(profile.scripts.test ?? "") ||
+    profile.packageManager !== "pnpm"
+  )
+    return undefined;
+  const tests = context.files
+    .map((file) => file.path)
+    .filter(
+      (file) =>
+        subtask.likelyWritePaths.includes(file) &&
+        /^tests\/[\w./-]+\.test\.ts$/.test(file),
+    );
+  return tests.length
+    ? `pnpm exec tsx --test ${tests.map(quote).join(" ")}`
+    : undefined;
 }
 
 export function targetedProjectUnitNativeCheck(
@@ -362,6 +434,22 @@ export function workerChecksAreTaskSpecific(
   }
 
   const tests = context.files.filter((file) => isTestPath(file.path));
+  const known = new Set(context.files.map((file) => file.path));
+  const imports = new Map(context.files.map((file) => [
+    file.path,
+    resolveImports(file.path, file.snippet, known),
+  ]));
+  const reaches = (from: string, target: string) => {
+    const pending = [from], seen = new Set<string>();
+    while (pending.length) {
+      const current = pending.pop()!;
+      if (current === target) return true;
+      if (seen.has(current)) continue;
+      seen.add(current);
+      pending.push(...(imports.get(current) ?? []));
+    }
+    return false;
+  };
 
   return repoBackedVerificationCommands(
     subtask.verificationCommands,
@@ -374,7 +462,8 @@ export function workerChecksAreTaskSpecific(
     return subtask.likelyWritePaths.every((target) =>
       isTestPath(target)
         ? mentioned.some((test) => test.path === target)
-        : relevantTests(target, mentioned).length > 0,
+        : relevantTests(target, mentioned).length > 0 ||
+          mentioned.some((test) => reaches(test.path, target)),
     );
   });
 }

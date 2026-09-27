@@ -52,6 +52,26 @@ test("coalescing keeps independent writes separate and does not merge broad wild
       2,
     );
 });
+test("coalescing keeps a shared verified invariant atomic only when the inspected graph connects it", () => {
+  const store = {
+    ...task("store", ["src/store.js"]),
+    likelyReadPaths: ["src/store.js"],
+    verificationCommands: ["node --test test/transfer.test.js"],
+  };
+  const transfer = {
+    ...task("transfer", ["src/transfer.js"]),
+    likelyReadPaths: ["src/transfer.js", "src/store.js"],
+    verificationCommands: ["node --test test/transfer.test.js"],
+  };
+  assert.equal(normalizePlan(plan([store, transfer])).after, 1);
+  assert.equal(
+    normalizePlan(plan([
+      { ...store, likelyReadPaths: ["src/store.js"] },
+      { ...transfer, likelyReadPaths: ["src/transfer.js"] },
+    ])).after,
+    2,
+  );
+});
 test("context-only DAG nodes are removed with dependency rewiring; real artifacts remain", () => {
   const inspect = {
     ...task("inspect", ["."]),

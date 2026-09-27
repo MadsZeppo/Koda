@@ -69,6 +69,18 @@ test("localized single-file DIRECT is budgeted as one structured model call", ()
   assert.ok((policy.minimumViableCostUsd ?? Infinity) < base.remainingUsd);
 });
 
+test("localized single-file PLANNED worker uses the same one-call edit contract", () => {
+  const policy = attemptLimitPolicy({
+    ...base,
+    fingerprint: fingerprint({ executionStrategy: "planned" }),
+  });
+
+  assert.equal(policy.localized, true);
+  assert.equal(policy.directEdit, true);
+  assert.equal(policy.viableCalls, 1);
+  assert.equal(policy.viable, true);
+});
+
 test("localized STABLE keeps the existing multi-turn mini-SWE viability bound", () => {
   const policy = attemptLimitPolicy({
     ...base,
@@ -94,4 +106,20 @@ test("multi-file DIRECT never receives the one-call direct-edit budget contract"
 
   assert.equal(policy.directEdit, false);
   assert.ok(policy.viableCalls > 1);
+});
+
+test("DIRECT uses routed p90 to bound a stalled provider without changing the hard cap", () => {
+  const measured = attemptLimitPolicy({
+    ...base,
+    fingerprint: fingerprint(),
+    plannedLatencyP90Ms: 3_400,
+  });
+  const unknown = attemptLimitPolicy({
+    ...base,
+    fingerprint: fingerprint(),
+  });
+
+  assert.equal(measured.timeoutMs, 10_000);
+  assert.equal(unknown.timeoutMs, 45_000);
+  assert.equal(measured.viable, true);
 });

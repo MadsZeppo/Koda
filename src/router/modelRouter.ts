@@ -7,21 +7,44 @@ import { Catalog } from "../openrouter/catalog.js";
 import { History, attributableCodingFailure } from "./history.js";
 import { historyMatches, taskBucket, type Features } from "./features.js";
 import { type PoolModel, type Metadata, supportsParameters } from "./pool.js";
-import { CapabilityRegistry, type ModelDiscoveryAdapter } from "./capabilityRegistry.js";
-import { optimizeSpecialists, type SpecialistEstimate } from "./routeOptimizer.js";
+import {
+  CapabilityRegistry,
+  type ModelDiscoveryAdapter,
+} from "./capabilityRegistry.js";
+import {
+  optimizeSpecialists,
+  type SpecialistEstimate,
+} from "./routeOptimizer.js";
 import type { TaskFingerprint } from "./taskFingerprint.js";
-import { activeModelBoard, chooseAdaptiveRecovery, freezeExecutionPolicy,
-  requiredQualityClass, type FrozenExecutionPolicy, type RecoveryObservation } from "./controlPolicy.js";
-export const routerStateDirectory = (config: Config) => config.routing.stateDirectory ??
-  join(homedir(), ".koda", "model-router",
-    createHash("sha256").update(config.baseUrl).digest("hex").slice(0, 12));
+import {
+  activeModelBoard,
+  chooseAdaptiveRecovery,
+  effectiveRecoveryFailureMode,
+  freezeExecutionPolicy,
+  requiredQualityClass,
+  type FrozenExecutionPolicy,
+  type RecoveryObservation,
+} from "./controlPolicy.js";
+import { usesDirectEditEngine } from "../agent/attemptPolicy.js";
+export const routerStateDirectory = (config: Config) =>
+  config.routing.stateDirectory ??
+  join(
+    homedir(),
+    ".koda",
+    "model-router",
+    createHash("sha256").update(config.baseUrl).digest("hex").slice(0, 12),
+  );
 export interface FrozenExecutionPlan extends FrozenExecutionPolicy<SpecialistEstimate> {
   readonly type: "single" | "cascade";
+  readonly executionEngine: TaskFingerprint["executionStrategy"];
   readonly initialCandidate: SpecialistEstimate;
   readonly evidenceClass: SpecialistEstimate["evidenceLevel"];
   readonly conservativeQuality: number;
   readonly expectedCostPerVerifiedSolve: number;
   readonly expectedLatencyMs: number;
+  readonly expectedLatencyP50Ms?: number;
+  readonly expectedLatencyP90Ms?: number;
+  readonly expectedTotalCostUsd?: number;
   readonly whySelected: string;
   readonly verificationStrength: TaskFingerprint["verificationStrength"];
   readonly stopConditions: readonly string[];
@@ -51,14 +74,18 @@ export function rankCandidates(
 ): Candidate[] {
   const candidates = models.map((model) => {
     const md = metadata.get(model.id) ?? {};
-    const protocolKnown = md.routableParameterSets !== undefined || md.supportedParameters !== undefined;
+    const protocolKnown =
+      md.routableParameterSets !== undefined ||
+      md.supportedParameters !== undefined;
     const rows = history.filter(
       (r) =>
         r.modelRequested === model.id &&
-        (r.verification !== "FAILED" || features.taskKind === "planning" || attributableCodingFailure(r)) &&
+        (r.verification !== "FAILED" ||
+          features.taskKind === "planning" ||
+          attributableCodingFailure(r)) &&
         historyMatches(r.features, features) &&
         !/provider|infra|timeout|rate.limit|transport|\b429\b|HTTP 5\d\d|unavailable|unknown pricing/i.test(
-          r.verification === "FAILED" ? r.reason ?? "" : "",
+          r.verification === "FAILED" ? (r.reason ?? "") : "",
         ) &&
         (features.taskKind === "planning"
           ? ["DAG_VALIDATED", "FAILED"]
@@ -97,7 +124,9 @@ export function rankCandidates(
     const plannerUnsupported =
       features.taskKind === "planning" &&
       (protocolKnown
-        ? !["structured_outputs", "response_format"].some((parameter) => supportsParameters(md, [parameter]))
+        ? !["structured_outputs", "response_format"].some((parameter) =>
+            supportsParameters(md, [parameter]),
+          )
         : !model.strengths.includes("structured_output"));
     const rejected = plannerUnsupported
       ? "structured planning unsupported"
@@ -111,8 +140,12 @@ export function rankCandidates(
               ? "context limit"
               : features.taskKind !== "planning" &&
                   (protocolKnown
-                    ? !supportsParameters(md, features.executionStrategy === "stable"
-                        ? ["tools", "tool_choice"] : ["tools"])
+                    ? !supportsParameters(
+                        md,
+                        features.executionStrategy === "stable"
+                          ? ["tools", "tool_choice"]
+                          : ["tools"],
+                      )
                     : !model.strengths.includes("tool_use"))
                 ? "tools unsupported"
                 : cost > (limits.budgetUsd ?? Infinity)
@@ -121,9 +154,18 @@ export function rankCandidates(
                     ? "already attempted or reserved for race"
                     : undefined;
     const qualityTargetMet = quality >= routing.minimumQuality;
-    return { model, metadata: md, quality, cost, latency, score: 0,
-      rejected, hardRejection: rejected, qualityTargetMet,
-      softPenalties: qualityTargetMet ? [] : ["below preferred quality target"] };
+    return {
+      model,
+      metadata: md,
+      quality,
+      cost,
+      latency,
+      score: 0,
+      rejected,
+      hardRejection: rejected,
+      qualityTargetMet,
+      softPenalties: qualityTargetMet ? [] : ["below preferred quality target"],
+    };
   });
   const eligible = candidates.filter((c) => !c.rejected);
   const costScale = Math.max(1e-9, ...eligible.map((c) => c.cost)),
@@ -132,11 +174,18 @@ export function rankCandidates(
     c.score =
       (routing.costWeight * c.cost) / costScale +
       (routing.latencyWeight * c.latency) / timeScale;
-  const targetAvailable = eligible.some((candidate) => candidate.qualityTargetMet);
-  return candidates.sort((a, b) => Number(!!a.hardRejection) - Number(!!b.hardRejection) ||
-    (targetAvailable
-      ? Number(b.qualityTargetMet) - Number(a.qualityTargetMet) || a.score - b.score
-      : b.quality - a.quality || a.score - b.score) || a.model.id.localeCompare(b.model.id));
+  const targetAvailable = eligible.some(
+    (candidate) => candidate.qualityTargetMet,
+  );
+  return candidates.sort(
+    (a, b) =>
+      Number(!!a.hardRejection) - Number(!!b.hardRejection) ||
+      (targetAvailable
+        ? Number(b.qualityTargetMet) - Number(a.qualityTargetMet) ||
+          a.score - b.score
+        : b.quality - a.quality || a.score - b.score) ||
+      a.model.id.localeCompare(b.model.id),
+  );
 }
 export class PoolRouter {
   readonly catalog: Catalog;
@@ -159,7 +208,12 @@ export class PoolRouter {
       config.modelPool!.models,
     );
     this.history = new History(dir);
-    this.capabilities = new CapabilityRegistry(config, this.catalog, adapter, dir);
+    this.capabilities = new CapabilityRegistry(
+      config,
+      this.catalog,
+      adapter,
+      dir,
+    );
   }
   async selectExecutionPlan(
     fingerprint: TaskFingerprint,
@@ -172,81 +226,208 @@ export class PoolRouter {
     if (raceGroup && !lockHeld) {
       const prior = this.raceRoutingLocks.get(raceGroup) ?? Promise.resolve();
       let release!: () => void;
-      const current = new Promise<void>((resolve) => { release = resolve; });
+      const current = new Promise<void>((resolve) => {
+        release = resolve;
+      });
       const queued = prior.then(() => current);
       this.raceRoutingLocks.set(raceGroup, queued);
       await prior;
       try {
-        return await this.selectExecutionPlan(fingerprint, features, subtaskId,
-          budgetUsd, raceGroup, true);
+        return await this.selectExecutionPlan(
+          fingerprint,
+          features,
+          subtaskId,
+          budgetUsd,
+          raceGroup,
+          true,
+        );
       } finally {
         release();
         if (this.raceRoutingLocks.get(raceGroup) === queued)
           this.raceRoutingLocks.delete(raceGroup);
       }
     }
-    // Load the cached/free provider catalog before building specialist
-    // candidates so Stable never routes from a model-level parameter union
-    // when concrete endpoint protocol evidence is available or required.
-    // Catalog metadata is free provider evidence. Resolve it before building
-    // the task board so a cold process can price and protocol-filter configured
-    // models instead of failing before the first coding attempt.
-    await this.catalog.get();
-    const models = (await this.capabilities.forTask(fingerprint)).filter(
+    // Selection normally uses the last-known-good local catalog. On a genuine
+    // cold start there is no price with which to enforce the run budget, so do
+    // one catalog acquisition and rebuild from that cached result. Subsequent
+    // selections never wait for the provider refresh.
+    let discovered = await this.capabilities.forTask(fingerprint);
+    const hasPricedCandidate = discovered.some(({ metadata }) =>
+      Number.isFinite(metadata.inputPrice) &&
+      Number.isFinite(metadata.outputPrice));
+    if (!hasPricedCandidate) {
+      await this.catalog.get();
+      discovered = await this.capabilities.reloadCachedForTask(fingerprint);
+    } else {
+      void this.catalog.get().catch(() => undefined);
+    }
+    const models = discovered.filter(
       (item) => !this.disabled.has(item.model.id),
     );
-    const reserved = raceGroup ? this.raceSelections.get(raceGroup) ?? new Set<string>() : new Set<string>();
+    const reserved = raceGroup
+      ? (this.raceSelections.get(raceGroup) ?? new Set<string>())
+      : new Set<string>();
     const result = optimizeSpecialists(
-      models, fingerprint, features, this.history.read(), this.config, budgetUsd,
-      this.history.readOperations(), reserved,
+      models,
+      fingerprint,
+      features,
+      this.history.read(),
+      this.config,
+      budgetUsd,
+      this.history.readOperations(),
+      reserved,
+      this.history.readEfficiency(),
     );
     const cascade = result.cascade;
-    if (!cascade.length || !result.reference)
-      throw Error("No compatible priced model fits the frozen execution policy");
+    if (!cascade.length || !result.reference) {
+      const diagnostic = {
+        reference: result.reference?.model.id ?? null,
+        allowed_regret: result.allowedRegret,
+        candidates: result.considered.map((candidate) => ({
+          id: candidate.model.id,
+          tier: candidate.model.tier,
+          rejected: candidate.rejected ?? null,
+          hard_rejection: candidate.hardRejection ?? null,
+          conservative_quality: candidate.conservativeQuality,
+          quality: candidate.quality,
+          quality_floor_passed: candidate.qualityFloorPassed,
+          expected_attempt_cost: candidate.expectedAttemptCost,
+          reservation_cost: candidate.reservationCost,
+          expected_latency_ms: candidate.expectedAttemptLatencyMs,
+          latency_p90_ms: candidate.latencyP90Ms,
+          deadline_feasible: candidate.deadlineFeasible,
+          evidence_level: candidate.evidenceLevel,
+          local_quality_evidence: candidate.localQualityEvidence,
+        })),
+        plans: result.plans.map((plan) => ({
+          models: plan.models,
+          eligible: plan.eligible,
+          reason: plan.reason,
+          hard_rejection: plan.hardRejection ?? null,
+          quality_gap: plan.qualityGap,
+          expected_cost: plan.expectedCompletionCost,
+          expected_latency_ms: plan.expectedCompletionLatencyMs,
+          conservative_final_success: plan.conservativeFinalSuccess,
+        })),
+      };
+
+      this.logger.log("execution_plan_rejected", {
+        subtaskId,
+        ...diagnostic,
+      });
+
+      throw Error(
+        "No compatible priced model fits the frozen execution policy: " +
+          JSON.stringify(diagnostic),
+      );
+    }
     if (raceGroup && cascade.length) {
       reserved.add(cascade[0]!.model.id);
       this.raceSelections.set(raceGroup, reserved);
     }
-    const board = activeModelBoard(result.considered, this.config.routing.shortlistSize);
-    const approvedCandidateSet = [...new Map([
-      ...cascade.map((candidate) => [candidate.model.id, candidate] as const),
-      ...board.approved.map((candidate) => [candidate.model.id, candidate] as const),
-    ]).values()].filter((candidate) => !candidate.hardRejection);
-    const planId = `route-${createHash("sha256").update(JSON.stringify({
-      subtaskId, initial: cascade[0]!.model.id,
-      approved: approvedCandidateSet.map((candidate) => candidate.model.id),
-      verification: fingerprint.verificationStrength,
-    })).digest("hex").slice(0, 12)}`;
+    const board = activeModelBoard(
+      result.considered,
+      this.config.routing.shortlistSize,
+    );
+    // The optimizer's coding cascade remains authoritative. Also freeze one
+    // bounded, quality-safe alternative first leg for provider/protocol
+    // failure. Its own optimizer-approved cascade preserves the same final
+    // quality floor; it is never eligible for coding-quality de-escalation.
+    const qualityCandidates = cascade.filter(
+      (candidate) => !candidate.hardRejection,
+    );
+    const qualityIds = new Set(
+      qualityCandidates.map((candidate) => candidate.model.id),
+    );
+    const operationalRecovery = result.considered
+      .filter((candidate) =>
+        !qualityIds.has(candidate.model.id) &&
+        !candidate.rejected &&
+        !candidate.hardRejection &&
+        candidate.qualityFloorPassed &&
+        candidate.deadlineFeasible,
+      )
+      .sort((a, b) =>
+        a.score - b.score ||
+        a.operationalErrorRate - b.operationalErrorRate ||
+        a.expectedAttemptLatencyMs - b.expectedAttemptLatencyMs ||
+        a.expectedAttemptCost - b.expectedAttemptCost ||
+        a.model.id.localeCompare(b.model.id),
+      )
+      .slice(0, 1);
+    const approvedCandidateSet = [
+      ...qualityCandidates,
+      ...operationalRecovery,
+    ];
+    const planId = `route-${createHash("sha256")
+      .update(
+        JSON.stringify({
+          subtaskId,
+          engine: fingerprint.executionStrategy,
+          initial: cascade[0]!.model.id,
+          approved: approvedCandidateSet.map((candidate) => candidate.model.id),
+          verification: fingerprint.verificationStrength,
+        }),
+      )
+      .digest("hex")
+      .slice(0, 12)}`;
     const qualityClass = requiredQualityClass(fingerprint);
-    const requiredQuality = Math.max(0.05,
-      result.reference.conservativeQuality - result.allowedRegret);
-    const planType: FrozenExecutionPlan["type"] = cascade.length > 1 ? "cascade" : "single";
+    const requiredQuality = Math.max(
+      0.05,
+      result.reference.conservativeQuality - result.allowedRegret,
+    );
+    const planType: FrozenExecutionPlan["type"] =
+      cascade.length > 1 ? "cascade" : "single";
     const plan = freezeExecutionPolicy({
       id: planId,
       type: planType,
+      executionEngine: fingerprint.executionStrategy,
       taskFingerprint: fingerprint,
       qualityClass,
       requiredQuality: Number(requiredQuality.toFixed(3)),
       approvedCandidateSet,
+      qualityCascadeModelIds: qualityCandidates.map(
+        (candidate) => candidate.model.id,
+      ),
+      operationalRecoveryModelIds: operationalRecovery.map(
+        (candidate) => candidate.model.id,
+      ),
       activeBoard: board.board,
       referenceModel: result.reference.model.id,
       initialModel: cascade[0]!.model.id,
       initialCandidate: cascade[0]!,
       evidenceClass: cascade[0]!.evidenceLevel,
-      conservativeQuality: Number((result.selectedPlan?.conservativeFinalSuccess ??
-        cascade[0]!.conservativeQuality).toFixed(3)),
-      expectedCostPerVerifiedSolve: result.selectedPlan?.costPerVerifiedCompletion ??
-        cascade[0]!.expectedCompletionCost / Math.max(0.05, cascade[0]!.conservativeQuality),
-      expectedLatencyMs: result.selectedPlan?.expectedCompletionLatencyMs ??
+      conservativeQuality: Number(
+        (
+          result.selectedPlan?.conservativeFinalSuccess ??
+          cascade[0]!.conservativeQuality
+        ).toFixed(3),
+      ),
+      expectedCostPerVerifiedSolve:
+        result.selectedPlan?.costPerVerifiedCompletion ??
+        cascade[0]!.expectedCompletionCost /
+          Math.max(0.05, cascade[0]!.conservativeQuality),
+      expectedLatencyMs:
+        result.selectedPlan?.expectedCompletionLatencyMs ??
         cascade[0]!.expectedCompletionLatencyMs,
+      expectedLatencyP50Ms: result.selectedPlan?.completionLatencyP50Ms,
+      expectedLatencyP90Ms: result.selectedPlan?.completionLatencyP90Ms,
+      expectedTotalCostUsd: result.selectedPlan?.expectedCompletionCost,
       whySelected: result.selectedPlan?.reason ?? result.reason,
       totalBudgetUsd: budgetUsd,
       latencyBudgetMs: this.config.stageMaxMinutes * 60_000,
-      maxCodingAttempts: Math.min(this.config.maxIterations, 3, approvedCandidateSet.length),
+      maxCodingAttempts: Math.min(
+        this.config.maxIterations,
+        3,
+        approvedCandidateSet.length,
+      ),
       maxScoutCalls: fingerprint.localizationConfidence === "low" ? 1 : 0,
       providerConstraints: {
-        requiredParameters: fingerprint.executionStrategy === "stable"
-          ? ["tools", "tool_choice"] : ["tools"],
+        requiredParameters:
+          fingerprint.executionStrategy === "stable" ||
+            usesDirectEditEngine(fingerprint)
+            ? ["tools", "tool_choice"]
+            : ["tools"],
         sessionSticky: true,
       },
       writeScopes: Object.freeze([...features.likelyWritePaths]),
@@ -256,62 +437,162 @@ export class PoolRouter {
         broaderProject: fingerprint.broaderProjectVerification === true,
       },
       verificationStrength: fingerprint.verificationStrength,
-      stopConditions: Object.freeze(["verified", "budget exhausted", "plan exhausted"]),
+      stopConditions: Object.freeze([
+        "verified",
+        "budget exhausted",
+        "plan exhausted",
+      ]),
     });
     this.logger.log("specialist_route", {
-      subtaskId, fingerprint, reason: result.reason,
+      subtaskId,
+      fingerprint,
+      reason: result.reason,
       selected_plan_id: plan.id,
       selected_plan_type: plan.type,
+      execution_engine: plan.executionEngine,
       verification_strength: fingerprint.verificationStrength,
       quality_class: qualityClass,
       required_quality: Number(requiredQuality.toFixed(3)),
       model_evidence_class: cascade[0]?.evidenceLevel ?? "UNKNOWN",
-      approved_recovery_candidates: approvedCandidateSet.slice(1).map((candidate) => candidate.model.id),
+      approved_recovery_candidates: approvedCandidateSet
+        .slice(1)
+        .map((candidate) => candidate.model.id),
+      quality_recovery_candidates: qualityCandidates
+        .slice(1)
+        .map((candidate) => candidate.model.id),
+      operational_recovery_candidates: operationalRecovery.map(
+        (candidate) => candidate.model.id,
+      ),
       active_model_board: board.board.map((entry) => ({
-        model: entry.candidate.model.id, lifecycle: entry.lifecycle, reason: entry.reason,
+        model: entry.candidate.model.id,
+        lifecycle: entry.lifecycle,
+        reason: entry.reason,
       })),
       allowed_quality_regret: result.allowedRegret,
-      first_attempt_quality_floor: result.considered[0]?.firstAttemptQualityFloor ?? this.config.routing.minimumQuality,
+      first_attempt_quality_floor:
+        result.considered[0]?.firstAttemptQualityFloor ??
+        this.config.routing.minimumQuality,
       reference_model: result.reference?.model.id ?? null,
-      reference_expected_success: result.reference ? Number(result.reference.quality.toFixed(3)) : null,
-      reference_conservative_success: result.reference ? Number(result.reference.conservativeQuality.toFixed(3)) : null,
+      reference_expected_success: result.reference
+        ? Number(result.reference.quality.toFixed(3))
+        : null,
+      reference_conservative_success: result.reference
+        ? Number(result.reference.conservativeQuality.toFixed(3))
+        : null,
       reference_plan: result.referencePlan ?? null,
-      reference_expected_cost_usd: result.referencePlan?.expectedCompletionCost ?? null,
-      reference_expected_latency_ms: result.referencePlan?.expectedCompletionLatencyMs ?? null,
+      reference_expected_cost_usd:
+        result.referencePlan?.expectedCompletionCost ?? null,
+      reference_expected_latency_ms:
+        result.referencePlan?.expectedCompletionLatencyMs ?? null,
       selected_model: cascade[0]?.model.id ?? null,
       selected_plan: result.selectedPlan ?? null,
-      expected_standalone_success: result.selectedPlan ? Number(result.selectedPlan.expectedStandaloneSuccess.toFixed(3)) : null,
-      expected_final_success: result.selectedPlan ? Number(result.selectedPlan.expectedFinalSuccess.toFixed(3)) : null,
-      conservative_quality: result.selectedPlan ? Number(result.selectedPlan.conservativeFinalSuccess.toFixed(3)) : null,
-      estimated_cost_per_verified_solve: result.selectedPlan?.costPerVerifiedCompletion ?? null,
+      expected_standalone_success: result.selectedPlan
+        ? Number(result.selectedPlan.expectedStandaloneSuccess.toFixed(3))
+        : null,
+      expected_final_success: result.selectedPlan
+        ? Number(result.selectedPlan.expectedFinalSuccess.toFixed(3))
+        : null,
+      conservative_quality: result.selectedPlan
+        ? Number(result.selectedPlan.conservativeFinalSuccess.toFixed(3))
+        : null,
+      estimated_cost_per_verified_solve:
+        result.selectedPlan?.costPerVerifiedCompletion ?? null,
       why_selected: result.selectedPlan?.reason ?? result.reason,
-      expected_completion_cost_usd: result.selectedPlan?.expectedCompletionCost ?? null,
-      expected_completion_latency_ms: result.selectedPlan?.expectedCompletionLatencyMs ?? null,
-      expected_completion_latency_p50_ms: result.selectedPlan?.completionLatencyP50Ms ?? null,
-      expected_completion_latency_p90_ms: result.selectedPlan?.completionLatencyP90Ms ?? null,
+      expected_completion_cost_usd:
+        result.selectedPlan?.expectedCompletionCost ?? null,
+      expected_completion_cost_p50_usd:
+        result.selectedPlan?.completionCostP50Usd ?? null,
+      expected_completion_cost_p90_usd:
+        result.selectedPlan?.completionCostP90Usd ?? null,
+      expected_completion_cost_p99_usd:
+        result.selectedPlan?.completionCostP99Usd ?? null,
+      risk_adjusted_cost_per_verified_solve:
+        result.selectedPlan?.riskAdjustedCostPerVerifiedCompletion ?? null,
+      expected_completion_latency_ms:
+        result.selectedPlan?.expectedCompletionLatencyMs ?? null,
+      expected_completion_latency_p50_ms:
+        result.selectedPlan?.completionLatencyP50Ms ?? null,
+      expected_completion_latency_p90_ms:
+        result.selectedPlan?.completionLatencyP90Ms ?? null,
+      expected_completion_latency_p99_ms:
+        result.selectedPlan?.completionLatencyP99Ms ?? null,
+      expected_completion_tokens:
+        result.selectedPlan?.completionTokensExpected ?? null,
+      expected_completion_tokens_p50:
+        result.selectedPlan?.completionTokensP50 ?? null,
+      expected_completion_tokens_p90:
+        result.selectedPlan?.completionTokensP90 ?? null,
+      expected_completion_tokens_p99:
+        result.selectedPlan?.completionTokensP99 ?? null,
+      deadline_miss_probability:
+        result.selectedPlan?.deadlineMissProbability ?? null,
+      candidate_funnel: {
+        catalog_plans: result.considered.length,
+        compatible: result.considered.filter((candidate) => !candidate.hardRejection).length,
+        runtime_feasible: result.considered.filter((candidate) =>
+          !candidate.hardRejection && candidate.deadlineFeasible).length,
+        quality_scored: result.plans.length,
+        quality_safe: result.plans.filter((candidate) => candidate.eligible).length,
+        economics_eligible: result.plans.filter((candidate) => candidate.eligible).length,
+        selected: result.selectedPlan ? 1 : 0,
+      },
       quality_gap: result.selectedPlan?.qualityGap ?? null,
       plans: result.plans,
       candidates: result.considered.map((candidate) => ({
         id: candidate.model.id,
+        selected: candidate.model.id === cascade[0]?.model.id,
+        recovery_eligible: approvedCandidateSet.slice(1).some((entry) =>
+          entry.model.id === candidate.model.id),
+        rejection_stage: candidate.hardRejection
+          ? "COMPATIBILITY_REJECTED"
+          : candidate.rejected
+            ? candidate.rejected === "outside bounded routing shortlist"
+              ? "ECONOMICS_NOT_SELECTED"
+              : candidate.localQualityEvidence > 0
+                ? "QUALITY_NEGATIVE_EVIDENCE_REJECTED"
+                : "QUALITY_UNCERTAINTY_REJECTED"
+            : candidate.model.id === cascade[0]?.model.id
+              ? "SELECTED"
+              : "ECONOMICS_NOT_SELECTED",
+        primary_rejection_reason: candidate.rejected ?? null,
         rejected: candidate.rejected,
         hard_rejection: candidate.hardRejection ?? null,
         soft_penalties: candidate.softPenalties ?? [],
-        reservation_cost_usd: Number.isFinite(candidate.reservationCost) ? candidate.reservationCost : null,
+        reservation_cost_usd: Number.isFinite(candidate.reservationCost)
+          ? candidate.reservationCost
+          : null,
         success: candidate.quality,
         expected_final_success: candidate.expectedFinalSuccess,
         conservative_success: candidate.conservativeQuality,
         quality_gap: candidate.qualityGap,
         uncertainty: candidate.uncertainty,
         quality_floor_passed: candidate.qualityFloorPassed,
+        first_attempt_quality_floor: candidate.firstAttemptQualityFloor,
+        local_quality_evidence: candidate.localQualityEvidence,
         confidence: candidate.confidence,
         call_cost_usd: Number.isFinite(candidate.cost) ? candidate.cost : null,
-        expected_completion_cost_usd: Number.isFinite(candidate.expectedCompletionCost) ? candidate.expectedCompletionCost : null,
-        expected_completion_latency_ms: Number.isFinite(candidate.expectedCompletionLatencyMs) ? candidate.expectedCompletionLatencyMs : null,
+        expected_completion_cost_usd: Number.isFinite(
+          candidate.expectedCompletionCost,
+        )
+          ? candidate.expectedCompletionCost
+          : null,
+        expected_completion_latency_ms: Number.isFinite(
+          candidate.expectedCompletionLatencyMs,
+        )
+          ? candidate.expectedCompletionLatencyMs
+          : null,
         expected_input_tokens: candidate.expectedInputTokens,
         expected_output_tokens: candidate.expectedOutputTokens,
         expected_total_tokens: candidate.expectedTotalTokens,
         token_efficiency: candidate.tokenEfficiency,
-        conservative_attempt_cost_usd: Number.isFinite(candidate.conservativeAttemptCost) ? candidate.conservativeAttemptCost : null,
+        conservative_attempt_cost_usd: Number.isFinite(
+          candidate.conservativeAttemptCost,
+        )
+          ? candidate.conservativeAttemptCost
+          : null,
+        p99_attempt_cost_usd: Number.isFinite(candidate.p99AttemptCost)
+          ? candidate.p99AttemptCost
+          : null,
         knowledge_sources: candidate.knowledgeSources,
         evidence_level: candidate.evidenceLevel,
         observation_count: candidate.observationCount,
@@ -319,29 +600,49 @@ export class PoolRouter {
         latency_ms: candidate.latency,
         call_count: candidate.callCount,
         latency_ewma_ms: candidate.latencyEwmaMs,
+        latency_p99_ms: candidate.latencyP99Ms,
         latency_p50_ms: candidate.latencyP50Ms,
         latency_p90_ms: candidate.latencyP90Ms,
         latency_sla_passed: candidate.latencySlaPassed,
         operational_error_rate: candidate.operationalErrorRate,
         evidence: candidate.evidence,
-        capability_evidence: models.find((item) => item.model.id === candidate.model.id)?.capabilityEvidence ?? [],
+        capability_evidence:
+          models.find((item) => item.model.id === candidate.model.id)
+            ?.capabilityEvidence ?? [],
       })),
     });
     return plan;
   }
-  selectRecoveryCandidate(plan: FrozenExecutionPlan, observation: RecoveryObservation,
-    attempted: ReadonlySet<string>) {
-    const selected = chooseAdaptiveRecovery(plan, observation, attempted);
+  selectRecoveryCandidate(
+    plan: FrozenExecutionPlan,
+    observation: RecoveryObservation,
+    attempted: ReadonlySet<string>,
+  ) {
+    const effectiveFailureMode = effectiveRecoveryFailureMode(observation);
+    const effectiveObservation =
+      effectiveFailureMode === observation.failureMode
+        ? observation
+        : { ...observation, failureMode: effectiveFailureMode };
+    const selected = chooseAdaptiveRecovery(
+      plan,
+      effectiveObservation,
+      attempted,
+    );
     this.logger.log("adaptive_recovery_decision", {
       previous_model: observation.previousModel,
-      failure_mode: observation.failureMode,
+      reported_failure_mode: observation.failureMode,
+      failure_mode: effectiveFailureMode,
       failure_phase: observation.failurePhase,
-      trajectory_summary: observation,
+      trajectory_summary: effectiveObservation,
       recovery_model: selected?.model.id ?? null,
       why_recovery_selected: selected
-        ? "best frozen-board candidate for observed failure state"
+        ? effectiveFailureMode === "operational"
+          ? "cheapest reliable frozen-board candidate satisfying the task quality floor"
+          : "best frozen-board candidate for observed coding evidence"
         : "frozen policy exhausted",
-      approved_recovery_candidates: plan.approvedCandidateSet.map((candidate) => candidate.model.id),
+      approved_recovery_candidates: plan.approvedCandidateSet.map(
+        (candidate) => candidate.model.id,
+      ).filter((id) => !attempted.has(id)),
     });
     return selected;
   }
@@ -353,10 +654,19 @@ export class PoolRouter {
     raceGroup?: string,
   ) {
     const plan = await this.selectExecutionPlan(
-      fingerprint, features, subtaskId, budgetUsd, raceGroup,
+      fingerprint,
+      features,
+      subtaskId,
+      budgetUsd,
+      raceGroup,
     );
-    return [plan.initialCandidate, ...plan.approvedCandidateSet.filter((candidate) =>
-      candidate.model.id !== plan.initialModel)];
+    return [
+      plan.initialCandidate,
+      ...plan.approvedCandidateSet.filter((candidate) =>
+        candidate.model.id !== plan.initialModel &&
+        (plan.qualityCascadeModelIds ?? []).includes(candidate.model.id),
+      ),
+    ];
   }
   recordServed(
     features: Features,
@@ -367,22 +677,42 @@ export class PoolRouter {
     reason?: string,
     fingerprint?: TaskFingerprint,
   ) {
-    if (verification !== "VERIFIED_SUCCESS" && !(verification === "FAILED" && escalated)) return;
-    const calls = this.logger.events.slice(since).filter((event) =>
-      event.type === "model_call" && event.subtaskId === subtaskId &&
-      event.modelRequested === "openrouter/pareto-code" &&
-      typeof event.modelReturned === "string" && event.modelReturned !== "openrouter/pareto-code" &&
-      event.costUsd !== null,
-    );
+    if (
+      verification !== "VERIFIED_SUCCESS" &&
+      !(verification === "FAILED" && escalated)
+    )
+      return;
+    const calls = this.logger.events
+      .slice(since)
+      .filter(
+        (event) =>
+          event.type === "model_call" &&
+          event.subtaskId === subtaskId &&
+          event.modelRequested === "openrouter/pareto-code" &&
+          typeof event.modelReturned === "string" &&
+          event.modelReturned !== "openrouter/pareto-code" &&
+          event.costUsd !== null,
+      );
     for (const call of calls) {
       this.history.record({
-        timestamp: new Date().toISOString(), runId: this.logger.runId, subtaskId,
-        modelRequested: call.modelReturned, modelServed: call.modelReturned,
-        features, fingerprint, verification, wallClockMs: call.wallClockMs,
-        inputTokens: call.promptTokens, outputTokens: call.completionTokens,
-        costUsd: call.costUsd, escalated, reason,
-        failureAttribution: verification === "FAILED" && reason === "focused_verification_failed"
-          ? "verified_patch_regression" as const : undefined,
+        timestamp: new Date().toISOString(),
+        runId: this.logger.runId,
+        subtaskId,
+        modelRequested: call.modelReturned,
+        modelServed: call.modelReturned,
+        features,
+        fingerprint,
+        verification,
+        wallClockMs: call.wallClockMs,
+        inputTokens: call.promptTokens,
+        outputTokens: call.completionTokens,
+        costUsd: call.costUsd,
+        escalated,
+        reason,
+        failureAttribution:
+          verification === "FAILED" && reason === "focused_verification_failed"
+            ? ("verified_patch_regression" as const)
+            : undefined,
       });
     }
   }
@@ -393,12 +723,18 @@ export class PoolRouter {
     previous?: PoolModel,
     fallback = false,
     raceGroup?: string,
-    routeLimits?: { budgetUsd?: number; inputTokens?: number; outputTokens?: number },
+    routeLimits?: {
+      budgetUsd?: number;
+      inputTokens?: number;
+      outputTokens?: number;
+    },
   ) {
     const discovered = this.config.specialistRouting
-      ? await this.capabilities.all() : undefined;
+      ? await this.capabilities.all()
+      : undefined;
     const metadata = await this.catalog.get();
-    let models = discovered?.map((item) => item.model) ?? this.config.modelPool!.models;
+    let models =
+      discovered?.map((item) => item.model) ?? this.config.modelPool!.models;
     if (
       features.taskKind === "planning" &&
       this.config.routing.plannerCandidates
@@ -409,8 +745,12 @@ export class PoolRouter {
     const force = this.config.forceModel;
     if (raceGroup)
       excluded = [...excluded, ...(this.raceSelections.get(raceGroup) ?? [])];
-    const blocked = new Set([...excluded.filter((id) => id !== force), ...this.disabled]);
-    if (previous && !fallback && previous.id !== force) blocked.add(previous.id);
+    const blocked = new Set([
+      ...excluded.filter((id) => id !== force),
+      ...this.disabled,
+    ]);
+    if (previous && !fallback && previous.id !== force)
+      blocked.add(previous.id);
     const considered = rankCandidates(
       models,
       metadata,
@@ -419,11 +759,19 @@ export class PoolRouter {
       this.config.routing,
       routeLimits?.inputTokens ?? features.contextBytes + 256,
       routeLimits?.outputTokens ?? this.config.maxOutputTokens,
-      { budgetUsd: Math.min(this.remainingBudget(), routeLimits?.budgetUsd ?? Infinity), excluded: blocked },
+      {
+        budgetUsd: Math.min(
+          this.remainingBudget(),
+          routeLimits?.budgetUsd ?? Infinity,
+        ),
+        excluded: blocked,
+      },
     );
     // Forced evaluations still respect execution constraints, including budget.
-    const selected = considered.find((candidate) => !candidate.hardRejection &&
-      (!force || candidate.model.id === force));
+    const selected = considered.find(
+      (candidate) =>
+        !candidate.hardRejection && (!force || candidate.model.id === force),
+    );
     this.logger.log("model_router", {
       subtaskId,
       selected_model: selected?.model.id ?? null,
@@ -484,8 +832,7 @@ export class PoolRouter {
     );
     const available = considered.filter(
       (candidate) =>
-        !this.disabled.has(candidate.model.id) &&
-        !candidate.hardRejection,
+        !this.disabled.has(candidate.model.id) && !candidate.hardRejection,
     );
     const selected = available[0];
     this.logger.log("frontier_rescue_route", {
@@ -518,12 +865,55 @@ export class PoolRouter {
           e.modelRequested === model.id,
       );
     if (!calls.length) return;
-    const prediction = [...this.logger.events].reverse().find((event) =>
-      event.type === "specialist_route" && event.subtaskId === subtaskId &&
-      event.selected_model === model.id);
-    const worker = [...this.logger.events].reverse().find((event) =>
-      event.type === "coding_worker_stop" && event.subtaskId === subtaskId &&
-      event.model === model.id);
+    const prediction = [...this.logger.events]
+      .reverse()
+      .find(
+        (event) =>
+          event.type === "specialist_route" &&
+          event.subtaskId === subtaskId &&
+          event.selected_model === model.id,
+      );
+    const worker = [...this.logger.events]
+      .reverse()
+      .find(
+        (event) =>
+          event.type === "coding_worker_stop" &&
+          event.subtaskId === subtaskId &&
+          event.model === model.id,
+      );
+    const verificationVector = this.logger.events
+      .slice(since)
+      .filter(
+        (event) =>
+          event.subtaskId === subtaskId &&
+          (event.type === "verification" ||
+            event.type === "mini_swe_attempt_verification"),
+      )
+      .map((event) =>
+        String(event.outcome ?? event.verification ?? "unknown"),
+      );
+    const contradictoryPositive =
+      verification === "VERIFIED_SUCCESS" &&
+      verificationVector.some((outcome) =>
+        [
+          "CHECK_FAIL",
+          "INFRA_FAILURE",
+          "CHECK_UNAVAILABLE",
+          "CANDIDATE_NEUTRAL",
+          "CANDIDATE_IMPROVEMENT",
+        ].includes(outcome),
+      );
+    const recordedVerification = contradictoryPositive
+      ? "NOT_FULLY_VERIFIED"
+      : verification;
+    if (contradictoryPositive)
+      this.logger.log("verification_invariant_violation", {
+        subtaskId,
+        model: model.id,
+        claimed_verification: verification,
+        recorded_verification: recordedVerification,
+        verification_vector: verificationVector,
+      });
     const record = {
       timestamp: new Date().toISOString(),
       runId: this.logger.runId,
@@ -532,26 +922,33 @@ export class PoolRouter {
       modelServed: calls.at(-1)?.modelReturned ?? null,
       features,
       fingerprint,
-      verification,
+      verification: recordedVerification,
       wallClockMs: calls.reduce((n, c) => n + c.wallClockMs, 0),
       inputTokens: calls.reduce((n, c) => n + c.promptTokens, 0),
       outputTokens: calls.reduce((n, c) => n + c.completionTokens, 0),
       cachedTokens: calls.reduce((n, c) => n + (c.cachedTokens ?? 0), 0),
-      cacheWriteTokens: calls.reduce((n, c) => n + (c.cacheWriteTokens ?? 0), 0),
+      cacheWriteTokens: calls.reduce(
+        (n, c) => n + (c.cacheWriteTokens ?? 0),
+        0,
+      ),
       costUsd: calls.some((c) => c.costUsd === null)
         ? null
         : calls.reduce((n, c) => n + c.costUsd, 0),
       escalated,
       reason,
-      failureAttribution: verification === "FAILED" && reason === "focused_verification_failed"
-        ? "verified_patch_regression" as const : undefined,
+      failureAttribution:
+        recordedVerification === "FAILED" &&
+        reason === "focused_verification_failed"
+          ? ("verified_patch_regression" as const)
+          : undefined,
       modelKnowledgeVersion: 1,
       planId: prediction?.selected_plan_id,
       nodeId: subtaskId,
       verificationStrength: fingerprint?.verificationStrength,
       predictedQuality: prediction?.expected_final_success,
-      predictedTokens: prediction?.candidates?.find((candidate: any) =>
-        candidate.id === model.id)?.expected_total_tokens,
+      predictedTokens: prediction?.candidates?.find(
+        (candidate: any) => candidate.id === model.id,
+      )?.expected_total_tokens,
       predictedCostUsd: prediction?.expected_completion_cost_usd,
       predictedLatencyP50Ms: prediction?.expected_completion_latency_p50_ms,
       predictedLatencyP90Ms: prediction?.expected_completion_latency_p90_ms,
@@ -561,31 +958,79 @@ export class PoolRouter {
       failurePhase: worker?.progress_phase,
       progressPhase: worker?.progress_phase,
       mutationObserved: (worker?.actual_changed_paths?.length ?? 0) > 0,
-      focusedVerification: [...this.logger.events].reverse().find((event) =>
-        event.type === "mini_swe_attempt_verification" &&
-        event.subtaskId === subtaskId && event.model === model.id)?.outcome,
+      focusedVerification: [...this.logger.events]
+        .reverse()
+        .find(
+          (event) =>
+            event.type === "mini_swe_attempt_verification" &&
+            event.subtaskId === subtaskId &&
+            event.model === model.id,
+        )?.outcome,
       timeToFirstMutationMs: worker?.time_to_first_mutation_ms ?? undefined,
-      toolFailures: this.logger.events.slice(since).filter((event) =>
-        event.subtaskId === subtaskId && event.type === "tool_result" &&
-        (event.ok === false || Number(event.exitCode ?? 0) !== 0)).length,
+      toolFailures: this.logger.events
+        .slice(since)
+        .filter(
+          (event) =>
+            event.subtaskId === subtaskId &&
+            event.type === "tool_result" &&
+            (event.ok === false || Number(event.exitCode ?? 0) !== 0),
+        ).length,
+      executionEngine: worker?.worker_engine === "direct-edit"
+        ? ("direct-edit" as const)
+        : worker?.worker_engine === "mini-swe-agent"
+          ? ("mini-swe-agent" as const)
+          : undefined,
+      contextStrategy: worker?.worker_engine === "direct-edit"
+        ? ("localized" as const)
+        : ("agentic" as const),
+      routePolicyVersion: "evidence-quality-safe-v3",
+      // Production routing is deterministic today. Recording this now keeps
+      // the log schema usable when controlled exploration is introduced.
+      selectionPropensity: 1,
+      verificationVector,
     };
     this.history.record(record);
     this.logger.log("model_attempt", record);
-    if (prediction) this.logger.log("routing_prediction_error", {
-      subtaskId, predicted_model: prediction.selected_model,
-      predicted_cost_usd: prediction.expected_completion_cost_usd,
-      predicted_tokens: prediction.candidates?.find((candidate: any) => candidate.id === model.id)?.expected_total_tokens ?? null,
-      predicted_latency_ms: prediction.expected_completion_latency_ms,
-      predicted_success: prediction.expected_final_success,
-      actual_cost_usd: record.costUsd,
-      actual_input_tokens: record.inputTokens, actual_output_tokens: record.outputTokens,
-      actual_wall_clock_ms: record.wallClockMs, verification_result: verification,
-      failure_attribution: record.failureAttribution ?? (verification === "FAILED" ? "operational_or_unattributed" : null),
-      cost_error_usd: record.costUsd === null || prediction.expected_completion_cost_usd === null
-        ? null : record.costUsd - prediction.expected_completion_cost_usd,
-      token_error: prediction.candidates?.find((candidate: any) => candidate.id === model.id)?.expected_total_tokens == null
-        ? null : record.inputTokens + record.outputTokens - prediction.candidates.find((candidate: any) => candidate.id === model.id).expected_total_tokens,
-      latency_error_ms: prediction.expected_completion_latency_ms == null ? null : record.wallClockMs - prediction.expected_completion_latency_ms,
-    });
+    if (prediction)
+      this.logger.log("routing_prediction_error", {
+        subtaskId,
+        predicted_model: prediction.selected_model,
+        predicted_cost_usd: prediction.expected_completion_cost_usd,
+        predicted_tokens:
+          prediction.candidates?.find(
+            (candidate: any) => candidate.id === model.id,
+          )?.expected_total_tokens ?? null,
+        predicted_latency_ms: prediction.expected_completion_latency_ms,
+        predicted_success: prediction.expected_final_success,
+        actual_cost_usd: record.costUsd,
+        actual_input_tokens: record.inputTokens,
+        actual_output_tokens: record.outputTokens,
+        actual_wall_clock_ms: record.wallClockMs,
+        verification_result: recordedVerification,
+        failure_attribution:
+          record.failureAttribution ??
+          (recordedVerification === "FAILED"
+            ? "operational_or_unattributed"
+            : null),
+        cost_error_usd:
+          record.costUsd === null ||
+          prediction.expected_completion_cost_usd === null
+            ? null
+            : record.costUsd - prediction.expected_completion_cost_usd,
+        token_error:
+          prediction.candidates?.find(
+            (candidate: any) => candidate.id === model.id,
+          )?.expected_total_tokens == null
+            ? null
+            : record.inputTokens +
+              record.outputTokens -
+              prediction.candidates.find(
+                (candidate: any) => candidate.id === model.id,
+              ).expected_total_tokens,
+        latency_error_ms:
+          prediction.expected_completion_latency_ms == null
+            ? null
+            : record.wallClockMs - prediction.expected_completion_latency_ms,
+      });
   }
 }

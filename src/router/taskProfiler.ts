@@ -1,9 +1,13 @@
 import { extname } from "node:path";
+import { createHash } from "node:crypto";
 import type { RepoProfile } from "../types.js";
 import type { ExecutionStrategy } from "./executionStrategy.js";
 
 export type ProfileConfidence = "high" | "medium" | "low";
 export interface DeterministicTaskProfile {
+  profileVersion: 1;
+  /** Stable routing region derived from repository facts, not prompt prose. */
+  profileKey: string;
   taskFamily: string;
   languages: string[];
   frameworks: string[];
@@ -16,6 +20,10 @@ export interface DeterministicTaskProfile {
   schemaRisk: boolean;
   concurrencyRisk: boolean;
   architectureRisk: boolean;
+  securitySensitive: boolean;
+  localizationEntropy: "low" | "medium" | "high";
+  expectedBlastRadius: "single-file" | "package" | "cross-component";
+  projectRoots: string[];
   verificationStrength: "strong" | "medium" | "weak";
   scopeConfidence: ProfileConfidence;
   decompositionConfidence: ProfileConfidence;
@@ -75,14 +83,33 @@ export function profileTask(task: string, repo: RepoProfile, strategy: Execution
   ])];
   const verificationStrength = likelyTests.length && repo.verificationCommands.length ? "strong"
     : repo.verificationCommands.length ? "medium" : "weak";
+  const publicApiRisk = /\b(?:public api|exported|endpoint|contract|breaking)\b/.test(lower);
+  const schemaRisk = /\b(?:schema|migration|database|protocol|config(?:uration)?)\b/.test(lower);
+  const concurrencyRisk = /\b(?:concurren|race condition|synchron|parallel|deadlock|atomic)\w*\b/.test(lower);
+  const architectureRisk = /\b(?:architect|redesign|restructure|large refactor)\w*\b/.test(lower);
+  const securitySensitive = /\b(?:auth|permission|credential|secret|security|crypto|payment)\w*\b/.test(lower);
+  const localizationEntropy = scopeConfidence === "high" ? "low"
+    : scopeConfidence === "medium" ? "medium" : "high";
+  const expectedBlastRadius = crossComponent ? "cross-component"
+    : likelyPaths.length <= 1 ? "single-file" : "package";
+  const projectRoots = [...new Set((repo.ecosystem?.projectUnits ?? [])
+    .filter((unit) => likelyPaths.some((path) => unit.root === "." || path === unit.root || path.startsWith(`${unit.root}/`)))
+    .map((unit) => unit.root))].sort();
+  const profileKey = createHash("sha256").update(JSON.stringify({
+    languages: [...languages].sort(), frameworks: [...(repo.ecosystem?.frameworks ?? [])].sort(),
+    repoScale: repo.files.length < 40 ? "small" : repo.files.length < 500 ? "medium" : "large",
+    likelyPaths: [...likelyPaths].sort(), components: [...components].sort(),
+    projectRoots, crossComponent, publicApiRisk, schemaRisk, concurrencyRisk,
+    architectureRisk, securitySensitive, verificationStrength, scopeConfidence,
+    expectedBlastRadius,
+  })).digest("hex").slice(0, 20);
   return {
+    profileVersion: 1, profileKey,
     taskFamily, languages, frameworks: repo.ecosystem?.frameworks ?? [],
     repoScale: repo.files.length < 40 ? "small" : repo.files.length < 500 ? "medium" : "large",
     likelyPaths, likelyTests, likelyComponents: components, crossComponent,
-    publicApiRisk: /\b(?:public api|exported|endpoint|contract|breaking)\b/.test(lower),
-    schemaRisk: /\b(?:schema|migration|database|protocol|config(?:uration)?)\b/.test(lower),
-    concurrencyRisk: /\b(?:concurren|race condition|synchron|parallel|deadlock|atomic)\w*\b/.test(lower),
-    architectureRisk: /\b(?:architect|redesign|restructure|large refactor)\w*\b/.test(lower),
+    publicApiRisk, schemaRisk, concurrencyRisk, architectureRisk,
+    securitySensitive, localizationEntropy, expectedBlastRadius, projectRoots,
     verificationStrength, scopeConfidence,
     decompositionConfidence: crossComponent && components.length < 2 ? "low" : scopeConfidence,
     evidence: [

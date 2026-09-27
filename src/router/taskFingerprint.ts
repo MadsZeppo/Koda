@@ -2,6 +2,7 @@ import { extname } from "node:path";
 import type { Subtask } from "../planner/schemas.js";
 import type { RepoProfile, VerificationResult } from "../types.js";
 import { routingTaskText, type Features } from "./features.js";
+import { routingTerms } from "./knowledge/contextual.js";
 
 export type TaskKind =
   | "implementation" | "debugging" | "frontend_ui" | "backend" | "fullstack"
@@ -54,9 +55,27 @@ export interface TaskFingerprint {
   repoComplexity?: Features["repoSizeBucket"];
   contextRequirementTokens?: number;
   observedCheckFailures?: number;
+  /** Semantic work required to produce the patch; consequence is separate. */
+  semanticComplexity?: Difficulty;
+  /** Uncertainty about where the change belongs, derived from inspected scope. */
+  localizationUncertainty?: Difficulty;
+  /** Expected code surface affected by the bounded repository scope. */
+  blastRadius?: "single-file" | "package" | "cross-component";
+  architecturalCoupling?: Difficulty;
+  /** Impact if a bad patch escaped verification. */
+  consequenceRisk?: Difficulty;
+  /** Chance that available checks accept an incorrect solution. */
+  verifierFalseAcceptRisk?: Difficulty;
+  /** How reliably a failed attempt can be detected before integration. */
+  recoveryDetectability?: "low" | "medium" | "high";
+  toolExplorationNeed?: Difficulty;
+  executionEngineComplexity?: Difficulty;
+  operationalRisk?: Difficulty;
   difficulty: TaskDifficulty;
   confidence: "high" | "medium";
   reasons: string[];
+  /** Bounded deterministic task signature used by the local cold-start router. */
+  routingTerms?: string[];
 }
 
 /** Deterministic, per-subtask classification; no model call or history lookup. */
@@ -115,20 +134,55 @@ export function taskFingerprint(
     : focusedCheck && checks.some((c) => c.outcome === "CHECK_PASS" || c.outcome === "CHECK_FAIL") ? "strong"
     : focusedCheck || checks.length || profile.verificationCommands.length ? "medium" : "weak";
   const high = (pattern: RegExp) => pattern.test(text);
+  const repoRisk = (pattern: RegExp) => pattern.test(`${text} ${paths.join(" ")}`);
   const architecture = high(/\b(?:architect|migration|migrate|redesign|restructure|schema|cross.module)\w*\b/);
-  const stateFlow = high(/\b(?:state|data.flow|concurren|race.condition|distributed|auth|transaction)\w*\b/);
+  const concurrency = repoRisk(/\b(?:concurren|race.condition|synchron|deadlock|atomic)\w*\b/);
   const interactions = high(/\b(?:interactive|animation|drag|workflow|form|navigation|accessibility)\w*\b/);
-  const technical: Difficulty = architecture || (stateFlow && scope !== "single") || effort === "complex" ? "high"
-    : stateFlow || (kinds.includes("debugging") && !(focusedCheck && scope === "single")) || scope === "multi-file" ? "medium" : "low";
+  const localizedEvidence = features.localizationConfidence === "high";
+  const architecturalCoupling: Difficulty = scope === "cross-component" ? "high"
+    : features.requiresCrossModuleReasoning || subtask.dependsOn.length > 0 ? "medium" : "low";
+  // File count and words such as "transaction" describe surface/consequence,
+  // not the semantic reasoning needed for a repository-grounded, localized fix.
+  const technical: Difficulty = architecture ||
+      (effort === "complex" && !localizedEvidence) ? "high"
+    : concurrency || architecturalCoupling !== "low" ||
+        (kinds.includes("debugging") && !focusedCheck && !localizedEvidence)
+      ? "medium" : "low";
+  // A requirement to preserve an API is a constraint against API change, not
+  // evidence that the candidate is expected to alter that API. Require an
+  // affirmative mutation verb near the interface vocabulary.
+  const publicApiRisk = repoRisk(
+    /\b(?:change|modify|add|remove|rename|replace|break|migrate|expose|publish)\w*\b.{0,48}\b(?:public\s+api|exported\s+(?:api|interface)|endpoint|contract)\b|\b(?:public\s+api|exported\s+(?:api|interface)|endpoint|contract)\b.{0,48}\b(?:change|modify|add|remove|rename|replace|break|migrate|expose|publish)\w*\b/,
+  );
+  const schemaRisk = repoRisk(/\b(?:schema|migration|database|protocol)\w*\b/);
+  const configRisk = repoRisk(/\b(?:config|configuration|manifest)\w*\b/);
+  const securityRisk = repoRisk(/\b(?:security|auth|permission|credential|secret|crypto|payment)\w*\b/);
+  const consequenceRisk: Difficulty = publicApiRisk || schemaRisk || concurrency || securityRisk
+    ? "high" : scope === "cross-component" ? "medium" : "low";
+  const observedExecutableCheck = checks.some((check) =>
+    check.outcome === "CHECK_PASS" || check.outcome === "CHECK_FAIL");
+  const verifierFalseAcceptRisk: Difficulty = subjective || !focusedCheck ? "high"
+    : observedExecutableCheck && profile.verificationCommands.length > 0 ? "low" : "medium";
+  const recoveryDetectability = verifierFalseAcceptRisk === "low" ? "high" as const
+    : focusedCheck ? "medium" as const : "low" as const;
+  const blastRadius = scope === "cross-component" ? "cross-component" as const
+    : scope === "single" ? "single-file" as const : "package" as const;
+  const localizationUncertainty: Difficulty = features.localizationConfidence === "low" ? "high"
+    : features.localizationConfidence === "medium" ? "medium" : "low";
+  const toolExplorationNeed: Difficulty = localizationUncertainty === "high" ? "high"
+    : (kinds.includes("repo_scanning") && !localizedEvidence) ||
+        localizationUncertainty === "medium" ? "medium" : "low";
+  const executionEngineComplexity: Difficulty = features.executionStrategy === "stable" ? "high"
+    : scope === "cross-component" || toolExplorationNeed !== "low" ? "medium" : "low";
+  const operationalRisk: Difficulty = executionEngineComplexity === "high" ? "medium" : "low";
   const difficulty: TaskDifficulty = {
     technicalComplexity: technical,
     visualComplexity: visualRelevant ? high(/\b(?:redesign|design.system|complex.layout|pixel.perfect)\b/) ? "high" : "medium" : "low",
-    architecturalComplexity: architecture ? "high" : scope === "multi-file" ? "medium" : "low",
-    interactionComplexity: interactions && architecture ? "high" : interactions || stateFlow ? "medium" : "low",
-    repoReasoningComplexity: scope === "cross-component" ? "high" : scope === "multi-file" || kinds.includes("repo_scanning") ? "medium" : "low",
-    changeRisk: high(/\b(?:security|auth|payment|database|migration|production|breaking)\b/) ? "high" : scope === "cross-component" ? "medium" : "low",
-    contextUncertainty: features.localizationConfidence === "low" ? "high"
-      : features.localizationConfidence === "medium" || kinds.includes("repo_scanning") ? "medium" : "low",
+    architecturalComplexity: architecture ? "high" : architecturalCoupling,
+    interactionComplexity: interactions && architecture ? "high" : interactions || concurrency ? "medium" : "low",
+    repoReasoningComplexity: scope === "cross-component" ? "high" : toolExplorationNeed,
+    changeRisk: consequenceRisk,
+    contextUncertainty: localizationUncertainty,
   };
   const reasons = [`${primary} from worker objective`, `${scope} write scope`, `${features.localizationConfidence} localization confidence`, `${verificationStrength} executable verification evidence`];
   const taskFamily: TaskFamily = scope === "cross-component" || kinds.includes("fullstack") ? "multi_component"
@@ -161,10 +215,10 @@ export function taskFingerprint(
     likelyComponents: new Set(paths.map((path) => path.includes("/")
       ? path.split("/").slice(0, -1).join("/") : ".")).size,
     crossComponent: scope === "cross-component",
-    publicApiRisk: high(/\b(?:public.api|exported|endpoint|breaking|contract)\w*\b/),
-    schemaRisk: high(/\b(?:schema|migration|database|protocol)\w*\b/),
-    configRisk: high(/\b(?:config|configuration|manifest)\w*\b/),
-    concurrencyRisk: high(/\b(?:concurren|race.condition|synchron|deadlock|atomic)\w*\b/),
+    publicApiRisk,
+    schemaRisk,
+    configRisk,
+    concurrencyRisk: concurrency,
     decompositionConfidence: features.localizationConfidence === "low" ? "low"
       : scope === "cross-component" && subtask.dependsOn.length === 0 ? "medium" : "high",
     taskType: features.taskType,
@@ -173,7 +227,24 @@ export function taskFingerprint(
     repoComplexity: features.repoSizeBucket,
     contextRequirementTokens: Math.ceil(features.contextBytes / 4),
     observedCheckFailures: checks.filter((check) => check.outcome === "CHECK_FAIL").length,
+    semanticComplexity: technical,
+    localizationUncertainty,
+    blastRadius,
+    architecturalCoupling,
+    consequenceRisk,
+    verifierFalseAcceptRisk,
+    recoveryDetectability,
+    toolExplorationNeed,
+    executionEngineComplexity,
+    operationalRisk,
     confidence: features.localizationConfidence === "high" ? "high" : "medium",
+    // Once concrete paths are known, keep task-neighborhood lookup stable
+    // across prompt paraphrases by leading with repository facts. Prompt terms
+    // remain useful only while localization is uncertain.
+    routingTerms: [...new Set([
+      ...routingTerms(`${taskFamily} ${primary} ${paths.join(" ")} ${features.languages.join(" ")}`),
+      ...(features.localizationConfidence === "high" ? [] : routingTerms(text, 24)),
+    ])].slice(0, 64),
     reasons,
   };
 }

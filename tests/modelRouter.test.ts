@@ -11,6 +11,7 @@ import { History } from "../src/router/history.js";
 import { Catalog } from "../src/openrouter/catalog.js";
 import { Logger } from "../src/telemetry/logger.js";
 import { summarize } from "../src/telemetry/summary.js";
+import { implementationReasoningEffort } from "../src/openrouter/client.js";
 const features = extractFeatures(
   {
     id: "fix",
@@ -59,6 +60,22 @@ const rank = (
     1000,
     100,
   ).filter((c) => !c.rejected)[0];
+
+test("provider reasoning follows semantic difficulty rather than consequence wording", () => {
+  const localized = {
+    semanticComplexity: "low",
+    consequenceRisk: "high",
+    architecturalCoupling: "low",
+    localizationUncertainty: "low",
+    architectureHeavy: false,
+    crossComponent: false,
+  };
+  assert.equal(implementationReasoningEffort({ verification_strength: "strong" }, localized), "low");
+  assert.equal(implementationReasoningEffort({ verification_strength: "strong" }, {
+    ...localized, semanticComplexity: "high",
+  }), "high");
+  assert.equal(implementationReasoningEffort({ verification_strength: "weak" }, localized), "high");
+});
 test("soft quality targets never remove the last compatible affordable pool model", () => {
   const choose = (budgetUsd: number, excluded = new Set<string>()) => rankCandidates(
     [{ ...cheap, qualityPrior: 0.6 }, frontier], metadata, [], features,
@@ -164,6 +181,41 @@ test("legacy operational failures are ignored while attributed patch regressions
     for (let i = 0; i < 20; i++) ledger.record(row(`focused_verification_failed ${i}`, "verified_patch_regression"));
     assert.equal(ledger.read().length, 20);
     assert.equal(rank([cheap, frontier], ledger.read())?.model.id, frontier.id);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+test("contradictory positive verification is excluded from quality evidence but retained for efficiency", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "koda-history-contradiction-"));
+  try {
+    const ledger = new History(dir);
+    ledger.record({
+      timestamp: new Date().toISOString(), runId: "contradiction",
+      subtaskId: "fix", modelRequested: cheap.id, modelServed: cheap.id,
+      features, verification: "VERIFIED_SUCCESS", wallClockMs: 1000,
+      inputTokens: 100, outputTokens: 20, costUsd: 0.001,
+      escalated: false,
+      verificationVector: ["CHECK_FAIL", "VERIFIED_SUCCESS"],
+    });
+    assert.equal(ledger.read().length, 0);
+    assert.equal(ledger.readEfficiency().length, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+test("limit observations calibrate efficiency without entering semantic quality history", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "koda-efficiency-history-"));
+  try {
+    const ledger = new History(dir);
+    ledger.record({ timestamp: new Date().toISOString(), runId: "overrun", subtaskId: "fix",
+      modelRequested: cheap.id, modelServed: cheap.id, features,
+      verification: "NOT_FULLY_VERIFIED", wallClockMs: 43_100,
+      inputTokens: 20_000, outputTokens: 3_689, costUsd: .174645,
+      escalated: false, terminationReason: "cost_limit",
+      executionEngine: "mini-swe-agent", contextStrategy: "agentic" });
+    assert.equal(rank([cheap], ledger.read())!.quality, rank([cheap], [])!.quality,
+      "a limit is not negative coding-quality evidence");
+    assert.equal(ledger.readEfficiency().length, 1);
+    assert.equal(ledger.readEfficiency()[0]!.inputTokens +
+      ledger.readEfficiency()[0]!.outputTokens, 23_689);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 test("failed final integration does not turn a worker success into model-quality failure", async () => {
@@ -535,4 +587,43 @@ test("strict forced routing reuses its pin but rejects invalid candidates", asyn
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("recovery telemetry never advertises an already attempted model as recovery", async () => {
+  const { config } = await import("../src/config.js");
+  const { PoolRouter } = await import("../src/router/modelRouter.js");
+  const dir = await mkdtemp(join(tmpdir(), "koda-recovery-telemetry-"));
+  try {
+    const cfg = await config(undefined, { routing: { stateDirectory: dir },
+      modelPool: { provider: "fixture", models: [cheap, frontier] } });
+    const logger = new Logger(dir, "recovery-telemetry", true);
+    const router = new PoolRouter(cfg, logger);
+    const candidate = (model: typeof cheap, quality: number, cost: number) => ({
+      model, metadata: metadata.get(model.id)!, quality,
+      conservativeQuality: quality, evidenceLevel: "SUPPORTED",
+      observationCount: 3, expectedAttemptCost: cost,
+      expectedAttemptLatencyMs: model.latencyPriorMs,
+      conservativeAttemptCost: cost, operationalErrorRate: 0,
+      tokenEfficiency: { p90TotalTokens: 2_000 },
+    });
+    const first = candidate(cheap, .94, .001);
+    const rescue = candidate(frontier, .98, .02);
+    const plan = { approvedCandidateSet: [first, rescue],
+      qualityCascadeModelIds: [cheap.id, frontier.id],
+      operationalRecoveryModelIds: [frontier.id], maxCodingAttempts: 2,
+      requiredQuality: .9 } as any;
+    assert.equal(router.selectRecoveryCandidate(plan, {
+      failureMode: "operational", failurePhase: "PROVIDER",
+      previousModel: cheap.id, mutationObserved: false,
+    }, new Set([cheap.id]))?.model.id, frontier.id);
+    assert.deepEqual(logger.events.findLast((event) =>
+      event.type === "adaptive_recovery_decision")?.approved_recovery_candidates,
+    [frontier.id]);
+    assert.equal(router.selectRecoveryCandidate(plan, {
+      failureMode: "operational", failurePhase: "PROVIDER",
+      previousModel: frontier.id, mutationObserved: false,
+    }, new Set([cheap.id, frontier.id])), undefined);
+    assert.deepEqual(logger.events.findLast((event) =>
+      event.type === "adaptive_recovery_decision")?.approved_recovery_candidates, []);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });

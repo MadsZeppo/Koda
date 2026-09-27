@@ -46,12 +46,31 @@ export interface Attempt {
   timeToFirstMutationMs?: number;
   toolFailures?: number;
   operationalFailure?: string;
+  /** Actual execution scaffold; absent legacy rows transfer only weakly. */
+  executionEngine?: "direct-edit" | "mini-swe-agent";
+  contextStrategy?: "localized" | "agentic";
+  routePolicyVersion?: string;
+  selectionPropensity?: number;
+  verificationVector?: string[];
 }
 /** Legacy FAILED rows lack proof that a candidate patch caused a regression. */
 export const attributableCodingFailure = (row: Attempt) =>
   row.verification === "FAILED" &&
   row.failureAttribution === "verified_patch_regression" &&
   !/provider|infra|timeout|rate.limit|transport|\b429\b|HTTP 5\d\d|unavailable|not[_ -]available|sandbox|environment[_ -]provisioning|missing[_ -]environment|unknown pricing/i.test(row.reason ?? "");
+
+/** A positive label cannot be quality evidence when its own raw checks disagree. */
+export const contradictoryPositiveEvidence = (row: Attempt) =>
+  row.verification === "VERIFIED_SUCCESS" &&
+  (row.verificationVector ?? []).some((outcome) =>
+    [
+      "CHECK_FAIL",
+      "INFRA_FAILURE",
+      "CHECK_UNAVAILABLE",
+      "CANDIDATE_NEUTRAL",
+      "CANDIDATE_IMPROVEMENT",
+    ].includes(outcome),
+  );
 export interface OperationalCall {
   type: "operational_call";
   timestamp: string;
@@ -67,6 +86,7 @@ export interface OperationalCall {
   costUsd: number | null;
   costSource?: "provider_reported" | "estimated_from_tokens";
   classification?: "OPERATIONAL_FAILURE";
+  failureKind?: "tool_protocol_incompatible" | "timeout" | "provider";
 }
 /** One append syscall per record (O_APPEND); no read/modify/write race between workers. */
 export class History {
@@ -99,8 +119,12 @@ export class History {
             Array.isArray(r.features.languages) &&
             typeof r.modelRequested === "string" &&
             Number.isFinite(r.wallClockMs) &&
-            (r.verification !== "FAILED" || r.features.taskKind === "planning" ||
-              attributableCodingFailure(r)) &&
+            !contradictoryPositiveEvidence(r) &&
+            (r.features.taskKind === "planning"
+              ? r.verification === "DAG_VALIDATED" ||
+                r.verification === "FAILED"
+              : r.verification === "VERIFIED_SUCCESS" ||
+                attributableCodingFailure(r)) &&
             // A later run-level failure removes provisional positive evidence;
             // it does not prove this worker/model made a bad edit.
             !(r.verification === "VERIFIED_SUCCESS" && finals.has(r.runId) &&
@@ -109,6 +133,30 @@ export class History {
     } catch {
       return [];
     }
+  }
+  /**
+   * Execution observations calibrate tokens/cost/latency even when they are not
+   * semantic quality evidence (for example cost_limit or timeout). Keeping this
+   * reader separate prevents efficiency failures from poisoning coding quality.
+   */
+  readEfficiency(): Attempt[] {
+    try {
+      return readFileSync(this.path, "utf8")
+        .split("\n")
+        .flatMap((line) => {
+          try {
+            const row = JSON.parse(line);
+            return row?.features && Array.isArray(row.features.languages) &&
+              typeof row.modelRequested === "string" &&
+              Number.isFinite(row.wallClockMs) &&
+              Number.isFinite(row.inputTokens) && row.inputTokens >= 0 &&
+              Number.isFinite(row.outputTokens) && row.outputTokens >= 0
+              ? [row as Attempt] : [];
+          } catch { return []; }
+        })
+        .filter((row) => row.features.taskKind !== "planning")
+        .slice(-4000);
+    } catch { return []; }
   }
   private append(record: unknown) {
     const fd = openSync(this.path, "a", 0o600);

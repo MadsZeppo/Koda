@@ -2,6 +2,7 @@ import { repairSourceContext } from "./repairSourceContext.js";
 import { WriteScope } from "../repo/writeScope.js";
 import { extractFeatures, taskBucket } from "../router/features.js";
 import { taskFingerprint } from "../router/taskFingerprint.js";
+import { requiredQualityClass } from "../router/controlPolicy.js";
 import type { SpecialistEstimate } from "../router/routeOptimizer.js";
 import {
   codingDemand,
@@ -475,7 +476,13 @@ export async function implement(
     subtaskId: subtask.id,
     task_bucket: taskBucket(features),
     verification_strength: fingerprint.verificationStrength,
-    task_risk: fingerprint.difficulty.changeRisk,
+    task_risk: requiredQualityClass(fingerprint).toLowerCase(),
+    semantic_complexity: fingerprint.semanticComplexity ??
+      fingerprint.difficulty.technicalComplexity,
+    consequence_risk: fingerprint.consequenceRisk ??
+      fingerprint.difficulty.changeRisk,
+    verifier_false_accept_risk: fingerprint.verifierFalseAcceptRisk ?? null,
+    recovery_detectability: fingerprint.recoveryDetectability ?? null,
     candidate: activeModel(),
     estimated_success: specialistCascade[0]?.quality ?? null,
     estimated_attempt_cost: specialistCascade[0]?.cost ?? null,
@@ -1932,7 +1939,12 @@ export async function implement(
             ? postWriteVerification ?? await checks(true)
             : verification;
       if (diff.trim()) {
-        after = verificationAgainstBaseline(baselineVerification, after);
+        const attemptChanges = await attemptCheckpoint.changed(path, writeScope);
+        after = verificationAgainstBaseline(
+          baselineVerification,
+          after,
+          attemptChanges.map((change) => change.path),
+        );
         if (after.checks.some((check) => check.source?.endsWith(":baseline_unchanged")))
           gateway.logger.log("verification_baseline_unchanged", {
             subtaskId: subtask.id,
@@ -1954,7 +1966,9 @@ export async function implement(
         );
       }
       if (
-        after.status === "VERIFIED_SUCCESS" &&
+        (after.status === "VERIFIED_SUCCESS" ||
+          after.status === "CANDIDATE_NEUTRAL" ||
+          after.status === "CANDIDATE_IMPROVEMENT") &&
         verificationExecuted &&
         (diff !== beforeDiff ||
           (objectiveCanBeAlreadySatisfied(subtask) &&
@@ -1962,7 +1976,12 @@ export async function implement(
       ) {
         gateway.logger.log("verified_completion", {
           subtaskId: subtask.id,
-          reason: "acceptance_checks_passed",
+          reason:
+            after.status === "VERIFIED_SUCCESS"
+              ? "acceptance_checks_passed"
+              : after.status === "CANDIDATE_IMPROVEMENT"
+                ? "baseline_failures_reduced_without_regression"
+                : "baseline_equivalent_without_regression",
           diffBytes: Buffer.byteLength(diff),
         });
         verification = after;

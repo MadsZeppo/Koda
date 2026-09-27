@@ -17,6 +17,9 @@ export async function routingEvidenceReport(directory: string) {
     snapshotId: snapshot.snapshotId, schemaVersion: snapshot.schemaVersion,
     createdAt: snapshot.createdAt, observations: snapshot.observations.length,
     pairwiseComparisons: snapshot.pairwiseEvidence?.length ?? 0,
+    contextualTaskCases: snapshot.taskCases?.length ?? 0,
+    contextualRoutingActive: snapshot.validation?.passed === true,
+    validation: snapshot.validation ?? null,
     identities, metrics,
     sources: snapshot.sources ?? [],
     catalog: {

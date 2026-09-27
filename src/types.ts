@@ -1,5 +1,10 @@
 import type { EcosystemProfile, CheckKind, VerificationRequirement } from "./repo/ecosystem.js";
-export type Status = "VERIFIED_SUCCESS" | "FAILED" | "NOT_FULLY_VERIFIED";
+export type Status =
+  | "VERIFIED_SUCCESS"
+  | "CANDIDATE_NEUTRAL"
+  | "CANDIDATE_IMPROVEMENT"
+  | "FAILED"
+  | "NOT_FULLY_VERIFIED";
 export interface CommandResult {
   command: string;
   outcome?:

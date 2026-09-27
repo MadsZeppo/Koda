@@ -206,6 +206,46 @@ test("parallel MiniSweWorkers receive independent writable worktrees", async () 
   }
 });
 
+test("localized PLANNED work uses one direct edit while STABLE keeps its agent loop", async () => {
+  const [plannedRoot, stableRoot] = await Promise.all([fixture(), fixture()]);
+  let directCalls = 0, bridgeCalls = 0;
+  const directWorker = { run: async (request: any) => {
+    directCalls++;
+    await writeFile(join(request.repoPath, "src/a.ts"), "export const a = 2;\n");
+    return { ...result(request.model), engine: "direct-edit" as const,
+      changedPaths: ["src/a.ts"] };
+  } };
+  const runner: MiniSweBridgeRunner = async (request) => {
+    bridgeCalls++;
+    await writeFile(join(request.repoPath, "src/a.ts"), "export const a = 3;\n");
+    return result(request.model);
+  };
+  try {
+    const worker = (root: string, runId: string) => new MiniSweWorker(
+      new Budget(1, 10_000, 30_000),
+      new Logger(join(root, ".koda"), runId, true),
+      { runner, directWorker },
+    );
+    const planned = await worker(plannedRoot, "planned-direct").run({
+      ...input(plannedRoot), attemptId: "fix-value", writeScope: ["src/a.ts"],
+      returnOnMutation: true,
+    });
+    const stable = await worker(stableRoot, "stable-agent").run({
+      ...input(stableRoot), attemptId: "stable", writeScope: ["src/a.ts"],
+      returnOnMutation: true,
+    });
+    assert.equal(planned.engine, "direct-edit");
+    assert.deepEqual(planned.changedPaths, ["src/a.ts"]);
+    assert.equal(stable.engine, "mini-swe-agent");
+    assert.deepEqual(stable.changedPaths, ["src/a.ts"]);
+    assert.equal(directCalls, 1);
+    assert.equal(bridgeCalls, 1);
+  } finally {
+    await Promise.all([plannedRoot, stableRoot].map((root) =>
+      rm(root, { recursive: true, force: true })));
+  }
+});
+
 test("Koda verification rejects a completed bad patch, restores it, and routes a clean second attempt", async () => {
   const root = await mkdtemp(join(tmpdir(), "koda-mini-executor-"));
   await mkdir(join(root, "src")); await mkdir(join(root, "tests"));
@@ -391,7 +431,68 @@ test("specialist execution plan is monotonic, bounded, and stops without catalog
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("a scoped mutation at the worker token boundary is verified before any fallback", async () => {
+test("frozen plan treats a no-diff timeout as operational and moves to a distinct approved peer", async () => {
+  const root = await executionFixture();
+  const firstModel = modelSchema.parse({ id: "initial-slow", tier: "strong", qualityPrior: .96 });
+  const peerModel = modelSchema.parse({ id: "approved-peer", tier: "cheap", qualityPrior: .95 });
+  const first = { ...routed(firstModel), conservativeQuality: .94,
+    evidenceLevel: "SUPPORTED", observationCount: 3,
+    expectedAttemptLatencyMs: 1_000, operationalErrorRate: 0 };
+  const peer = { ...routed(peerModel), conservativeQuality: .93,
+    evidenceLevel: "SUPPORTED", observationCount: 3,
+    expectedAttemptLatencyMs: 800, operationalErrorRate: 0 };
+  const requests: string[] = [], observations: any[] = [];
+  try {
+    const cfg = await config(undefined, { specialistRouting: true, maxIterations: 4,
+      modelPool: { provider: "fixture", models: [firstModel, peerModel] } });
+    const logger = new Logger(join(root, ".koda"), "timeout-peer", true);
+    const gateway: any = { config: cfg, logger,
+      budget: new Budget(.3, 200_000, 300_000), modelRouter: {
+        selectExecutionPlan: async () => ({ id: "timeout-plan", type: "single",
+          executionEngine: "planned", initialModel: firstModel.id,
+          initialCandidate: first, approvedCandidateSet: [first, peer],
+          qualityCascadeModelIds: [firstModel.id],
+          operationalRecoveryModelIds: [peerModel.id], maxCodingAttempts: 2,
+          maxScoutCalls: 0, requiredQuality: .9, qualityClass: "MEDIUM",
+          evidenceClass: "SUPPORTED", conservativeQuality: .94,
+          expectedCostPerVerifiedSolve: .01, expectedLatencyMs: 1_000,
+          whySelected: "fixture", totalBudgetUsd: .3, latencyBudgetMs: 60_000,
+          activeBoard: [], referenceModel: firstModel.id,
+          providerConstraints: {}, writeScopes: ["src/value.cjs"],
+          verificationContract: {}, verificationStrength: "strong",
+          stopConditions: ["verified", "plan exhausted"] }),
+        selectRecoveryCandidate: (_plan: any, observation: any, attempted: Set<string>) => {
+          observations.push({ ...observation, attempted: [...attempted] });
+          return observation.failureMode === "operational" && !attempted.has(peerModel.id)
+            ? peer : undefined;
+        },
+        record: () => undefined,
+        history: { recordOperation: () => undefined },
+      } };
+    const output = await implement(gateway, root, boundedSubtask.objective, boundedSubtask,
+      { acceptanceCriteria: ["tests pass"] },
+      { files: boundedSubtask.likelyReadPaths,
+        verificationCommands: boundedSubtask.verificationCommands } as any,
+      { codingWorker: { run: async (request: any) => {
+          requests.push(request.model);
+          if (request.model === firstModel.id)
+            return { ...result(request.model), exitStatus: "failed" as const,
+              terminationReason: "LimitsExceeded", limitKind: "timeout" as const,
+              progressPhase: "MUTATION_ATTEMPTED" as const,
+              inputTokens: 14_000, outputTokens: 3_000, wallClockMs: 45_000 };
+          await writeFile(join(request.repoPath, "src/value.cjs"), "module.exports = 2;\n");
+          return { ...result(request.model), changedPaths: ["src/value.cjs"] };
+        } }, compiledContext: { files: [], localDependencies: [],
+          completePaths: [], repoMap: [] } });
+    assert.equal(output.verification.status, "VERIFIED_SUCCESS");
+    assert.deepEqual(requests, [firstModel.id, peerModel.id]);
+    assert.equal(observations[0]?.failureMode, "operational");
+    assert.deepEqual(observations[0]?.attempted, [firstModel.id]);
+    assert.equal(await readFile(join(root, "src/value.cjs"), "utf8"), "module.exports = 2;\n");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("a scoped mutation at token preflight hands off cleanly to deterministic verification", async () => {
   const root = await executionFixture();
   const cheap = modelSchema.parse({ id: "cheap-boundary", tier: "cheap", qualityPrior: .95 });
   const frontier = modelSchema.parse({ id: "frontier-unused", tier: "frontier", qualityPrior: .99 });
@@ -416,8 +517,10 @@ test("a scoped mutation at the worker token boundary is verified before any fall
           await writeFile(join(request.repoPath, "src/value.cjs"), "module.exports = 2;\n");
           return { ...result(request.model), exitStatus: "failed" as const,
             changedPaths: ["src/value.cjs"], terminationReason: "LimitsExceeded",
-            limitKind: "token_limit" as const,
-            progressPhase: "MUTATION_OBSERVED" as const, steps: 4 };
+            limitKind: "token_preflight" as const,
+            progressPhase: "VERIFICATION_ATTEMPTED" as const, steps: 4,
+            configuredTokenLimit: 8192, consumedTokens: 4600,
+            remainingTokens: 3592, exactLimitFired: "token_preflight" };
         } }, compiledContext: { files: [], localDependencies: [],
           completePaths: [], repoMap: [] } });
     assert.equal(output.verification.status, "VERIFIED_SUCCESS");
@@ -426,8 +529,13 @@ test("a scoped mutation at the worker token boundary is verified before any fall
     assert.equal(requests[0].maxToolOutputBytes, 2048);
     assert.equal(await readFile(join(root, "src/value.cjs"), "utf8"), "module.exports = 2;\n");
     assert.equal(logger.events.filter((event) => event.type === "mini_swe_fallback").length, 0);
+    assert.equal(logger.events.filter((event) =>
+      event.type === "execution_limit_candidate_preserved").length, 0);
     assert.equal(logger.events.find((event) =>
-      event.type === "execution_limit_candidate_preserved")?.limit_kind, "token_limit");
+      event.type === "candidate_verification_handoff")?.remaining_tokens, 3592);
+    const stop = logger.events.find((event) => event.type === "coding_worker_stop");
+    assert.equal(stop?.termination_reason, "candidate_ready_for_verification");
+    assert.equal(stop?.limit_kind, null);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

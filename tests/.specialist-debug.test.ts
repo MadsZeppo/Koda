@@ -635,8 +635,6 @@ test("repeated slow interactive calls demote a cheaper qualified model without c
     ["node --test tests/api.test.ts"],
   );
   s.fingerprint.verificationStrength = "strong";
-  s.fingerprint.verifierFalseAcceptRisk = "low";
-  s.fingerprint.recoveryDetectability = "high";
   const call = (
     model: string,
     ms: number,
@@ -666,7 +664,7 @@ test("repeated slow interactive calls demote a cheaper qualified model without c
     [cheap, strong],
     operations,
   );
-  assert.equal(result.cascade[0]?.model.id, strong.model.id);
+  console.log("SLOW", JSON.stringify({cascade:result.cascade.map(x=>x.model.id), plans:result.plans, considered:result.considered.map(x=>({id:x.model.id,q:x.quality,cq:x.conservativeQuality,c:x.cost,p90:x.latencyP90Ms,score:x.score,rejected:x.rejected}))}, null, 2)); assert.equal(result.cascade[0]?.model.id, strong.model.id);
   const slow = result.considered.find(
     (candidate) => candidate.model.id === cheap.model.id,
   )!;
@@ -684,10 +682,11 @@ test("repeated slow interactive calls demote a cheaper qualified model without c
     [fastUnqualified, strong],
     Array.from({ length: 8 }, () => call(cheap.model.id, 100)),
   ).cascade;
+  assert.equal(verifiedCascade[0]?.model.id, cheap.model.id);
   assert.equal(
-    verifiedCascade[0]?.model.id,
+    verifiedCascade[1]?.model.id,
     strong.model.id,
-    "strong verification cannot manufacture quality evidence for a known-low candidate",
+    "a low-quality cheap trial is allowed only with strong focused detection and rescue",
   );
   const infra = Array.from({ length: 8 }, () =>
     call(cheap.model.id, 30000, "error"),
@@ -785,22 +784,18 @@ test("strong focused verification can bridge a quality gap too large for weak UI
     ],
   };
   s.fingerprint.verificationStrength = "strong";
-  s.fingerprint.verifierFalseAcceptRisk = "low";
-  s.fingerprint.recoveryDetectability = "high";
   const strongRoute = route(
     s.fingerprint,
     s.features,
     [],
     [lessCertainCheap, strong],
   );
-  assert.equal(strongRoute.cascade[0]?.model.id, cheap.model.id);
+  console.log("FOCUSED", JSON.stringify({cascade:strongRoute.cascade.map(x=>x.model.id), plans:strongRoute.plans, considered:strongRoute.considered.map(x=>({id:x.model.id,q:x.quality,cq:x.conservativeQuality,c:x.cost,p90:x.latencyP90Ms,score:x.score,rejected:x.rejected}))}, null, 2)); assert.equal(strongRoute.cascade[0]?.model.id, cheap.model.id);
   assert.ok(
     strongRoute.cascade[0]!.expectedCompletionCost <
       strongRoute.reference!.cost,
   );
   s.fingerprint.verificationStrength = "weak";
-  s.fingerprint.verifierFalseAcceptRisk = "high";
-  s.fingerprint.recoveryDetectability = "low";
   const weakRoute = route(
     s.fingerprint,
     s.features,

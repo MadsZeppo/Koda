@@ -22,7 +22,11 @@ import {
 } from "../src/workspace/backend.js";
 import { listWorkspaceFiles, snapshotTree } from "../src/workspace/files.js";
 import { profileRepo } from "../src/repo/profiler.js";
-import { command, git, linuxTemporaryMountArguments } from "../src/repo/commands.js";
+import {
+  command,
+  git,
+  linuxTemporaryMountArguments,
+} from "../src/repo/commands.js";
 import { config } from "../src/config.js";
 import { run } from "./helpers/run.js";
 import { AgentTools, currentDiff } from "../src/agent/tools.js";
@@ -52,56 +56,235 @@ test("DIRECT explicit test mutation codes despite related words and keeps final 
     const body = JSON.parse(raw);
     requests.push(body);
     res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify({ id: "mock", model: body.model, choices: [{ index: 0,
-      finish_reason: "tool_calls", message: { role: "assistant", content: null, tool_calls: [{
-        id: "write-test", type: "function", function: { name: "write_file",
-          arguments: JSON.stringify({ path: testPath, content: changed }) },
-      }] } }], usage: { prompt_tokens: 100, completion_tokens: 20, cost: 0 } }));
+    res.end(
+      JSON.stringify({
+        id: "mock",
+        model: body.model,
+        choices: [
+          {
+            index: 0,
+            finish_reason: "tool_calls",
+            message: {
+              role: "assistant",
+              content: null,
+              tool_calls: [
+                {
+                  id: "write-test",
+                  type: "function",
+                  function: {
+                    name: "write_file",
+                    arguments: JSON.stringify({
+                      path: testPath,
+                      content: changed,
+                    }),
+                  },
+                },
+              ],
+            },
+          },
+        ],
+        usage: { prompt_tokens: 100, completion_tokens: 20, cost: 0 },
+      }),
+    );
   });
   try {
     await mkdir(join(f.root, "tests"), { recursive: true });
     await mkdir(join(f.root, "tests/fixtures/math"), { recursive: true });
     await writeFile(join(f.root, testPath), source);
-    await writeFile(join(f.root, "package.json"), JSON.stringify({ scripts: {
-      test: "node --test tests/*.test.ts", build: "node -e \"process.exit(0)\"",
-      typecheck: "node -e \"process.exit(0)\"",
-    }, type: "module" }));
-    await writeFile(join(f.root, "tests/fixtures/math/package.json"), JSON.stringify({ scripts: {
-      test: "node --test failing.test.cjs",
-    } }));
-    await writeFile(join(f.root, "tests/fixtures/math/failing.test.cjs"),
-      `const {test}=require("node:test");test("unrelated fixture",()=>{throw Error("must not run")});\n`);
+    await writeFile(
+      join(f.root, "package.json"),
+      JSON.stringify({
+        scripts: {
+          test: "node --test tests/*.test.ts",
+          build: 'node -e "process.exit(0)"',
+          typecheck: 'node -e "process.exit(0)"',
+        },
+        type: "module",
+      }),
+    );
+    await writeFile(
+      join(f.root, "tests/fixtures/math/package.json"),
+      JSON.stringify({
+        scripts: {
+          test: "node --test failing.test.cjs",
+        },
+      }),
+    );
+    await writeFile(
+      join(f.root, "tests/fixtures/math/failing.test.cjs"),
+      `const {test}=require("node:test");test("unrelated fixture",()=>{throw Error("must not run")});\n`,
+    );
     await git(f.root, "init", "-q");
     await git(f.root, "config", "user.email", "test@koda.local");
     await git(f.root, "config", "user.name", "Koda Test");
     await git(f.root, "add", ".");
     await git(f.root, "commit", "-qm", "covered regression");
-    assert.equal(testRequirementAlreadyCovered(task, [{ path: testPath, content: source }]), false);
-    assert.equal(testRequirementAlreadyCovered(task, [{ path: testPath,
-      content: `// recovery maxCodingAttempts\ntest("name only",()=>assert.equal(1,1));\n` }]), false);
+    assert.equal(
+      testRequirementAlreadyCovered(task, [
+        { path: testPath, content: source },
+      ]),
+      false,
+    );
+    assert.equal(
+      testRequirementAlreadyCovered(task, [
+        {
+          path: testPath,
+          content: `
+const policy = (approved: unknown[], maxCodingAttempts = 3) => ({ approved, maxCodingAttempts });
+const chooseAdaptiveRecovery = (value: { maxCodingAttempts: number }, attempted: Set<string>) =>
+  attempted.size >= value.maxCodingAttempts ? undefined : "next";
+test("bounded recovery", () => {
+  const frozen = policy([], 1);
+  assert.equal(chooseAdaptiveRecovery(frozen, new Set(["first"])), undefined);
+});\n`,
+        },
+      ]),
+      true,
+      "a passing assertion with a locally bound limit is concrete no-change evidence",
+    );
+    assert.equal(
+      testRequirementAlreadyCovered(task, [
+        {
+          path: testPath,
+          content: `// recovery maxCodingAttempts\ntest("name only",()=>assert.equal(1,1));\n`,
+        },
+      ]),
+      false,
+    );
 
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    const result = await run({ repo: f.root, task, output: f.output, quiet: true,
-      config: await config(undefined, { adaptiveCoding: false, specialistRouting: false,
-        models: {}, baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`,
-        budgetUsd: 10 }) });
-    const events = (await readFile(join(f.output, "events.jsonl"), "utf8")).trim()
-      .split("\n").map((line) => JSON.parse(line));
-    assert.equal(result.status, "VERIFIED_SUCCESS",
-      `${result.error ?? ""}\n${JSON.stringify(events.slice(-20), null, 2)}`);
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const result = await run({
+      repo: f.root,
+      task,
+      output: f.output,
+      quiet: true,
+      config: await config(undefined, {
+        adaptiveCoding: false,
+        specialistRouting: false,
+        models: {},
+        baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`,
+        budgetUsd: 10,
+      }),
+    });
+    const events = (await readFile(join(f.output, "events.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(
+      result.status,
+      "VERIFIED_SUCCESS",
+      `${result.error ?? ""}\n${JSON.stringify(events.slice(-20), null, 2)}`,
+    );
     assert.equal(result.execution_strategy, "direct");
     assert.equal(result.execution_effort, "normal");
-    assert.equal(events.some((event) => event.type === "no_changes_required"), false);
-    assert.equal(events.some((event) => event.type === "coding_worker_start"), true);
+    assert.equal(
+      events.some((event) => event.type === "no_changes_required"),
+      false,
+    );
+    assert.equal(
+      events.some((event) => event.type === "coding_worker_start"),
+      true,
+    );
     assert.equal(requests.length, 1);
     assert.deepEqual(result.workerScopes[0]?.allowed_write_paths, [testPath]);
     assert.deepEqual(result.changedFiles, [testPath]);
-    const finalCommands = events.filter((event) => event.type === "final_verification")
+    const finalCommands = events
+      .filter((event) => event.type === "final_verification")
       .map((event) => event.command);
-    assert.ok(finalCommands.some((command) => command.includes(testPath)), finalCommands.join("\n"));
-    assert.ok(finalCommands.some((command) => /build/.test(command)), finalCommands.join("\n"));
-    assert.ok(finalCommands.some((command) => /typecheck/.test(command)), finalCommands.join("\n"));
-    assert.equal(finalCommands.some((command) => command.includes("tests/fixtures/math")), false);
+    assert.ok(
+      finalCommands.some((command) => command.includes(testPath)),
+      finalCommands.join("\n"),
+    );
+    assert.ok(
+      finalCommands.some((command) => /build/.test(command)),
+      finalCommands.join("\n"),
+    );
+    assert.ok(
+      finalCommands.some((command) => /typecheck/.test(command)),
+      finalCommands.join("\n"),
+    );
+    assert.equal(
+      finalCommands.some((command) => /^pnpm run test$/.test(command)),
+      false,
+      `exact focused test must replace the aggregate test dimension:\n${finalCommands.join("\n")}`,
+    );
+    assert.equal(
+      finalCommands.some((command) => command.includes("tests/fixtures/math")),
+      false,
+    );
+    assert.equal(await readFile(join(f.root, testPath), "utf8"), source);
+    assert.equal((await git(f.root, "status", "--porcelain")).trim(), "");
+  } finally {
+    if (server.listening)
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(f.parent, { recursive: true, force: true });
+  }
+});
+
+test("DIRECT skips coding when the requested bounded behavior is already proven", async () => {
+  const f = await sandbox("koda-direct-already-covered-");
+  const testPath = "tests/controlPolicy.test.ts";
+  const source = `import {test} from "node:test";\nimport assert from "node:assert/strict";\nconst policy=(approved:unknown[],maxCodingAttempts=3)=>({approved,maxCodingAttempts});\nconst chooseAdaptiveRecovery=(value:{maxCodingAttempts:number},attempted:Set<string>)=>attempted.size>=value.maxCodingAttempts?undefined:"next";\ntest("bounded recovery",()=>{const frozen=policy([],1);assert.equal(chooseAdaptiveRecovery(frozen,new Set(["first"])),undefined);});\n`;
+  let modelCalls = 0;
+  const server = createServer((_req, res) => {
+    modelCalls++;
+    res.statusCode = 500;
+    res.end("model must not be called");
+  });
+  try {
+    await mkdir(join(f.root, "tests"), { recursive: true });
+    await writeFile(join(f.root, testPath), source);
+    await writeFile(
+      join(f.root, "package.json"),
+      JSON.stringify({
+        type: "module",
+        scripts: {
+          test: "node --test tests/*.test.ts",
+          build: 'node -e "process.exit(0)"',
+          typecheck: 'node -e "process.exit(0)"',
+        },
+      }),
+    );
+    await git(f.root, "init", "-q");
+    await git(f.root, "config", "user.email", "test@koda.local");
+    await git(f.root, "config", "user.name", "Koda Test");
+    await git(f.root, "add", ".");
+    await git(f.root, "commit", "-qm", "covered behavior");
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const result = await run({
+      repo: f.root,
+      task: `In ${testPath}, add a deterministic regression test proving recovery stops when maxCodingAttempts is reached.`,
+      output: f.output,
+      quiet: true,
+      apply: true,
+      config: await config(undefined, {
+        models: {},
+        baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`,
+        budgetUsd: 10,
+      }),
+    });
+    const events = (await readFile(join(f.output, "events.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    const finalCommands = events
+      .filter((event) => event.type === "final_verification")
+      .map((event) => event.command);
+    assert.equal(
+      result.status,
+      "VERIFIED_SUCCESS",
+      `${result.error ?? ""}\n${JSON.stringify(events.slice(0, 20), null, 2)}`,
+    );
+    assert.equal(modelCalls, 0);
+    assert.equal(result.coderModelCalls, 0);
+    assert.equal(result.changedFiles.length, 0);
+    assert.ok(events.some((event) => event.type === "no_changes_required"));
+    assert.ok(finalCommands.some((command) => command.includes(testPath)));
+    assert.equal(finalCommands.includes("pnpm run test"), false);
     assert.equal(await readFile(join(f.root, testPath), "utf8"), source);
     assert.equal((await git(f.root, "status", "--porcelain")).trim(), "");
   } finally {
@@ -119,10 +302,20 @@ test("Linux /tmp workspaces have mountpoints before /tmp becomes read-only", asy
     const args = linuxTemporaryMountArguments(cwd, "/tmp/k");
     const remount = args.indexOf("--remount-ro");
     assert.ok(remount > 0);
-    assert.ok(args.indexOf(cwd) < remount, "cwd mountpoint must exist before remount");
-    assert.ok(args.indexOf("/tmp/k") < remount, "scratch mountpoint must exist before remount");
-    assert.deepEqual(args.slice(remount, remount + 4),
-      ["--remount-ro", "/tmp", "--tmpfs", "/tmp/k"]);
+    assert.ok(
+      args.indexOf(cwd) < remount,
+      "cwd mountpoint must exist before remount",
+    );
+    assert.ok(
+      args.indexOf("/tmp/k") < remount,
+      "scratch mountpoint must exist before remount",
+    );
+    assert.deepEqual(args.slice(remount, remount + 4), [
+      "--remount-ro",
+      "/tmp",
+      "--tmpfs",
+      "/tmp/k",
+    ]);
     assert.ok(!args.includes("--bind"), "all of /tmp must not become writable");
   }
   if (process.platform !== "linux") return;
@@ -135,7 +328,9 @@ test("Linux /tmp workspaces have mountpoints before /tmp becomes read-only", asy
       const result = await command(repo, "printf sandbox-ok", 10000, true);
       assert.equal(result.exitCode, 0, result.stderr);
       assert.equal(result.stdout, "sandbox-ok");
-    } finally { await rm(parent, { recursive: true, force: true }); }
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
   }
 });
 
@@ -159,7 +354,10 @@ test("clean Git integration and untouched worker begin with zero snapshot change
   await mkdir(join(f.root, "package.egg-info"), { recursive: true });
   await mkdir(join(f.root, "src", "nested"), { recursive: true });
   await writeFile(join(f.root, ".gitignore"), "scratch.egg-info/\n");
-  await writeFile(join(f.root, "package.egg-info", "PKG-INFO"), "tracked metadata\n");
+  await writeFile(
+    join(f.root, "package.egg-info", "PKG-INFO"),
+    "tracked metadata\n",
+  );
   await writeFile(join(f.root, "src", "nested", "plain.py"), "value = 1\n");
   await writeFile(join(f.root, "src", "tool.sh"), "#!/bin/sh\nexit 0\n");
   await chmod(join(f.root, "src", "tool.sh"), 0o755);
@@ -174,21 +372,33 @@ test("clean Git integration and untouched worker begin with zero snapshot change
   let integration: { path: string } | undefined;
   try {
     assert.equal(await git(f.root, "status", "--porcelain"), "");
-    const backend = await createWorkspaceBackend(f.root, join(f.parent, "workspaces"),
-      new Logger(f.output, "clean-git", true), false);
+    const backend = await createWorkspaceBackend(
+      f.root,
+      join(f.parent, "workspaces"),
+      new Logger(f.output, "clean-git", true),
+      false,
+    );
     assert.equal(backend.mode, "git");
     integration = await backend.initialize();
     assert.deepEqual(await backend.changes(integration.path), []);
     const worker = await backend.createWorker("untouched");
     try {
       assert.deepEqual(await backend.changes(worker.path), []);
-      await writeFile(join(worker.path, "src", "nested", "plain.py"), "value = 2\n");
-      assert.deepEqual((await backend.changes(worker.path)).map((change) => change.path),
-        ["src/nested/plain.py"]);
-    } finally { await backend.cleanupWorker(worker); }
+      await writeFile(
+        join(worker.path, "src", "nested", "plain.py"),
+        "value = 2\n",
+      );
+      assert.deepEqual(
+        (await backend.changes(worker.path)).map((change) => change.path),
+        ["src/nested/plain.py"],
+      );
+    } finally {
+      await backend.cleanupWorker(worker);
+    }
     assert.deepEqual(await backend.changes(integration.path), []);
   } finally {
-    if (integration) await git(f.root, "worktree", "remove", "--force", integration.path);
+    if (integration)
+      await git(f.root, "worktree", "remove", "--force", integration.path);
     await rm(f.parent, { recursive: true, force: true });
   }
 });
@@ -860,7 +1070,9 @@ test("non-Git DIRECT run edits, verifies and leaves the original unchanged in pr
     const failed = await run({
       repo: f.root,
       task: "Change calc.js addition from subtraction to addition.",
-      verify: ["node -e \"import('./calc.js').then(({add})=>process.exit(Number(add(2,3)===5)))\""],
+      verify: [
+        "node -e \"import('./calc.js').then(({add})=>process.exit(Number(add(2,3)===5)))\"",
+      ],
       config: cfg,
       output: join(f.parent, "failed-output"),
       apply: true,
@@ -870,7 +1082,10 @@ test("non-Git DIRECT run edits, verifies and leaves the original unchanged in pr
     assert.equal(failed.applyResult, "not_verified");
     assert.equal(failed.candidateProduced, true);
     assert.deepEqual(failed.candidateChangedFiles, ["calc.js"]);
-    assert.equal(failed.candidatePatchPath, join(f.parent, "failed-output", "candidate.patch"));
+    assert.equal(
+      failed.candidatePatchPath,
+      join(f.parent, "failed-output", "candidate.patch"),
+    );
     const candidatePatch = await readFile(failed.candidatePatchPath, "utf8");
     assert.match(
       candidatePatch,
@@ -992,14 +1207,19 @@ test("localized README dogfood task is DIRECT and makes zero planner calls", asy
     assert.equal(result.finalVerificationStatus, "VERIFIED_SUCCESS");
     assert.equal(result.applyResult, "preview");
     assert.equal(requests.length, 1);
-    assert.ok(requests[0].tools.some((tool: any) =>
-      tool.function.name === "write_file"));
+    assert.ok(
+      requests[0].tools.some(
+        (tool: any) => tool.function.name === "write_file",
+      ),
+    );
     assert.deepEqual(result.workerContexts[0]?.context_files, ["README.md"]);
     assert.deepEqual(result.workerScopes[0]?.allowed_write_paths, [
       "README.md",
     ]);
-    assert.match(JSON.stringify(JSON.parse(requests[0].messages[1].content).context.files),
-      /Workspace safety|# Sample/);
+    assert.match(
+      JSON.stringify(JSON.parse(requests[0].messages[1].content).context.files),
+      /Workspace safety|# Sample/,
+    );
     assert.deepEqual(
       result.verification.checks.map((check: any) => check.command),
       ["pnpm run lint", "internal:tiny-documentation-structure"],
@@ -1089,9 +1309,22 @@ test("large README TINY request uses a bounded edit_file window and preserves su
   const server = createServer(async (req, res) => {
     res.setHeader("content-type", "application/json");
     if (req.url?.endsWith("/models")) {
-      res.end(JSON.stringify({ data: [{ id: "frontier", context_length: 100000,
-        pricing: { prompt: "0.000001", completion: "0.000002" },
-        supported_parameters: ["tools", "tool_choice", "structured_outputs"] }] }));
+      res.end(
+        JSON.stringify({
+          data: [
+            {
+              id: "frontier",
+              context_length: 100000,
+              pricing: { prompt: "0.000001", completion: "0.000002" },
+              supported_parameters: [
+                "tools",
+                "tool_choice",
+                "structured_outputs",
+              ],
+            },
+          ],
+        }),
+      );
       return;
     }
     let raw = "";
@@ -1169,19 +1402,19 @@ test("large README TINY request uses a bounded edit_file window and preserves su
     assert.equal(result.escalations, 0);
     assert.equal(result.verificationCalls, 1);
     assert.equal(requests.length, 1);
-    assert.ok(requests[0].tools.some((tool: any) =>
-      tool.function.name === "edit_file"));
+    assert.ok(
+      requests[0].tools.some((tool: any) => tool.function.name === "edit_file"),
+    );
     assert.equal(requests[0].tool_choice, "required");
     assert.equal(requests[0].plugins[0].min_coding_score, 0);
     const payload = JSON.parse(requests[0].messages[1].content);
     assert.ok(Buffer.byteLength(JSON.stringify(requests[0])) < 10000);
-    const excerpt = payload.context.files.find((file: any) => file.path === "README.md").snippet;
+    const excerpt = payload.context.files.find(
+      (file: any) => file.path === "README.md",
+    ).snippet;
     assert.ok(Buffer.byteLength(excerpt) <= 4096);
     assert.match(excerpt, /Workspace safety/);
-    assert.match(
-      excerpt,
-      /Previews can alter the original project/,
-    );
+    assert.match(excerpt, /Previews can alter the original project/);
     assert.ok(!JSON.stringify(requests[0]).includes("END OF README"));
     assert.deepEqual(result.changedFiles, ["README.md"]);
     assert.equal(
@@ -1402,13 +1635,22 @@ for (const recover of [true, false]) {
         quiet: true,
       });
       assert.equal(result.execution_effort, "tiny");
-      assert.equal(result.coderModelCalls, 2, "one bounded recovery follows the first TINY no-op");
+      assert.equal(
+        result.coderModelCalls,
+        2,
+        "one bounded recovery follows the first TINY no-op",
+      );
       assert.equal(result.plannerModelCalls, 0);
       assert.ok(
         requests.every((request) => request.tool_choice === "required"),
       );
-      assert.ok(requests.every((request) => request.tools.some((tool: any) =>
-        tool.function.name === "write_file")));
+      assert.ok(
+        requests.every((request) =>
+          request.tools.some(
+            (tool: any) => tool.function.name === "write_file",
+          ),
+        ),
+      );
       if (recover)
         assert.deepEqual(
           requests.map((request) => request.plugins?.[0]?.min_coding_score),

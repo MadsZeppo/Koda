@@ -162,6 +162,29 @@ test("execution strategy: three separately named source repairs use PLANNED", ()
     "Fix math, slug and display-name; preserve existing behavior.", repository,
   ).execution_strategy, "planned");
 });
+test("execution strategy: exact same-directory source paths use dependency-aware planning", () => {
+  const repository = profile([
+    "src/money.js",
+    "src/accounts.js",
+    "src/payments.js",
+    "tests/money.test.js",
+    "tests/accounts.test.js",
+    "tests/payments.test.js",
+  ]);
+  const task =
+    "Fix the failing behavior in src/money.js, src/accounts.js, and src/payments.js so their focused tests pass.";
+  const result = chooseExecutionStrategy(task, repository);
+  assert.equal(result.execution_strategy, "planned");
+  assert.equal(
+    result.strategy_reason,
+    "Several explicit source targets require dependency-aware planning",
+  );
+  assert.deepEqual(result.likelyFiles, [
+    "src/money.js",
+    "src/accounts.js",
+    "src/payments.js",
+  ]);
+});
 test("execution strategy: bounded inspect, fix and regression test uses stable mode", () => {
   const repository = profile([
     "src/repo/commands.ts",

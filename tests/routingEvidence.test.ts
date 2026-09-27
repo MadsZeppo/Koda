@@ -8,13 +8,16 @@ import { buildKnowledgeSnapshot, ingestEvidenceSource, pairwiseOutcomes,
   repriceTokens, resolveSourceIdentities, type EvidenceSourceInput } from "../src/router/knowledge/ingest.js";
 import { RoutingKnowledgeStore } from "../src/router/knowledge/store.js";
 import { syncRoutingEvidence } from "../src/router/knowledge/sync.js";
-import { CODEROUTER_MODELS_URL, CODEROUTER_RESULTS_URL, SWE_REBENCH_TREE_URL,
+import { CODEROUTER_MODELS_URL, CODEROUTER_RESULTS_URL, CODEROUTER_TASKS_URL, SWE_REBENCH_TREE_URL,
   codeRouterSource, currentPricingFromState, prepareCodeRouterBench, prepareSWERebench,
   sweRebenchRecord } from "../src/router/knowledge/bootstrap.js";
 import { routingEvidenceReport } from "../src/router/knowledge/report.js";
 
 const paired: EvidenceSourceInput = { id: "coderouter-fixture", type: "paired_task_model",
-  version: "fixture-1", harness: "same deterministic harness", records: [
+  version: "fixture-1", harness: "same deterministic harness",
+  tasks: ["t1", "t2", "t3"].map((taskKey) => ({ taskKey,
+    taskFamily: "localized_bugfix", languages: ["typescript"],
+    routingTerms: ["atomic", "rollback", taskKey] })), records: [
     { taskKey: "t1", taskFamily: "localized_bugfix", externalModelName: "Candidate exact",
       canonicalModelId: "vendor/candidate", identityLevel: "EXACT", success: false,
       inputTokens: 100, outputTokens: 20 },
@@ -77,6 +80,16 @@ test("paired same-task outcomes retain overlap and conditional-recovery counts",
     sampleSize: 3, identityLevel: "EXACT" });
 });
 
+test("knowledge snapshots retain compact task-level outcomes without raw prompts", () => {
+  const snapshot = buildKnowledgeSnapshot([paired], "2026-09-24T00:00:00Z");
+  assert.equal(snapshot.taskCases?.length, 3);
+  assert.deepEqual(snapshot.taskCases?.[0]?.routingTerms, ["atomic", "rollback", "t1"]);
+  assert.equal(snapshot.taskCases?.[0]?.outcomes.length, 2);
+  assert.equal(JSON.stringify(snapshot).includes("prompt"), false);
+  const candidate = new RoutingKnowledgeStore(snapshot).forModel("vendor/candidate");
+  assert.equal(candidate.taskCases?.length, 3);
+});
+
 test("current repricing requires exact identity and preserves cached-input economics", () => {
   assert.equal(repriceTokens({ identityLevel: "EXACT", inputTokens: 1000,
     cachedTokens: 800, outputTokens: 100 },
@@ -112,14 +125,19 @@ test("CodeRouterBench preparation uses explicit canonical identity and never gue
   const source = codeRouterSource(csv, { models: [
     { model: "model-a", canonical_openrouter_id: "vendor/model-a" },
     { model: "unmapped-latest", provider: "Vendor" },
-  ] }, "2026-09-24T00:00:00Z");
+  ] }, "2026-09-24T00:00:00Z",
+  JSON.stringify({ task_id: "t1", dimension: "bug_fix", prompt: "Fix atomic reservation rollback" }));
   assert.equal(source.records[0]?.canonicalModelId, "vendor/model-a");
   assert.equal(source.records[0]?.identityLevel, "EXACT");
-  assert.equal(source.records[1]?.canonicalModelId, undefined);
-  assert.equal(source.records[1]?.identityLevel, "UNKNOWN");
+  assert.equal(source.records[1]?.canonicalModelId, "unmapped-latest");
+  assert.equal(source.records[1]?.identityLevel, "FAMILY_TRANSFER");
   assert.deepEqual(source.records.map((row) => row.success), [true, false]);
+  assert.deepEqual(source.tasks?.[0]?.routingTerms,
+    ["bug", "fix", "fix", "atomic", "reservation", "rollback"].filter((v, i, a) => a.indexOf(v) === i));
   assert.equal(sweRebenchRecord({ participant: { name: "display/name" } }).identityLevel,
     "UNKNOWN", "a slash in a display name is not authoritative identity");
+  assert.equal(buildKnowledgeSnapshot([source], "2026-09-24T00:00:00Z").taskCases?.length, 1,
+    "official revision labels retain paired cases without claiming exact endpoint identity");
 });
 
 test("CodeRouterBench downloader uses the official compact artifacts and writes atomically", async () => {
@@ -131,13 +149,18 @@ test("CodeRouterBench downloader uses the official compact artifacts and writes 
     if (url === CODEROUTER_RESULTS_URL) return new Response(
       "task_id,dimension,model,score\nt1,bug_fix,vendor/model-a,1\n", { status: 200 });
     if (url === CODEROUTER_MODELS_URL) return new Response(JSON.stringify({ models: [] }), { status: 200 });
+    if (url === CODEROUTER_TASKS_URL) return new Response(
+      '{"task_id":"t1","dimension":"bug_fix","prompt":"Fix atomic reservation"}\n', { status: 200 });
     throw Error(`unexpected fixture URL ${url}`);
   }) as typeof fetch;
   try {
     const result = await prepareCodeRouterBench(output, fetcher, "2026-09-24T00:00:00Z");
     assert.equal(result.records, 1);
-    assert.deepEqual(requested.sort(), [CODEROUTER_MODELS_URL, CODEROUTER_RESULTS_URL].sort());
-    assert.equal(JSON.parse(await readFile(output, "utf8")).records[0].identityLevel, "EXACT");
+    assert.deepEqual(requested.sort(), [CODEROUTER_MODELS_URL, CODEROUTER_RESULTS_URL,
+      CODEROUTER_TASKS_URL].sort());
+    const source = JSON.parse(await readFile(output, "utf8"));
+    assert.equal(source.records[0].identityLevel, "EXACT");
+    assert.equal(source.tasks[0].taskKey, "t1");
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 

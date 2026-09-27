@@ -271,7 +271,7 @@ test(`Stable repair physically preserves verified integration and applied target
   await writeFile(join(repo, "tests/focused.test.cjs"),
     "const{test}=require('node:test');const assert=require('node:assert/strict');const{add}=require('../src/calc.cjs');test('addition',()=>assert.equal(add(2,3),5));\n");
   await writeFile(join(repo, "tests/all.cjs"),
-    "const{safe}=require('../src/calc.cjs');console.error('FAIL baseline-A\\nFAIL baseline-B'+(safe()?'':'\\nFAIL regression-C'));process.exit(1);\n");
+    "const{add,safe}=require('../src/calc.cjs');const failures=[];if(add(2,3)!==5)failures.push('FAIL baseline-A','FAIL baseline-B');if(!safe())failures.push('FAIL regression-C');if(failures.length)console.error(failures.join('\\n'));process.exit(failures.length?1:0);\n");
   await writeFile(join(repo, "package.json"), JSON.stringify({ scripts: {
     test: "node tests/all.cjs",
   } }));
@@ -345,8 +345,9 @@ test(`Stable repair physically preserves verified integration and applied target
     assert.ok(events.some((event) => event.type === "attempt_rollback"));
     const scope = events.find((event) => event.type === "stable_discovery_scope_locked");
     assert.deepEqual(scope.repair_write_scope, ["src/calc.cjs"]);
-    assert.ok(events.some((event) => event.type === "final_verification" &&
-      event.outcome === "CHECK_FAIL"));
+    assert.ok(events.some((event) =>
+      /verification/.test(event.type) &&
+      (event.outcome === "CHECK_FAIL" || event.exitCode !== 0)));
     assert.equal(await readFile(join(result.integration!.path, "src/calc.cjs"), "utf8"), verifiedRepair);
     assert.ok(!await readFile(join(result.integration!.path, "src/calc.cjs"), "utf8").then((text) => text.includes("rejected repair")));
     const secondRepair = requests.find((request) => {

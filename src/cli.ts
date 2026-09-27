@@ -11,8 +11,9 @@ import { routerStateDirectory } from "./router/modelRouter.js";
 import { PoolRouter } from "./router/modelRouter.js";
 import { Logger } from "./telemetry/logger.js";
 import { currentIdentityCatalog, currentPricingFromState, evidenceInputPaths, prepareCodeRouterBench,
-  prepareSWERebench } from "./router/knowledge/bootstrap.js";
+  prepareCodeRouterBenchHoldout, prepareSWERebench } from "./router/knowledge/bootstrap.js";
 import { routingEvidenceReport } from "./router/knowledge/report.js";
+import { validateAndActivateSnapshot } from "./router/knowledge/validation.js";
 const cli = new Command()
   .name("agent")
   .description("Parallel, evidence-driven local coding agent");
@@ -31,6 +32,14 @@ cli.command("routing-prepare-swe-rebench")
     const c = await config(o.config), directory = routerStateDirectory(c);
     const output = resolve(o.output ?? evidenceInputPaths(directory).sweRebench);
     console.log(JSON.stringify(await prepareSWERebench(output), null, 2));
+  });
+cli.command("routing-prepare-coderouterbench-holdout")
+  .option("--config <path>")
+  .option("--output <path>")
+  .action(async (o) => {
+    const c = await config(o.config), directory = routerStateDirectory(c);
+    const output = resolve(o.output ?? evidenceInputPaths(directory).codeRouterBenchHoldout);
+    console.log(JSON.stringify(await prepareCodeRouterBenchHoldout(output), null, 2));
   });
 cli.command("routing-refresh-catalog")
   .option("--config <path>")
@@ -63,6 +72,16 @@ cli.command("routing-evidence-report")
   .action(async (o) => {
     const c = await config(o.config);
     console.log(JSON.stringify(await routingEvidenceReport(routerStateDirectory(c)), null, 2));
+  });
+cli.command("routing-validate-knowledge")
+  .option("--config <path>")
+  .option("--snapshot <path>")
+  .option("--holdout <path>")
+  .action(async (o) => {
+    const c = await config(o.config), directory = routerStateDirectory(c);
+    const snapshot = resolve(o.snapshot ?? join(directory, "routing-knowledge-v2.json"));
+    const holdout = resolve(o.holdout ?? evidenceInputPaths(directory).codeRouterBenchHoldout);
+    console.log(JSON.stringify(await validateAndActivateSnapshot(snapshot, holdout), null, 2));
   });
 cli
   .command("routing-sync-evidence")

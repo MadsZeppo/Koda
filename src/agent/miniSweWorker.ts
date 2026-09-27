@@ -31,6 +31,8 @@ export type MiniSweBridgeRunner = (input: CodingWorkerInput & { trajectoryPath: 
 export interface MiniSweWorkerOptions {
   runner?: MiniSweBridgeRunner;
   ensureRuntime?: () => Promise<string>;
+  /** Tests may inject the already-covered direct editor at the dispatch seam. */
+  directWorker?: CodingWorker;
 }
 
 export class MiniSweWorker implements CodingWorker {
@@ -73,18 +75,22 @@ export class MiniSweWorker implements CodingWorker {
   }
 
   async run(input: CodingWorkerInput): Promise<CodingWorkerResult> {
-    // DIRECT is already localized by Koda. Do not pay for a repository-browsing
-    // mini-SWE loop when one concrete target and a bounded source packet exist.
+    // DIRECT and localized PLANNED subtasks are already grounded by Koda. Do
+    // not pay for a repository-browsing mini-SWE loop when one concrete target
+    // and a bounded source packet exist. Stable keeps its agent loop because
+    // its lifecycle may still need repository exploration and repair turns.
     // The direct worker performs one structured model call; Koda still owns
     // path validation, patch application, verification, rollback and recovery.
-    if (!this.options.runner && input.attemptId === "direct" && input.returnOnMutation &&
+    if ((this.options.directWorker || !this.options.runner) && input.attemptId !== "stable" &&
+        input.returnOnMutation &&
         input.writeScope.length === 1 && input.writeScope[0] !== ".") {
       this.logger.log("direct_edit_dispatch", {
         subtaskId: input.attemptId,
         model: input.model,
         target: input.writeScope[0],
       });
-      const direct = await new DirectEditWorker(this.budget, this.logger).run(input);
+      const direct = await (this.options.directWorker ??
+        new DirectEditWorker(this.budget, this.logger)).run(input);
       if (direct.terminationReason !== "direct_edit_unsupported") return direct;
       this.logger.log("direct_edit_fallback", {
         subtaskId: input.attemptId,

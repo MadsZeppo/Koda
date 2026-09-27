@@ -40,8 +40,16 @@ const pool = {
       qualityPrior: 0.94,
       latencyPriorMs: 1000,
       strengths: ["coding", "tool_use", "structured_output"],
-      fallback: { inputPrice: 0.1, outputPrice: 0.2,
-        supportedParameters: ["tools", "tool_choice", "structured_outputs", "response_format"] },
+      fallback: {
+        inputPrice: 0.1,
+        outputPrice: 0.2,
+        supportedParameters: [
+          "tools",
+          "tool_choice",
+          "structured_outputs",
+          "response_format",
+        ],
+      },
     },
     {
       id: "strong",
@@ -55,8 +63,16 @@ const pool = {
         "repo_scale",
         "reasoning",
       ],
-      fallback: { inputPrice: 1, outputPrice: 2,
-        supportedParameters: ["tools", "tool_choice", "structured_outputs", "response_format"] },
+      fallback: {
+        inputPrice: 1,
+        outputPrice: 2,
+        supportedParameters: [
+          "tools",
+          "tool_choice",
+          "structured_outputs",
+          "response_format",
+        ],
+      },
     },
   ],
 };
@@ -105,201 +121,534 @@ test("model-planned missing paths reconcile to unique real files and optional te
   const f = await fixture();
   try {
     const profile = await profileRepo(f.repo);
-    const candidate = validatePlanningCandidate({ taskSummary: "repair", acceptanceCriteria: ["tests pass"],
+    const candidate = validatePlanningCandidate({
+      taskSummary: "repair",
+      acceptanceCriteria: ["tests pass"],
       subtasks: [
-        { id: "fix", title: "Fix imagined/a.ts", objective: "Fix imagined/a.ts",
-          dependsOn: [], likelyReadPaths: ["imagined/a.ts", "imagined/a.test.ts"],
-          likelyWritePaths: ["imagined/a.ts"], integrationContract: "Preserve exports",
-          verificationCommands: [], estimatedDifficulty: "normal", parallelSafe: false },
-        { id: "test", title: "Add a test", objective: "Add a test for the fix",
-          dependsOn: ["fix"], likelyReadPaths: ["test/nonexistent.test.ts"],
-          likelyWritePaths: ["test/nonexistent.test.ts"], integrationContract: "Check behavior",
-          verificationCommands: [], estimatedDifficulty: "low", parallelSafe: false },
-      ] });
-    const reconciled = await reconcilePlannedPaths(candidate, "Fix the bug in src/a.ts so tests pass", profile);
+        {
+          id: "fix",
+          title: "Fix imagined/a.ts",
+          objective: "Fix imagined/a.ts",
+          dependsOn: [],
+          likelyReadPaths: ["imagined/a.ts", "imagined/a.test.ts"],
+          likelyWritePaths: ["imagined/a.ts"],
+          integrationContract: "Preserve exports",
+          verificationCommands: [],
+          estimatedDifficulty: "normal",
+          parallelSafe: false,
+        },
+        {
+          id: "test",
+          title: "Add a test",
+          objective: "Add a test for the fix",
+          dependsOn: ["fix"],
+          likelyReadPaths: ["test/nonexistent.test.ts"],
+          likelyWritePaths: ["test/nonexistent.test.ts"],
+          integrationContract: "Check behavior",
+          verificationCommands: [],
+          estimatedDifficulty: "low",
+          parallelSafe: false,
+        },
+      ],
+    });
+    const reconciled = await reconcilePlannedPaths(
+      candidate,
+      "Fix the bug in src/a.ts so tests pass. Do not modify tests.",
+      profile,
+    );
     assert.equal(reconciled.subtasks.length, 1);
     assert.deepEqual(reconciled.subtasks[0]!.likelyWritePaths, ["src/a.ts"]);
-    assert.ok(reconciled.subtasks[0]!.likelyReadPaths.includes("test/a.test.ts"));
+    assert.ok(
+      reconciled.subtasks[0]!.likelyReadPaths.includes("test/a.test.ts"),
+    );
     assert.ok(!reconciled.subtasks[0]!.objective.includes("imagined/a.ts"));
-  } finally { await f.cleanup(); }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("model plan cannot omit an evidence-backed implementation target", async () => {
+  const f = await fixture();
+  try {
+    const profile = await profileRepo(f.repo);
+    const incomplete = validatePlanningCandidate({
+      taskSummary: "repair a and b",
+      acceptanceCriteria: ["tests pass"],
+      subtasks: [
+        {
+          id: "fix-a",
+          title: "Fix a",
+          objective: "Fix src/a.ts",
+          dependsOn: [],
+          likelyReadPaths: ["src/a.ts", "test/a.test.ts"],
+          likelyWritePaths: ["src/a.ts"],
+          integrationContract: "Preserve exports",
+          verificationCommands: ["node --test test/a.test.ts"],
+          estimatedDifficulty: "normal",
+          parallelSafe: true,
+        },
+      ],
+    });
+    await assert.rejects(
+      reconcilePlannedPaths(incomplete, task, profile, [
+        "src/a.ts",
+        "src/b.ts",
+      ]),
+      /omitted evidence-backed mutation targets: src\/b\.ts/,
+    );
+  } finally {
+    await f.cleanup();
+  }
 });
 
 test("explicit test creation keeps its scoped new path; unresolved source ownership fails boundedly", async () => {
   const f = await fixture();
   try {
     const profile = await profileRepo(f.repo);
-    const planned = (path: string) => validatePlanningCandidate({ taskSummary: "task",
-      acceptanceCriteria: ["repo checks pass"], subtasks: [{ id: "work", title: "Work", objective: "Work",
-        dependsOn: [], likelyReadPaths: [], likelyWritePaths: [path],
-        integrationContract: "Preserve behavior", verificationCommands: [],
-        estimatedDifficulty: "normal", parallelSafe: false }] });
-    const tests = await reconcilePlannedPaths(planned("test/new.test.ts"),
-      "Add a regression test for the source behavior", profile);
+    const planned = (path: string) =>
+      validatePlanningCandidate({
+        taskSummary: "task",
+        acceptanceCriteria: ["repo checks pass"],
+        subtasks: [
+          {
+            id: "work",
+            title: "Work",
+            objective: "Work",
+            dependsOn: [],
+            likelyReadPaths: [],
+            likelyWritePaths: [path],
+            integrationContract: "Preserve behavior",
+            verificationCommands: [],
+            estimatedDifficulty: "normal",
+            parallelSafe: false,
+          },
+        ],
+      });
+    const tests = await reconcilePlannedPaths(
+      planned("test/new.test.ts"),
+      "Add a regression test for the source behavior",
+      profile,
+    );
     assert.deepEqual(tests.subtasks[0]!.likelyWritePaths, ["test/new.test.ts"]);
-    await assert.rejects(reconcilePlannedPaths(planned("src/nonexistent.ts"),
-      "Fix the source bug", profile), /does not exist/);
-  } finally { await f.cleanup(); }
+    await assert.rejects(
+      reconcilePlannedPaths(
+        planned("src/nonexistent.ts"),
+        "Fix the source bug",
+        profile,
+      ),
+      /does not exist/,
+    );
+  } finally {
+    await f.cleanup();
+  }
 });
 
 test("missing read tool navigates to actual source once and bounds repeated misses", async () => {
   const f = await fixture();
   try {
-    const logger = new Logger(join(f.root, "navigation-log"), "navigation", true);
+    const logger = new Logger(
+      join(f.root, "navigation-log"),
+      "navigation",
+      true,
+    );
     const tools = new AgentTools(f.repo, false, 1000, logger, "navigation");
     const result = await tools.execute("read_file", { path: "imagined/a.ts" });
     assert.match(String(result), /src\/a\.ts/);
     assert.match(String(result), /export function a/);
-    assert.equal(logger.events.filter((event) => event.type === "missing_path_navigation").length, 1);
+    assert.equal(
+      logger.events.filter((event) => event.type === "missing_path_navigation")
+        .length,
+      1,
+    );
     await tools.execute("read_file", { path: "imagined/a.ts" });
     assert.equal(tools.missingReadAttempts.get("imagined/a.ts"), 2);
     const before = tools.progressEvidence.length;
-    const unknown = JSON.parse(String(await tools.execute("read_file", {
-      path: "imagined/definitely_absent_zzz.ts",
-    })));
+    const unknown = JSON.parse(
+      String(
+        await tools.execute("read_file", {
+          path: "imagined/definitely_absent_zzz.ts",
+        }),
+      ),
+    );
     assert.equal(unknown.source, undefined);
-    assert.equal(tools.progressEvidence.length, before,
-      "an unresolved path must not count as inspection progress");
+    assert.equal(
+      tools.progressEvidence.length,
+      before,
+      "an unresolved path must not count as inspection progress",
+    );
     assert.equal(await git(f.repo, "status", "--porcelain"), "");
-  } finally { await f.cleanup(); }
+  } finally {
+    await f.cleanup();
+  }
 });
 
-for (const outcome of ["passing", "failing", "infrastructure", "unrecoverable"] as const)
-test(`PLANNED worker recovers verification after write: ${outcome}`, async () => {
-  const root = await mkdtemp(join(tmpdir(), "koda-post-write-"));
-  const repo = join(root, "repo");
-  await mkdir(repo);
-  await writeFile(join(repo, "module.py"), "# implementation pending\n");
-  await git(repo, "init", "-q");
-  await git(repo, "config", "user.email", "test@koda.local");
-  await git(repo, "config", "user.name", "Koda Test");
-  await git(repo, "add", ".");
-  await git(repo, "commit", "-qm", "baseline");
-  const mockServer = await mock(() => ({ role: "assistant", content: null,
-    tool_calls: [{ id: "write", type: "function", function: { name: "write_file",
-      arguments: JSON.stringify({ path: "module.py", content: outcome === "passing"
-        ? "def add(a, b):\n    return a + b\n"
-        : outcome === "infrastructure"
-          ? "def add(a, b):\n    raise PermissionError('/outside/environment/pyvenv.cfg: Operation not permitted')\n"
-          : "def add(a, b):\n    return a - b\n" }) } }] }));
-  try {
-    const task = outcome === "unrecoverable" ? "Repair module.py" : "Repair module.py: add(2, 3) == 5";
-    const subtask = { id: "planned-fix", title: task, objective: task,
-      dependsOn: [], likelyReadPaths: ["module.py"], likelyWritePaths: ["module.py"],
-      integrationContract: "Preserve behavior", verificationCommands: [],
-      estimatedDifficulty: "normal" as const, parallelSafe: false };
-    const logger = new Logger(join(root, "report"), "planned-recovery", true);
-    const gateway = new Gateway(await config(undefined, { modelPool: pool,
-      baseUrl: mockServer.url, maxIterations: 3 }), logger,
-      new Budget(0.1, 200000, 60000));
-    const execute = () => implement(gateway, repo, task, subtask,
-      { acceptanceCriteria: [task], subtasks: [subtask] }, awaitProfile, {});
-    const awaitProfile = await profileRepo(repo);
-    if (outcome === "failing" || outcome === "infrastructure") {
-      await assert.rejects(execute());
-      assert.ok(!logger.events.some((event) => event.type === "verified_completion"));
-      assert.ok(logger.events.some((event) => event.type === "verification" &&
-        event.outcome === (outcome === "failing" ? "CHECK_FAIL" : "INFRA_FAILURE")));
-      if (outcome === "infrastructure") {
-        assert.equal(logger.events.filter((event) => event.type === "escalation").length, 0);
-        assert.equal(logger.events.find((event) => event.type === "verification")?.infrastructureRecoveryAttempts, 1);
+for (const outcome of [
+  "passing",
+  "failing",
+  "infrastructure",
+  "unrecoverable",
+] as const)
+  test(`PLANNED worker recovers verification after write: ${outcome}`, async () => {
+    const root = await mkdtemp(join(tmpdir(), "koda-post-write-"));
+    const repo = join(root, "repo");
+    await mkdir(repo);
+    await writeFile(join(repo, "module.py"), "# implementation pending\n");
+    await git(repo, "init", "-q");
+    await git(repo, "config", "user.email", "test@koda.local");
+    await git(repo, "config", "user.name", "Koda Test");
+    await git(repo, "add", ".");
+    await git(repo, "commit", "-qm", "baseline");
+    const mockServer = await mock(() => ({
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        {
+          id: "write",
+          type: "function",
+          function: {
+            name: "write_file",
+            arguments: JSON.stringify({
+              path: "module.py",
+              content:
+                outcome === "passing"
+                  ? "def add(a, b):\n    return a + b\n"
+                  : outcome === "infrastructure"
+                    ? "def add(a, b):\n    raise PermissionError('/outside/environment/pyvenv.cfg: Operation not permitted')\n"
+                    : "def add(a, b):\n    return a - b\n",
+            }),
+          },
+        },
+      ],
+    }));
+    try {
+      const task =
+        outcome === "unrecoverable"
+          ? "Repair module.py"
+          : "Repair module.py: add(2, 3) == 5";
+      const subtask = {
+        id: "planned-fix",
+        title: task,
+        objective: task,
+        dependsOn: [],
+        likelyReadPaths: ["module.py"],
+        likelyWritePaths: ["module.py"],
+        integrationContract: "Preserve behavior",
+        verificationCommands: [],
+        estimatedDifficulty: "normal" as const,
+        parallelSafe: false,
+      };
+      const logger = new Logger(join(root, "report"), "planned-recovery", true);
+      const gateway = new Gateway(
+        await config(undefined, {
+          modelPool: pool,
+          baseUrl: mockServer.url,
+          maxIterations: 3,
+        }),
+        logger,
+        new Budget(0.1, 200000, 60000),
+      );
+      const execute = () =>
+        implement(
+          gateway,
+          repo,
+          task,
+          subtask,
+          { acceptanceCriteria: [task], subtasks: [subtask] },
+          awaitProfile,
+          {},
+        );
+      const awaitProfile = await profileRepo(repo);
+      if (outcome === "failing" || outcome === "infrastructure") {
+        await assert.rejects(execute());
+        assert.ok(
+          !logger.events.some((event) => event.type === "verified_completion"),
+        );
+        assert.ok(
+          logger.events.some(
+            (event) =>
+              event.type === "verification" &&
+              event.outcome ===
+                (outcome === "failing" ? "CHECK_FAIL" : "INFRA_FAILURE"),
+          ),
+        );
+        if (outcome === "infrastructure") {
+          assert.equal(
+            logger.events.filter((event) => event.type === "escalation").length,
+            0,
+          );
+          assert.equal(
+            logger.events.find((event) => event.type === "verification")
+              ?.infrastructureRecoveryAttempts,
+            1,
+          );
+        }
+      } else {
+        const result = await execute();
+        assert.equal(
+          result.verification.status,
+          outcome === "passing" ? "VERIFIED_SUCCESS" : "NOT_FULLY_VERIFIED",
+        );
       }
-    } else {
-      const result = await execute();
-      assert.equal(result.verification.status,
-        outcome === "passing" ? "VERIFIED_SUCCESS" : "NOT_FULLY_VERIFIED");
+      assert.equal(
+        logger.events.filter(
+          (event) => event.type === "verification_recovery_attempt",
+        ).length,
+        1,
+      );
+      assert.ok(
+        logger.events.some(
+          (event) =>
+            event.type ===
+            (outcome === "unrecoverable"
+              ? "verification_recovery_exhausted"
+              : "verification_recovery"),
+        ),
+      );
+      assert.equal(
+        await git(repo, "status", "--porcelain"),
+        outcome === "failing" ? "" : " M module.py",
+      );
+    } finally {
+      await mockServer.close();
+      await rm(root, { recursive: true, force: true });
     }
-    assert.equal(logger.events.filter((event) => event.type === "verification_recovery_attempt").length, 1);
-    assert.ok(logger.events.some((event) => event.type ===
-      (outcome === "unrecoverable" ? "verification_recovery_exhausted" : "verification_recovery")));
-    assert.equal(await git(repo, "status", "--porcelain"),
-      outcome === "failing" ? "" : " M module.py");
-  } finally { await mockServer.close(); await rm(root, { recursive: true, force: true }); }
-});
-for (const mutate of [false, true]) test(`a pre-existing failing check does not escalate after ${mutate ? "an unrelated edit" : "a zero-diff final response"}`, async () => {
-  const root = await mkdtemp(join(tmpdir(), "koda-baseline-fail-"));
-  const repo = join(root, "repo");
-  await mkdir(join(repo, "tests"), { recursive: true });
-  await writeFile(join(repo, "package.json"), JSON.stringify({ type: "module", scripts: { test: "node --test tests/*.test.mjs" } }));
-  await writeFile(join(repo, "src.mjs"), "export const value = 0;\n");
-  await writeFile(join(repo, "tests/preexisting.test.mjs"), "import {test} from 'node:test'; import assert from 'node:assert/strict'; test('preexisting',()=>assert.equal(0,1));\n");
-  await git(repo, "init", "-q");
-  await git(repo, "config", "user.email", "test@koda.local");
-  await git(repo, "config", "user.name", "Koda Test");
-  await git(repo, "add", ".");
-  await git(repo, "commit", "-qm", "baseline");
-  const mockServer = await mock(() => mutate ? ({ role: "assistant", content: null,
-    tool_calls: [{ id: "write", type: "function", function: { name: "write_file",
-      arguments: JSON.stringify({ path: "src.mjs", content: "export const value = 1;\n" }) } }] })
-    : ({ role: "assistant", content: null, tool_calls: [{ id: "verify", type: "function",
-      function: { name: "run_command", arguments: JSON.stringify({ command: "npm run test" }) } }] }));
-  try {
-    const objective = "Fix src.mjs while preserving existing test behavior";
-    const subtask = { id: "fix", title: objective, objective, dependsOn: [],
-      likelyReadPaths: ["src.mjs"], likelyWritePaths: ["src.mjs"], integrationContract: "Run tests",
-      verificationCommands: ["npm run test"], estimatedDifficulty: "normal" as const, parallelSafe: false };
-    const logger = new Logger(join(root, "report"), "baseline-fail", true);
-    const gateway = new Gateway(await config(undefined, { modelPool: pool, baseUrl: mockServer.url, maxIterations: 3 }),
-      logger, new Budget(0.1, 200000, 60000));
-    const result = await implement(gateway, repo, objective, subtask,
-      { acceptanceCriteria: [objective], subtasks: [subtask] }, await profileRepo(repo), {}).catch((error) => {
-        throw Error(`${String(error)}; checks=${JSON.stringify(logger.events.filter((event) => event.type === "verification"))}`);
+  });
+for (const mutate of [false, true])
+  test(`a pre-existing failing check does not escalate after ${mutate ? "an unrelated edit" : "a zero-diff final response"}`, async () => {
+    const root = await mkdtemp(join(tmpdir(), "koda-baseline-fail-"));
+    const repo = join(root, "repo");
+    await mkdir(join(repo, "tests"), { recursive: true });
+    await writeFile(
+      join(repo, "package.json"),
+      JSON.stringify({
+        type: "module",
+        scripts: { test: "node --test tests/*.test.mjs" },
+      }),
+    );
+    await writeFile(join(repo, "src.mjs"), "export const value = 0;\n");
+    await writeFile(
+      join(repo, "tests/preexisting.test.mjs"),
+      "import {test} from 'node:test'; import assert from 'node:assert/strict'; test('preexisting',()=>assert.equal(0,1));\n",
+    );
+    await git(repo, "init", "-q");
+    await git(repo, "config", "user.email", "test@koda.local");
+    await git(repo, "config", "user.name", "Koda Test");
+    await git(repo, "add", ".");
+    await git(repo, "commit", "-qm", "baseline");
+    const mockServer = await mock(() =>
+      mutate
+        ? {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "write",
+                type: "function",
+                function: {
+                  name: "write_file",
+                  arguments: JSON.stringify({
+                    path: "src.mjs",
+                    content: "export const value = 1;\n",
+                  }),
+                },
+              },
+            ],
+          }
+        : {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "verify",
+                type: "function",
+                function: {
+                  name: "run_command",
+                  arguments: JSON.stringify({ command: "npm run test" }),
+                },
+              },
+            ],
+          },
+    );
+    try {
+      const objective = "Fix src.mjs while preserving existing test behavior";
+      const subtask = {
+        id: "fix",
+        title: objective,
+        objective,
+        dependsOn: [],
+        likelyReadPaths: ["src.mjs"],
+        likelyWritePaths: ["src.mjs"],
+        integrationContract: "Run tests",
+        verificationCommands: ["npm run test"],
+        estimatedDifficulty: "normal" as const,
+        parallelSafe: false,
+      };
+      const logger = new Logger(join(root, "report"), "baseline-fail", true);
+      const gateway = new Gateway(
+        await config(undefined, {
+          modelPool: pool,
+          baseUrl: mockServer.url,
+          maxIterations: 3,
+        }),
+        logger,
+        new Budget(0.1, 200000, 60000),
+      );
+      const result = await implement(
+        gateway,
+        repo,
+        objective,
+        subtask,
+        { acceptanceCriteria: [objective], subtasks: [subtask] },
+        await profileRepo(repo),
+        {},
+      ).catch((error) => {
+        throw Error(
+          `${String(error)}; checks=${JSON.stringify(logger.events.filter((event) => event.type === "verification"))}`,
+        );
       });
-    assert.equal(result.verification.status, mutate ? "VERIFIED_SUCCESS" : "NOT_FULLY_VERIFIED");
-    assert.ok(logger.events.some((event) => event.type === "verification_baseline_unchanged"));
-    assert.equal(logger.events.filter((event) => event.type === "escalation").length, 0);
-    assert.equal(await readFile(join(repo, "src.mjs"), "utf8"),
-      mutate ? "export const value = 1;\n" : "export const value = 0;\n");
-    if (!mutate) assert.equal(logger.events.filter((event) => event.type === "model_call").length, 1);
-  } finally { await mockServer.close(); await rm(root, { recursive: true, force: true }); }
-});
+      assert.equal(
+        result.verification.status,
+        mutate ? "CANDIDATE_NEUTRAL" : "NOT_FULLY_VERIFIED",
+      );
+      assert.ok(
+        logger.events.some(
+          (event) => event.type === "verification_baseline_unchanged",
+        ),
+      );
+      assert.equal(
+        logger.events.filter((event) => event.type === "escalation").length,
+        0,
+      );
+      assert.equal(
+        await readFile(join(repo, "src.mjs"), "utf8"),
+        mutate ? "export const value = 1;\n" : "export const value = 0;\n",
+      );
+      if (!mutate)
+        assert.equal(
+          logger.events.filter((event) => event.type === "model_call").length,
+          1,
+        );
+    } finally {
+      await mockServer.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 test("coding worker expands one evidenced sibling scope and verifies its edit", async () => {
   const root = await mkdtemp(join(tmpdir(), "koda-sibling-fix-"));
   const repo = join(root, "repo");
   await mkdir(join(repo, "src"), { recursive: true });
   await mkdir(join(repo, "tests"));
-  await writeFile(join(repo, "package.json"), JSON.stringify({ type: "module", scripts: { test: "node --test tests/*.test.mjs" } }));
-  await writeFile(join(repo, "src/a.mjs"), 'import {value} from "./b.mjs"; export const result = value;\n');
+  await writeFile(
+    join(repo, "package.json"),
+    JSON.stringify({
+      type: "module",
+      scripts: { test: "node --test tests/*.test.mjs" },
+    }),
+  );
+  await writeFile(
+    join(repo, "src/a.mjs"),
+    'import {value} from "./b.mjs"; export const result = value;\n',
+  );
   await writeFile(join(repo, "src/b.mjs"), "export const value = 0;\n");
-  await writeFile(join(repo, "tests/feature.test.mjs"), "import {test} from 'node:test'; import assert from 'node:assert/strict'; import {result} from '../src/a.mjs'; test('feature',()=>assert.equal(result,1));\n");
+  await writeFile(
+    join(repo, "tests/feature.test.mjs"),
+    "import {test} from 'node:test'; import assert from 'node:assert/strict'; import {result} from '../src/a.mjs'; test('feature',()=>assert.equal(result,1));\n",
+  );
   await git(repo, "init", "-q");
   await git(repo, "config", "user.email", "test@koda.local");
   await git(repo, "config", "user.name", "Koda Test");
   await git(repo, "add", ".");
   await git(repo, "commit", "-qm", "baseline");
-  const mockServer = await mock(() => ({ role: "assistant", content: null,
-    tool_calls: [{ id: "write", type: "function", function: { name: "write_file",
-      arguments: JSON.stringify({ path: "src/b.mjs", content: "export const value = 1;\n" }) } }] }));
+  const mockServer = await mock(() => ({
+    role: "assistant",
+    content: null,
+    tool_calls: [
+      {
+        id: "write",
+        type: "function",
+        function: {
+          name: "write_file",
+          arguments: JSON.stringify({
+            path: "src/b.mjs",
+            content: "export const value = 1;\n",
+          }),
+        },
+      },
+    ],
+  }));
   try {
-    const objective = "Fix src/b.mjs used by src/a.mjs so the feature test passes";
-    const subtask = { id: "fix", title: objective, objective, dependsOn: [],
-      likelyReadPaths: ["src/a.mjs", "src/b.mjs"], likelyWritePaths: ["src/a.mjs"],
-      integrationContract: "Feature test passes", verificationCommands: ["npm run test"],
-      estimatedDifficulty: "normal" as const, parallelSafe: false };
+    const objective =
+      "Fix src/b.mjs used by src/a.mjs so the feature test passes";
+    const subtask = {
+      id: "fix",
+      title: objective,
+      objective,
+      dependsOn: [],
+      likelyReadPaths: ["src/a.mjs", "src/b.mjs"],
+      likelyWritePaths: ["src/a.mjs"],
+      integrationContract: "Feature test passes",
+      verificationCommands: ["npm run test"],
+      estimatedDifficulty: "normal" as const,
+      parallelSafe: false,
+    };
     const logger = new Logger(join(root, "report"), "sibling-fix", true);
-    const gateway = new Gateway(await config(undefined, { modelPool: pool, baseUrl: mockServer.url, maxIterations: 4 }),
-      logger, new Budget(0.1, 200000, 60000));
-    const result = await implement(gateway, repo, objective, subtask,
-      { acceptanceCriteria: [objective], subtasks: [subtask] }, await profileRepo(repo), {});
+    const gateway = new Gateway(
+      await config(undefined, {
+        modelPool: pool,
+        baseUrl: mockServer.url,
+        maxIterations: 4,
+      }),
+      logger,
+      new Budget(0.1, 200000, 60000),
+    );
+    const result = await implement(
+      gateway,
+      repo,
+      objective,
+      subtask,
+      { acceptanceCriteria: [objective], subtasks: [subtask] },
+      await profileRepo(repo),
+      {},
+    );
     assert.equal(result.verification.status, "VERIFIED_SUCCESS");
     assert.deepEqual(subtask.likelyWritePaths, ["src/a.mjs", "src/b.mjs"]);
-    assert.equal(logger.events.filter((event) => event.type === "write_scope_expanded").length, 1);
-    assert.equal(await readFile(join(repo, "src/b.mjs"), "utf8"), "export const value = 1;\n");
-  } finally { await mockServer.close(); await rm(root, { recursive: true, force: true }); }
+    assert.equal(
+      logger.events.filter((event) => event.type === "write_scope_expanded")
+        .length,
+      1,
+    );
+    assert.equal(
+      await readFile(join(repo, "src/b.mjs"), "utf8"),
+      "export const value = 1;\n",
+    );
+  } finally {
+    await mockServer.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 test("worker attempts are transactional: regressed patch rolls back before stronger model succeeds", async () => {
   const root = await mkdtemp(join(tmpdir(), "koda-transactional-"));
   const repo = join(root, "repo");
   await mkdir(join(repo, "src"), { recursive: true });
   await mkdir(join(repo, "tests"));
-  await writeFile(join(repo, "package.json"), JSON.stringify({ type: "module", scripts: { test: "node --test tests/*.test.mjs" } }));
+  await writeFile(
+    join(repo, "package.json"),
+    JSON.stringify({
+      type: "module",
+      scripts: { test: "node --test tests/*.test.mjs" },
+    }),
+  );
   await writeFile(join(repo, "src/value.mjs"), "export const value = 0;\n");
-  await writeFile(join(repo, "tests/value.test.mjs"), `import {test} from 'node:test';
+  await writeFile(
+    join(repo, "tests/value.test.mjs"),
+    `import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {value} from '../src/value.mjs';
 test('first',()=>assert.equal(value,1));
 test('second',()=>assert.equal(value,1));
 test('no negative regression',()=>assert.notEqual(value,-1));
-`);
+`,
+  );
   await git(repo, "init", "-q");
   await git(repo, "config", "user.email", "test@koda.local");
   await git(repo, "config", "user.name", "Koda Test");
@@ -311,64 +660,180 @@ test('no negative regression',()=>assert.notEqual(value,-1));
   const mockServer = await mock((body) => {
     served.push(body.model);
     if (body.model === "strong") {
-      cleanBeforeStrong = readFileSync(join(repo, "src/value.mjs"), "utf8") === "export const value = 0;\n";
-      handoffHadFailure = JSON.stringify(body.messages).includes("REJECTED ATTEMPT DIFF") &&
+      cleanBeforeStrong =
+        readFileSync(join(repo, "src/value.mjs"), "utf8") ===
+        "export const value = 0;\n";
+      handoffHadFailure =
+        JSON.stringify(body.messages).includes("REJECTED ATTEMPT DIFF") &&
         JSON.stringify(body.messages).includes("value = -1");
     }
-    return { role: "assistant", content: null, tool_calls: [{ id: `write-${served.length}`,
-      type: "function", function: { name: "write_file", arguments: JSON.stringify({
-        path: "src/value.mjs", content: body.model === "strong"
-          ? "export const value = 1;\n" : "export const value = -1;\n",
-      }) } }] };
+    return {
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        {
+          id: `write-${served.length}`,
+          type: "function",
+          function: {
+            name: "write_file",
+            arguments: JSON.stringify({
+              path: "src/value.mjs",
+              content:
+                body.model === "strong"
+                  ? "export const value = 1;\n"
+                  : "export const value = -1;\n",
+            }),
+          },
+        },
+      ],
+    };
   });
   try {
     const objective = "Fix src/value.mjs so all tests pass";
-    const subtask = { id: "fix", title: objective, objective, dependsOn: [],
+    const subtask = {
+      id: "fix",
+      title: objective,
+      objective,
+      dependsOn: [],
       likelyReadPaths: ["src/value.mjs", "tests/value.test.mjs"],
-      likelyWritePaths: ["src/value.mjs"], integrationContract: "Tests pass",
-      verificationCommands: ["npm run test"], estimatedDifficulty: "normal" as const, parallelSafe: false };
+      likelyWritePaths: ["src/value.mjs"],
+      integrationContract: "Tests pass",
+      verificationCommands: ["npm run test"],
+      estimatedDifficulty: "normal" as const,
+      parallelSafe: false,
+    };
     const logger = new Logger(join(root, "report"), "transactional", true);
-    const gateway = new Gateway(await config(undefined, { modelPool: pool,
-      baseUrl: mockServer.url, adaptiveCoding: false, specialistRouting: false,
-      maxIterations: 6, routing: { stateDirectory: join(root, "history") } }),
-      logger, new Budget(0.1, 200000, 60000));
-    const result = await implement(gateway, repo, objective, subtask,
-      { acceptanceCriteria: [objective], subtasks: [subtask] }, await profileRepo(repo), {}).catch((error) => {
-        throw Error(`${String(error)}; attempts=${JSON.stringify(logger.events.filter((event) =>
-          ["attempt_evaluation", "attempt_rollback", "coding_route_escalation", "verification"].includes(event.type)))}`);
-      });
+    const gateway = new Gateway(
+      await config(undefined, {
+        modelPool: pool,
+        baseUrl: mockServer.url,
+        adaptiveCoding: false,
+        specialistRouting: false,
+        maxIterations: 6,
+        routing: { stateDirectory: join(root, "history") },
+      }),
+      logger,
+      new Budget(0.1, 200000, 60000),
+    );
+    const result = await implement(
+      gateway,
+      repo,
+      objective,
+      subtask,
+      { acceptanceCriteria: [objective], subtasks: [subtask] },
+      await profileRepo(repo),
+      {},
+    ).catch((error) => {
+      throw Error(
+        `${String(error)}; attempts=${JSON.stringify(
+          logger.events.filter((event) =>
+            [
+              "attempt_evaluation",
+              "attempt_rollback",
+              "coding_route_escalation",
+              "verification",
+            ].includes(event.type),
+          ),
+        )}`,
+      );
+    });
     assert.equal(result.verification.status, "VERIFIED_SUCCESS");
     assert.deepEqual(served, ["fast", "strong"]);
     assert.equal(cleanBeforeStrong, true);
     assert.equal(handoffHadFailure, true);
-    assert.equal(await readFile(join(repo, "src/value.mjs"), "utf8"), "export const value = 1;\n");
-    assert.equal(logger.events.filter((event) => event.type === "attempt_rollback").length, 1);
-    assert.equal(logger.events.filter((event) => event.type === "attempt_checkpoint_promoted").length, 1);
-  } finally { await mockServer.close(); await rm(root, { recursive: true, force: true }); }
+    assert.equal(
+      await readFile(join(repo, "src/value.mjs"), "utf8"),
+      "export const value = 1;\n",
+    );
+    assert.equal(
+      logger.events.filter((event) => event.type === "attempt_rollback").length,
+      1,
+    );
+    assert.equal(
+      logger.events.filter(
+        (event) => event.type === "attempt_checkpoint_promoted",
+      ).length,
+      1,
+    );
+  } finally {
+    await mockServer.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 test("malformed scout final JSON retains concrete search evidence for coding", async () => {
   const f = await fixture();
-  const m = await mock((body) => body.messages.length === 2
-    ? { role: "assistant", content: null, tool_calls: [{ id: "search", type: "function",
-        function: { name: "search_code", arguments: JSON.stringify({ query: "export function a" }) } }] }
-    : { role: "assistant", content: "not valid JSON" });
+  const m = await mock((body) =>
+    body.messages.length === 2
+      ? {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "search",
+              type: "function",
+              function: {
+                name: "search_code",
+                arguments: JSON.stringify({ query: "export function a" }),
+              },
+            },
+          ],
+        }
+      : { role: "assistant", content: "not valid JSON" },
+  );
   try {
-    const subtask = { id: "inspect", title: "Inspect", objective: "Find the existing implementation",
-      dependsOn: [], likelyReadPaths: [], likelyWritePaths: [], readOnly: true,
-      integrationContract: "Return evidence", verificationCommands: [],
-      estimatedDifficulty: "low" as const, parallelSafe: false };
-    const logger = new Logger(join(f.root, "scout-report"), "scout-search", true);
-    const gateway = new Gateway(await config(undefined, { modelPool: pool, baseUrl: m.url }),
-      logger, new Budget(0.1, 200000, 60000));
-    const evidence = await discover(gateway, f.repo, "Find the implementation", subtask,
-      { subtasks: [subtask] }, await profileRepo(f.repo));
-    assert.ok(evidence.relevantFiles.includes("src/a.ts"), JSON.stringify({ evidence, events: logger.events.filter((event) => event.type === "tool_result") }));
-    assert.ok(evidence.evidence.some((item) => item.includes("search_code:") && item.includes("src/a.ts")));
-    assert.ok(logger.events.some((event) => event.type === "discovery_fallback"));
-  } finally { await m.close(); await f.cleanup(); }
+    const subtask = {
+      id: "inspect",
+      title: "Inspect",
+      objective: "Find the existing implementation",
+      dependsOn: [],
+      likelyReadPaths: [],
+      likelyWritePaths: [],
+      readOnly: true,
+      integrationContract: "Return evidence",
+      verificationCommands: [],
+      estimatedDifficulty: "low" as const,
+      parallelSafe: false,
+    };
+    const logger = new Logger(
+      join(f.root, "scout-report"),
+      "scout-search",
+      true,
+    );
+    const gateway = new Gateway(
+      await config(undefined, { modelPool: pool, baseUrl: m.url }),
+      logger,
+      new Budget(0.1, 200000, 60000),
+    );
+    const evidence = await discover(
+      gateway,
+      f.repo,
+      "Find the implementation",
+      subtask,
+      { subtasks: [subtask] },
+      await profileRepo(f.repo),
+    );
+    assert.ok(
+      evidence.relevantFiles.includes("src/a.ts"),
+      JSON.stringify({
+        evidence,
+        events: logger.events.filter((event) => event.type === "tool_result"),
+      }),
+    );
+    assert.ok(
+      evidence.evidence.some(
+        (item) => item.includes("search_code:") && item.includes("src/a.ts"),
+      ),
+    );
+    assert.ok(
+      logger.events.some((event) => event.type === "discovery_fallback"),
+    );
+  } finally {
+    await m.close();
+    await f.cleanup();
+  }
 });
 async function mock(
-  handler: (body: any) => any,
+  handler: (body: any) => any | Promise<any>,
   catalogModels: any[] = pool.models,
 ) {
   const requests: any[] = [];
@@ -388,7 +853,7 @@ async function mock(
                 ? undefined
                 : String((m.outputPrice ?? 0.2) / 1e6),
             },
-            supported_parameters: ["tools", "structured_outputs"],
+            supported_parameters: ["tools", "tool_choice", "structured_outputs"],
           })),
         }),
       );
@@ -399,7 +864,7 @@ async function mock(
       for await (const c of req) raw += c;
       const body = JSON.parse(raw);
       requests.push(body);
-      const message = handler(body);
+      const message = await handler(body);
       res.end(
         JSON.stringify({
           id: "mock",
@@ -433,11 +898,18 @@ const response = (content: unknown) => ({
 for (const finalFailure of [false, true])
   test(`deterministic planner executes three generic isolated repairs; final failure=${finalFailure}`, async () => {
     const f = await fixture();
-    const m = await mock((body) => {
+    const m = await mock(async (body) => {
       assert.ok(
         !body.messages[0].content.startsWith("Compile"),
         "no planner HTTP request",
       );
+
+      // Keep otherwise-instant mock coding calls alive briefly so this test
+      // deterministically observes the scheduler's real parallel worker
+      // overlap. The assertion below remains strict: Koda must actually run
+      // independent workers concurrently.
+      await new Promise((resolve) => setTimeout(resolve, 75));
+
       const input = JSON.parse(body.messages[1].content);
       const path = input.subtask.likelyWritePaths[0],
         id = path.match(/([abc])\.ts$/)[1];
@@ -474,7 +946,11 @@ for (const finalFailure of [false, true])
         config: c,
         quiet: true,
         output: join(f.root, "report"),
-        verify: finalFailure ? ["node -e \"import('./src/a.ts').then(({a})=>process.exit(Number(a()===1)))\""] : undefined,
+        verify: finalFailure
+          ? [
+              "node -e \"import('./src/a.ts').then(({a})=>process.exit(Number(a()===1)))\"",
+            ]
+          : undefined,
       });
       assert.equal(result.execution_strategy, "planned");
       assert.equal(
@@ -512,23 +988,153 @@ for (const finalFailure of [false, true])
     }
   });
 
+test("explicit dependent source targets plan locally, run independent roots in parallel, and start with the economical quality-peer", async () => {
+  const f = await fixture();
+  await writeFile(
+    join(f.repo, "src/c.ts"),
+    "import {a} from './a.ts'; import {b} from './b.ts'; export function c(){return a()+b()}\n",
+  );
+  await git(f.repo, "add", ".");
+  await git(f.repo, "commit", "-qm", "dependent broken sources");
+  const solutions: Record<string, string> = {
+    "src/a.ts": "export function a(){return 1}\n",
+    "src/b.ts": "export function b(){return 1}\n",
+    "src/c.ts":
+      "import {a} from './a.ts'; import {b} from './b.ts'; export function c(){return a()+b()-1}\n",
+  };
+  const economicalPool = {
+    provider: "openrouter",
+    models: [
+      {
+        ...pool.models[0],
+        id: "economical-quality-peer",
+        tier: "cheap",
+        qualityPrior: 0.985,
+        latencyPriorMs: 500,
+        fallback: {
+          ...pool.models[0]!.fallback,
+          inputPrice: 0.05,
+          outputPrice: 0.1,
+        },
+      },
+      {
+        ...pool.models[1],
+        id: "frontier-reference",
+        tier: "frontier",
+        qualityPrior: 0.99,
+        latencyPriorMs: 5000,
+        fallback: {
+          ...pool.models[1]!.fallback,
+          inputPrice: 5,
+          outputPrice: 20,
+        },
+      },
+    ],
+  };
+  const m = await mock(async (body) => {
+    assert.ok(
+      !body.messages[0].content.startsWith("Compile"),
+      "repository-backed dependency planning must not call a planner model",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    const input = JSON.parse(body.messages[1].content);
+    const path = input.allowed_write_paths[0];
+    assert.deepEqual(input.allowed_write_paths, [path]);
+    assert.ok(solutions[path], `unexpected write target: ${path}`);
+    return {
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        {
+          id: `edit-${path}`,
+          type: "function",
+          function: {
+            name: "write_file",
+            arguments: JSON.stringify({ path, content: solutions[path] }),
+          },
+        },
+      ],
+    };
+  }, economicalPool.models);
+  try {
+    const result = await run({
+      repo: f.repo,
+      task: "Fix src/a.ts, src/b.ts and src/c.ts so their focused tests pass.",
+      config: await config(undefined, {
+        modelPool: economicalPool,
+        baseUrl: m.url,
+        routing: { stateDirectory: join(f.root, "economic-history") },
+        maxParallel: 3,
+        budgetUsd: 0.1,
+      }),
+      quiet: true,
+      output: join(f.root, "economic-report"),
+    });
+    assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
+    assert.equal(result.execution_strategy, "planned");
+    assert.equal(result.planning.planner_strategy, "deterministic");
+    assert.equal(result.plannerModelCalls, 0);
+    assert.equal(result.coderExecutions, 3);
+    assert.ok(result.maxConcurrentCodingWorkers >= 2);
+    assert.equal(m.requests.length, 3);
+    assert.ok(
+      m.requests.every((request) =>
+        request.model === "economical-quality-peer"),
+      JSON.stringify(m.requests.map((request) => request.model)),
+    );
+    const plan = JSON.parse(
+      await readFile(join(f.root, "economic-report/plan.json"), "utf8"),
+    );
+    const byPath = new Map<string, any>(
+      plan.subtasks.map((subtask: any) => [
+        subtask.likelyWritePaths[0],
+        subtask,
+      ]),
+    );
+    assert.deepEqual(byPath.get("src/a.ts")!.dependsOn, []);
+    assert.deepEqual(byPath.get("src/b.ts")!.dependsOn, []);
+    assert.deepEqual(new Set(byPath.get("src/c.ts")!.dependsOn), new Set([
+      byPath.get("src/a.ts")!.id,
+      byPath.get("src/b.ts")!.id,
+    ]));
+  } finally {
+    await m.close();
+    await f.cleanup();
+  }
+});
+
 test("two explicitly independent concrete repairs skip planner and scout calls and overlap", async () => {
   const f = await fixture();
   try {
-    const task = "Fix both independent bugs in src/a.ts and src/b.ts. They are independent repairs.";
+    const task =
+      "Fix both independent bugs in src/a.ts and src/b.ts. They are independent repairs.";
     const profile = await profileRepo(f.repo);
     const c = await config(undefined, { models: {} });
     const policy = await planningPolicy(task, profile, c.planner);
     assert.equal(policy.strategy, "deterministic");
-    assert.deepEqual(policy.candidate?.subtasks.map((subtask) => subtask.likelyWritePaths),
-      [["src/a.ts"], ["src/b.ts"]]);
-    assert.ok(policy.candidate?.subtasks.every((subtask) =>
-      !subtask.readOnly && subtask.dependsOn.length === 0));
-    const gateway = new Gateway(c, new Logger(join(f.root, "local-plan"), "local-plan", true),
-      new Budget(1, 100000, 60000));
-    (gateway as any).call = async () => { throw Error("planner/scout model call forbidden"); };
+    assert.deepEqual(
+      policy.candidate?.subtasks.map((subtask) => subtask.likelyWritePaths),
+      [["src/a.ts"], ["src/b.ts"]],
+    );
+    assert.ok(
+      policy.candidate?.subtasks.every(
+        (subtask) => !subtask.readOnly && subtask.dependsOn.length === 0,
+      ),
+    );
+    const gateway = new Gateway(
+      c,
+      new Logger(join(f.root, "local-plan"), "local-plan", true),
+      new Budget(1, 100000, 60000),
+    );
+    (gateway as any).call = async () => {
+      throw Error("planner/scout model call forbidden");
+    };
     const plan = await compileTask(gateway, task, profile);
-    assert.equal(gateway.logger.events.filter((event) => event.type === "model_call").length, 0);
+    assert.equal(
+      gateway.logger.events.filter((event) => event.type === "model_call")
+        .length,
+      0,
+    );
     let active = 0;
     const result = await schedule(plan.subtasks, 2, async () => {
       active++;
@@ -537,10 +1143,87 @@ test("two explicitly independent concrete repairs skip planner and scout calls a
     });
     assert.equal(active, 0);
     assert.equal(result.peak, 2);
-  } finally { await f.cleanup(); }
+  } finally {
+    await f.cleanup();
+  }
 });
 
-test("deterministic gate refuses missing tests, ambiguous aliases, extra requirements and coupled imports; context is bounded", async () => {
+test("a bounded connected transaction flow is planned locally as one coding work unit", async () => {
+  const f = await fixture();
+  const transactionTask =
+    "Fix the checkout transaction bug. A failed payment must leave inventory exactly as it was before checkout and must not create a successful payment record, while out-of-stock requests must never charge the customer and successful checkouts must reserve inventory exactly once. Unrelated checkout requests must remain independent. Investigate the relationships between checkout, inventory, and payment rather than assuming this is a single-file repair. Preserve the existing public APIs and do not modify tests.";
+  try {
+    await writeFile(join(f.repo, "package.json"), JSON.stringify({
+      type: "module", scripts: { test: "node --test test/checkout.test.js" },
+    }));
+    await writeFile(join(f.repo, "src/inventory.js"),
+      "export function reserve(stock,items){for(const [sku,n] of Object.entries(items))if((stock[sku]??0)<n)return false;for(const [sku,n] of Object.entries(items))stock[sku]-=n;return true}\nexport function release(stock,items){for(const [sku,n] of Object.entries(items))stock[sku]=(stock[sku]??0)+n}\n");
+    await writeFile(join(f.repo, "src/payment.js"),
+      "export async function charge(gateway,id,amount){return gateway.charge(id,amount)}\n");
+    await writeFile(join(f.repo, "src/checkout.js"),
+      "import {reserve} from './inventory.js'; import {charge} from './payment.js'; export async function checkout(x){if(!reserve(x.stock,x.items))return {ok:false,reason:'OUT_OF_STOCK'};await charge(x.gateway,x.customerId,x.amount);return {ok:true}}\n");
+    await writeFile(join(f.repo, "test/checkout.test.js"),
+      "import test from 'node:test'; import assert from 'node:assert/strict'; import {checkout} from '../src/checkout.js'; test('rollback',async()=>{const stock={a:1};await assert.rejects(checkout({stock,items:{a:1},gateway:{charge:async()=>{throw Error('declined')}},customerId:'c',amount:1}));assert.deepEqual(stock,{a:1})})\n");
+    await git(f.repo, "add", ".");
+    await git(f.repo, "commit", "-qm", "transaction fixture");
+    // A previous run may have written its report below a non-git repository.
+    // Its before/after source copies must not create false scope ambiguity.
+    const report = join(f.repo, "previous-agent-output");
+    await mkdir(join(report, "workspace/before/src"), { recursive: true });
+    await writeFile(join(report, "events.jsonl"), "{}\n");
+    await writeFile(join(report, "summary.json"), "{}\n");
+    await writeFile(join(report, "workspace.json"), "{}\n");
+    await writeFile(join(report, "candidate.patch"), "");
+    await writeFile(
+      join(report, "workspace/before/src/payment.js"),
+      "export async function charge(){ throw Error('stale copy') }\n",
+    );
+    const profile = await profileRepo(f.repo);
+    assert.ok(!profile.files.some((path) => path.startsWith("previous-agent-output/")));
+    const c = await config(undefined, { models: {} });
+    const policy = await planningPolicy(transactionTask, profile, c.planner);
+    assert.equal(policy.strategy, "deterministic");
+    assert.equal(policy.complexity, "trivial");
+    assert.equal(policy.candidate?.subtasks.length, 1);
+    assert.deepEqual(policy.candidate?.subtasks[0]?.likelyWritePaths,
+      ["src/checkout.js", "src/inventory.js", "src/payment.js"]);
+    assert.ok(policy.candidate?.subtasks[0]?.likelyReadPaths.includes(
+      "test/checkout.test.js"));
+    assert.equal(policy.candidate?.subtasks[0]?.parallelSafe, false);
+    const gateway = new Gateway(c,
+      new Logger(join(f.root, "transaction-plan"), "transaction-plan", true),
+      new Budget(.1, 100000, 60000));
+    (gateway as any).call = async () => {
+      throw Error("connected local evidence must not invoke a planner model");
+    };
+    const plan = await compileTask(gateway, transactionTask, profile);
+    assert.equal(plan.subtasks.length, 1);
+    assert.equal(gateway.logger.events.filter((event) =>
+      event.type === "model_call").length, 0);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("planner routing excludes endpoints that cannot enforce submit_plan", async () => {
+  const c = await config(undefined, { modelPool: pool });
+  const models = c.modelPool!.models;
+  const metadata = new Map(models.map((model) => [model.id, {
+    inputPrice: .1, outputPrice: .2, contextLength: 100000, available: true,
+    routableParameterSets: model.id === "fast"
+      ? [["tools"], ["tool_choice"]]
+      : [["tools", "tool_choice"]],
+    supportedParameters: ["tools", "tool_choice", "structured_outputs"],
+  }]));
+  const ranked = rankPlanners(models, metadata, [], "complex",
+    c.planner, 1000, 1000);
+  assert.equal(ranked.find((row) => row.model.id === "fast")?.rejected,
+    "required planning tool protocol unsupported");
+  assert.notEqual(ranked.find((row) => row.model.id === "strong")?.rejected,
+    "required planning tool protocol unsupported");
+});
+
+test("deterministic gate maps bounded imports and refuses missing tests, ambiguous aliases, and extra requirements", async () => {
   const f = await fixture();
   try {
     const c = await config(undefined, { models: {} });
@@ -550,12 +1233,24 @@ test("deterministic gate refuses missing tests, ambiguous aliases, extra require
       "deterministic",
     );
     assert.equal(
-      (await planningPolicy("Repair the independent defects in src/a.ts and src/b.ts using their existing focused tests.", profile, c.planner)).strategy,
+      (
+        await planningPolicy(
+          "Repair the independent defects in src/a.ts and src/b.ts using their existing focused tests.",
+          profile,
+          c.planner,
+        )
+      ).strategy,
       "deterministic",
       "ordinary task wording must not force a paid planner or scouts when ownership is proven",
     );
     assert.equal(
-      (await planningPolicy("Fix both independent bugs in src/a.ts and src/b.ts. They are independent repairs. Make the smallest correct changes and verify all tests.", profile, c.planner)).strategy,
+      (
+        await planningPolicy(
+          "Fix both independent bugs in src/a.ts and src/b.ts. They are independent repairs. Make the smallest correct changes and verify all tests.",
+          profile,
+          c.planner,
+        )
+      ).strategy,
       "deterministic",
     );
     for (const text of [
@@ -597,9 +1292,47 @@ test("deterministic gate refuses missing tests, ambiguous aliases, extra require
       join(f.repo, "src/a.ts"),
       "import {b} from './b.ts'; export function a(){return b()}",
     );
-    const coupled = await planningPolicy(task, profile, c.planner);
-    assert.equal(coupled.strategy, "model");
-    assert.equal(coupled.complexity, "complex");
+    const coupled = await planningPolicy(
+      "Fix src/a.ts, src/b.ts and src/c.ts so their focused tests pass.",
+      profile,
+      c.planner,
+    );
+    assert.equal(coupled.strategy, "deterministic");
+    assert.equal(coupled.complexity, "trivial");
+    const byPath = new Map(
+      coupled.candidate!.subtasks.map((subtask) => [
+        subtask.likelyWritePaths[0],
+        subtask,
+      ]),
+    );
+    assert.deepEqual(byPath.get("src/a.ts")!.dependsOn, [
+      byPath.get("src/b.ts")!.id,
+    ]);
+    assert.deepEqual(byPath.get("src/b.ts")!.dependsOn, []);
+    assert.equal(
+      coupled.candidate!.subtasks.length,
+      3,
+      "one source/test task per concrete target; no redundant model-planned task",
+    );
+    const gateway = new Gateway(
+      c,
+      new Logger(join(f.root, "dependent-local-plan"), "dependent-plan", true),
+      new Budget(1, 100000, 60000),
+    );
+    (gateway as any).call = async () => {
+      throw Error("bounded dependency graph must not call a model planner");
+    };
+    const compiled = await compileTask(
+      gateway,
+      "Fix src/a.ts, src/b.ts and src/c.ts so their focused tests pass.",
+      profile,
+    );
+    assert.equal(compiled.subtasks.length, 3);
+    assert.equal(
+      gateway.logger.events.filter((event) => event.type === "model_call")
+        .length,
+      0,
+    );
     const bounded = await planningPolicy(
       task,
       { ...profile, verificationCommands: Array(50).fill("x".repeat(2000)) },
@@ -626,7 +1359,10 @@ for (const invalid of [
       assert.ok(body.messages[0].content.startsWith("Compile"));
       assert.equal(body.max_tokens, 1800);
       assert.equal(body.tool_choice, "required");
-      assert.deepEqual(body.tools.map((tool: any) => tool.function.name), ["submit_plan"]);
+      assert.deepEqual(
+        body.tools.map((tool: any) => tool.function.name),
+        ["submit_plan"],
+      );
       const input = JSON.parse(body.messages[1].content);
       assert.ok(
         Buffer.byteLength(JSON.stringify(input.planningContext)) <= 6000,
@@ -658,8 +1394,20 @@ for (const invalid of [
         );
       }
       return invalid === "valid"
-        ? { role: "assistant", content: null, tool_calls: [{ id: "plan-control", type: "function",
-            function: { name: "submit_plan", arguments: JSON.stringify(good) } }] }
+        ? {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "plan-control",
+                type: "function",
+                function: {
+                  name: "submit_plan",
+                  arguments: JSON.stringify(good),
+                },
+              },
+            ],
+          }
         : response(good);
     });
     try {
@@ -877,155 +1625,192 @@ test("planner permits explicit read-only discovery but retains mutation ownershi
   );
 });
 
-for (const malformed of [false, true]) test(malformed
-  ? "malformed discovery finalization preserves context and continues to dependent coding"
-  : "planned discovery is read-only and its evidence reaches the dependent coder", async () => {
-  const f = await fixture();
-  const liveTask =
-    "Across src/repo/commands.ts and src/repo/dependencies.ts, use a separate read-only discovery step before the dependent mutation step. Find one small real robustness issue that is not already covered by tests, fix it with the smallest possible change, and add a focused regression test. Do not change dependencies, do not weaken existing tests, and do not perform unrelated refactors. Verify the result with the relevant tests and typecheck.";
-  await writeFile(join(f.repo, "src/b.ts"), "export function b(){return 1}\n");
-  await writeFile(join(f.repo, "src/c.ts"), "export function c(){return 1}\n");
-  await git(f.repo, "add", ".");
-  await git(f.repo, "commit", "-qm", "leave one focused failure");
-  const planned = {
-    taskSummary: liveTask,
-    acceptanceCriteria: ["The focused fix and repository checks pass"],
-    subtasks: [
-      {
-        id: "inspect-verification",
-        title: "Inspect verification flow",
-        objective:
-          "Inspect src/a.ts and src/b.ts to identify the focused issue",
-        dependsOn: [],
-        likelyReadPaths: ["src/a.ts", "src/b.ts"],
-        likelyWritePaths: [],
-        readOnly: true,
-        integrationContract: "Return concrete evidence to fix-verification",
-        verificationCommands: [],
-        estimatedDifficulty: "low",
-        parallelSafe: false,
-      },
-      {
-        id: "fix-verification",
-        title: "Fix verification flow",
-        objective: "Fix the discovered defect in src/a.ts",
-        dependsOn: ["inspect-verification"],
-        likelyReadPaths: ["src/a.ts", "src/b.ts", "test/a.test.ts"],
-        likelyWritePaths: ["src/a.ts"],
-        readOnly: false,
-        integrationContract: "test/a.test.ts passes",
-        verificationCommands: ["node --test test/a.test.ts"],
-        estimatedDifficulty: "normal",
-        parallelSafe: false,
-      },
-    ],
-  };
-  const m = await mock((body) => {
-    const system = body.messages[0].content as string;
-    if (system.startsWith("Compile")) {
-      assert.match(system, /readOnly:true and likelyWritePaths:\[\]/);
-      return response(planned);
-    }
-    const input = JSON.parse(body.messages[1].content);
-    if (system.includes("read-only repository scout")) {
-      assert.deepEqual(input.allowed_write_paths, []);
-      if (body.messages.length === 2)
+for (const malformed of [false, true])
+  test(
+    malformed
+      ? "malformed discovery finalization preserves context and continues to dependent coding"
+      : "planned discovery is read-only and its evidence reaches the dependent coder",
+    async () => {
+      const f = await fixture();
+      const liveTask =
+        "Across src/repo/commands.ts and src/repo/dependencies.ts, use a separate read-only discovery step before the dependent mutation step. Find one small real robustness issue that is not already covered by tests, fix it with the smallest possible change, and add a focused regression test. Do not change dependencies, do not weaken existing tests, and do not perform unrelated refactors. Verify the result with the relevant tests and typecheck.";
+      await writeFile(
+        join(f.repo, "src/b.ts"),
+        "export function b(){return 1}\n",
+      );
+      await writeFile(
+        join(f.repo, "src/c.ts"),
+        "export function c(){return 1}\n",
+      );
+      await git(f.repo, "add", ".");
+      await git(f.repo, "commit", "-qm", "leave one focused failure");
+      const planned = {
+        taskSummary: liveTask,
+        acceptanceCriteria: ["The focused fix and repository checks pass"],
+        subtasks: [
+          {
+            id: "inspect-verification",
+            title: "Inspect verification flow",
+            objective:
+              "Inspect src/a.ts and src/b.ts to identify the focused issue",
+            dependsOn: [],
+            likelyReadPaths: ["src/a.ts", "src/b.ts"],
+            likelyWritePaths: [],
+            readOnly: true,
+            integrationContract: "Return concrete evidence to fix-verification",
+            verificationCommands: [],
+            estimatedDifficulty: "low",
+            parallelSafe: false,
+          },
+          {
+            id: "fix-verification",
+            title: "Fix verification flow",
+            objective: "Fix the discovered defect in src/a.ts",
+            dependsOn: ["inspect-verification"],
+            likelyReadPaths: ["src/a.ts", "src/b.ts", "test/a.test.ts"],
+            likelyWritePaths: ["src/a.ts"],
+            readOnly: false,
+            integrationContract: "test/a.test.ts passes",
+            verificationCommands: ["node --test test/a.test.ts"],
+            estimatedDifficulty: "normal",
+            parallelSafe: false,
+          },
+        ],
+      };
+      const m = await mock((body) => {
+        const system = body.messages[0].content as string;
+        if (system.startsWith("Compile")) {
+          assert.match(system, /readOnly:true and likelyWritePaths:\[\]/);
+          return response(planned);
+        }
+        const input = JSON.parse(body.messages[1].content);
+        if (system.includes("read-only repository scout")) {
+          assert.deepEqual(input.allowed_write_paths, []);
+          if (body.messages.length === 2)
+            return {
+              role: "assistant",
+              content: null,
+              tool_calls: [
+                {
+                  id: "inspect-source",
+                  type: "function",
+                  function: {
+                    name: "read_file",
+                    arguments: JSON.stringify({ path: "src/a.ts" }),
+                  },
+                },
+              ],
+            };
+          return malformed
+            ? response("Unable to produce JSON")
+            : response({
+                relevantFiles: ["src/a.ts", "src/b.ts"],
+                symbols: ["a", "b"],
+                reproduction: "test/a.test.ts expects a() to return 1",
+                failingTests: ["test/a.test.ts"],
+                likelyRootCause: "a returns 0",
+                dependencies: [],
+                uncertainty: "low",
+                suggestedApproach: "Change a to return 1",
+                evidence: ["src/a.ts contains return 0"],
+              });
+        }
+        assert.equal(input.subtask.id, "fix-verification");
+        if (malformed) {
+          assert.equal(input.evidence.uncertainty, "high");
+          assert.ok(input.evidence.relevantFiles.includes("src/a.ts"));
+        } else assert.equal(input.evidence.likelyRootCause, "a returns 0");
+        assert.deepEqual(input.allowed_write_paths, ["src/a.ts"]);
         return {
           role: "assistant",
           content: null,
           tool_calls: [
             {
-              id: "inspect-source",
+              id: "focused-fix",
               type: "function",
               function: {
-                name: "read_file",
-                arguments: JSON.stringify({ path: "src/a.ts" }),
+                name: "write_file",
+                arguments: JSON.stringify({
+                  path: "src/a.ts",
+                  content: "export function a(){return 1}\n",
+                }),
               },
             },
           ],
         };
-      return malformed ? response("Unable to produce JSON") : response({
-        relevantFiles: ["src/a.ts", "src/b.ts"],
-        symbols: ["a", "b"],
-        reproduction: "test/a.test.ts expects a() to return 1",
-        failingTests: ["test/a.test.ts"],
-        likelyRootCause: "a returns 0",
-        dependencies: [],
-        uncertainty: "low",
-        suggestedApproach: "Change a to return 1",
-        evidence: ["src/a.ts contains return 0"],
       });
-    }
-    assert.equal(input.subtask.id, "fix-verification");
-    if (malformed) {
-      assert.equal(input.evidence.uncertainty, "high");
-      assert.ok(input.evidence.relevantFiles.includes("src/a.ts"));
-    } else assert.equal(input.evidence.likelyRootCause, "a returns 0");
-    assert.deepEqual(input.allowed_write_paths, ["src/a.ts"]);
-    return {
-      role: "assistant",
-      content: null,
-      tool_calls: [
-        {
-          id: "focused-fix",
-          type: "function",
-          function: {
-            name: "write_file",
-            arguments: JSON.stringify({
-              path: "src/a.ts",
-              content: "export function a(){return 1}\n",
-            }),
-          },
-        },
-      ],
-    };
-  });
-  try {
-    const c = await config(undefined, {
-      modelPool: pool,
-      baseUrl: m.url,
-      models: { SCOUT_MODEL: "fast", CHEAP_CODER_A: "fast" },
-      routing: { stateDirectory: join(f.root, "discovery-history") },
-      budgetUsd: 0.1,
-    });
-    const result = await run({
-      repo: f.repo,
-      task: liveTask,
-      config: c,
-      quiet: true,
-      output: join(f.root, "discovery-report"),
-    });
-    assert.equal(result.execution_strategy, "planned");
-    assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
-    if (malformed) assert.ok((await readFile(join(f.root, "discovery-report/events.jsonl"), "utf8"))
-      .includes('"type":"discovery_fallback"'));
-    const events = (
-      await readFile(join(f.root, "discovery-report/events.jsonl"), "utf8")
-    )
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line));
-    const discoveryScope = events.find(
-      (event) =>
-        event.type === "worker_scope" &&
-        event.subtaskId === "inspect-verification",
-    );
-    assert.deepEqual(discoveryScope.allowed_write_paths, []);
-    assert.equal(discoveryScope.read_only, true);
-    assert.equal(events.filter((event) => event.type === "write_attempt" &&
-      event.subtaskId === "inspect-verification").length, 0);
-    assert.ok(events.some((event) =>
-      event.type === (malformed ? "discovery_fallback" : "discovery_complete") &&
-      event.subtaskId === "inspect-verification"));
-    assert.equal(m.requests.filter((request) =>
-      request.messages[0].content.includes("read-only repository scout")).length, 2);
-    assert.equal(await git(f.repo, "status", "--porcelain"), "");
-    assert.match(await readFile(join(f.repo, "src/a.ts"), "utf8"), /return 0/);
-  } finally {
-    await m.close();
-    await f.cleanup();
-  }
-});
+      try {
+        const c = await config(undefined, {
+          modelPool: pool,
+          baseUrl: m.url,
+          models: { SCOUT_MODEL: "fast", CHEAP_CODER_A: "fast" },
+          routing: { stateDirectory: join(f.root, "discovery-history") },
+          budgetUsd: 0.1,
+        });
+        const result = await run({
+          repo: f.repo,
+          task: liveTask,
+          config: c,
+          quiet: true,
+          output: join(f.root, "discovery-report"),
+        });
+        assert.equal(result.execution_strategy, "planned");
+        assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
+        if (malformed)
+          assert.ok(
+            (
+              await readFile(
+                join(f.root, "discovery-report/events.jsonl"),
+                "utf8",
+              )
+            ).includes('"type":"discovery_fallback"'),
+          );
+        const events = (
+          await readFile(join(f.root, "discovery-report/events.jsonl"), "utf8")
+        )
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line));
+        const discoveryScope = events.find(
+          (event) =>
+            event.type === "worker_scope" &&
+            event.subtaskId === "inspect-verification",
+        );
+        assert.deepEqual(discoveryScope.allowed_write_paths, []);
+        assert.equal(discoveryScope.read_only, true);
+        assert.equal(
+          events.filter(
+            (event) =>
+              event.type === "write_attempt" &&
+              event.subtaskId === "inspect-verification",
+          ).length,
+          0,
+        );
+        assert.ok(
+          events.some(
+            (event) =>
+              event.type ===
+                (malformed ? "discovery_fallback" : "discovery_complete") &&
+              event.subtaskId === "inspect-verification",
+          ),
+        );
+        assert.equal(
+          m.requests.filter((request) =>
+            request.messages[0].content.includes("read-only repository scout"),
+          ).length,
+          2,
+        );
+        assert.equal(await git(f.repo, "status", "--porcelain"), "");
+        assert.match(
+          await readFile(join(f.repo, "src/a.ts"), "utf8"),
+          /return 0/,
+        );
+      } finally {
+        await m.close();
+        await f.cleanup();
+      }
+    },
+  );
 
 test("discovery routing skips an otherwise eligible unknown-priced model", async () => {
   const f = await fixture();
@@ -1131,13 +1916,12 @@ test("discovery routing skips an otherwise eligible unknown-priced model", async
       m.requests.map((request) => request.model),
       ["known-scout", "known-scout"],
     );
-    const routed = logger.events.find(
-      (event) => event.type === "model_router",
-    );
+    const routed = logger.events.find((event) => event.type === "model_router");
     assert.equal(routed.selected_model, "known-scout");
     assert.equal(
-      routed.candidates.find((candidate: any) => candidate.id === "unknown-scout")
-        .rejected,
+      routed.candidates.find(
+        (candidate: any) => candidate.id === "unknown-scout",
+      ).rejected,
       "unknown pricing",
     );
   } finally {
@@ -1188,11 +1972,7 @@ test("discovery returns uncertain read-only evidence after an unusable tool-free
     });
     const gateway = new Gateway(
       c,
-      new Logger(
-        join(f.root, "discovery-final-log"),
-        "discovery-final",
-        true,
-      ),
+      new Logger(join(f.root, "discovery-final-log"), "discovery-final", true),
       new Budget(0.1, 200000, 60000),
     );
     const subtask = {
@@ -1209,13 +1989,13 @@ test("discovery returns uncertain read-only evidence after an unusable tool-free
       parallelSafe: false,
     };
     const evidence = await discover(
-        gateway,
-        f.repo,
-        subtask.objective,
-        subtask,
-        { subtasks: [subtask] },
-        await profileRepo(f.repo),
-      );
+      gateway,
+      f.repo,
+      subtask.objective,
+      subtask,
+      { subtasks: [subtask] },
+      await profileRepo(f.repo),
+    );
     assert.equal(evidence.uncertainty, "high");
     assert.ok(evidence.relevantFiles.includes("src/a.ts"));
     assert.equal(m.requests.length, 2);
@@ -1234,7 +2014,7 @@ test("planner quality, latency and cost history are independent of coder history
       {
         inputPrice: 0.1,
         outputPrice: 0.2,
-        supportedParameters: ["tools", "structured_outputs"],
+        supportedParameters: ["tools", "tool_choice", "structured_outputs"],
       },
     ]),
   );
@@ -1344,7 +2124,7 @@ test("complex planning falls back to a qualified fast planner when strong histor
           outputPrice: 0.2,
           contextLength: 100000,
           available: true,
-          supportedParameters: ["structured_outputs"],
+          supportedParameters: ["tools", "tool_choice", "structured_outputs"],
         },
       ]),
     );
@@ -1365,6 +2145,82 @@ test("complex planning falls back to a qualified fast planner when strong histor
     assert.match(
       logger.events.at(-1)!.routing_reason,
       /qualified fast planner fallback/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("planner recovery uses the attainable quality plateau instead of retrying a worse expensive tier", async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-planner-plateau-"));
+  try {
+    const c = await config(undefined, {
+      modelPool: pool,
+      routing: { stateDirectory: root },
+    });
+    const logger = new Logger(join(root, "log"), "planner-plateau", true);
+    const features = extractFeatures(
+      {
+        id: "planner",
+        title: "Plan bounded dependent fixes",
+        objective: "Plan bounded dependent fixes",
+        dependsOn: [],
+        likelyReadPaths: [],
+        likelyWritePaths: ["src/a.ts", "src/b.ts"],
+        integrationContract: "Preserve behavior",
+        verificationCommands: [],
+        estimatedDifficulty: "high",
+        parallelSafe: false,
+      },
+      { files: ["src/a.ts", "src/b.ts"] } as any,
+      100,
+    );
+    features.taskKind = "planning";
+    features.complexity = "complex";
+    const failure = (model: string, index: number): Attempt => ({
+      timestamp: String(index),
+      runId: `previous-${model}`,
+      subtaskId: "planner",
+      modelRequested: model,
+      modelServed: model,
+      features,
+      verification: "FAILED",
+      wallClockMs: model === "strong" ? 8000 : 3000,
+      inputTokens: 100,
+      outputTokens: 20,
+      costUsd: model === "strong" ? 0.01 : 0.0001,
+      escalated: true,
+    });
+    const history = [failure("fast", 0), failure("strong", 0), failure("strong", 1)];
+    const metadata = new Map(
+      pool.models.map((model) => [
+        model.id,
+        {
+          inputPrice: model.id === "strong" ? 2 : 0.1,
+          outputPrice: model.id === "strong" ? 8 : 0.2,
+          contextLength: 100000,
+          available: true,
+          supportedParameters: ["tools", "tool_choice", "structured_outputs"],
+        },
+      ]),
+    );
+    const selected = await selectPlanner(
+      {
+        config: c,
+        catalog: { get: async () => metadata },
+        history: { read: () => history },
+        disabled: new Set<string>(),
+        logger,
+      } as any,
+      features,
+      "strong",
+      [],
+      1000,
+    );
+    assert.equal(selected.id, "fast");
+    assert.match(
+      logger.events.at(-1)!.routing_reason,
+      /attainable planner quality plateau/,
     );
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -1451,7 +2307,7 @@ test("planner attempts reset between runs while remaining unique within each run
       second.logger.events.some(
         (event) =>
           event.type === "planner_route" &&
-          /fresh-run retry/.test(event.routing_reason),
+          /attainable planner quality plateau/.test(event.routing_reason),
       ),
     );
   } finally {

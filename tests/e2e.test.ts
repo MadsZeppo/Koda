@@ -773,7 +773,7 @@ test("same-layer writes to one file coalesce into one verified coding execution"
   try {
     const result = await run({
       repo,
-      task: "Fix the independent addition and multiplication bugs in add.cjs and multiply.cjs.",
+      task: "Fix the independent addition and multiplication bugs in add.cjs and multiply.cjs. Also preserve the existing CommonJS exports.",
       config: await config(undefined, {
         models: {},
         baseUrl: api.url,
@@ -836,7 +836,21 @@ test("three independent repairs genuinely overlap in isolated worktrees even wit
     assert.equal(result.coderModelCalls, 3);
     assert.ok(result.maxConcurrentCodingWorkers >= 2);
     assert.ok(result.maxConcurrentCodingWorkers <= 3);
-    assert.equal(result.parallelPeak, result.maxConcurrentCodingWorkers);
+    // Scheduler parallelism is authoritative. Short coding-only intervals may
+    // overlap by two or three depending on filesystem/setup timing.
+    assert.equal(result.parallelPeak, 3);
+    const codingRequests = api.requests
+      .filter((request: any) => request.messages?.[0]?.content ===
+        "Deterministic test CodingWorker. Implement with tools.")
+      .map((request: any) => JSON.parse(request.messages[1].content));
+    assert.equal(codingRequests.length, 3);
+    for (const request of codingRequests) {
+      const owned = request.allowed_write_paths[0].replace(/\.cjs$/, "");
+      assert.match(request.task, new RegExp(`${owned}\\.cjs`));
+      for (const sibling of ["add", "multiply", "report"].filter((id) => id !== owned))
+        assert.doesNotMatch(request.task, new RegExp(`${sibling}\\.cjs`),
+          "parallel workers must not receive sibling mutation objectives");
+    }
     const events = (await readFile(join(output, "events.jsonl"), "utf8"))
       .trim()
       .split("\n")

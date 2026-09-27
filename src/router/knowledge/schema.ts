@@ -10,9 +10,11 @@ export type RoutingEvidenceCategory = "agentic_swe" | "terminal_tool" |
 export type RoutingMetric = "result_at_1" | "pass_at_5" | "success_rate" |
   "cost_per_task_usd" | "historical_cost_usd" | "current_repriced_cost_usd" |
   "input_tokens" | "output_tokens" | "total_tokens" | "total_tokens_p75" |
-  "total_tokens_p90" | "turns" | "cached_token_ratio" |
+  "total_tokens_p90" | "total_tokens_p99" | "turns" | "cached_token_ratio" |
   "completion_latency_p50_ms" | "completion_latency_p90_ms" |
+  "completion_latency_p99_ms" |
   "task_count" | "market_share";
+export type RoutingExecutionEngine = "direct-edit" | "mini-swe-agent" | "unknown";
 export type ProviderCapabilityMetric = "tools_supported" | "tool_choice_supported" |
   "structured_output_supported" | "context_tokens" | "input_price_per_million" |
   "output_price_per_million" | "availability" | "text_modality" | "vision_modality";
@@ -36,6 +38,10 @@ export interface RoutingKnowledgeObservation {
   taskFamilies?: string[];
   languages?: string[];
   harness?: string;
+  /** Evidence transfers across execution scaffolds only with an explicit discount. */
+  engine?: RoutingExecutionEngine;
+  evidenceQuality?: number;
+  contaminationConfidence?: number;
   sampleSize?: number;
   successes?: number;
   failures?: number;
@@ -56,6 +62,21 @@ export interface PairwiseRoutingEvidence {
   sampleSize: number;
   identityLevel: "EXACT";
 }
+/** Compact task-level matrix used for contextual cold-start routing. */
+export interface RoutingTaskCase {
+  sourceId: string;
+  taskKey: string;
+  taskFamily?: string;
+  languages?: string[];
+  /** Deterministic bounded terms; raw benchmark prompts are not persisted. */
+  routingTerms: string[];
+  harness?: string;
+  engine?: RoutingExecutionEngine;
+  evidenceQuality?: number;
+  contaminationConfidence?: number;
+  outcomes: Array<{ modelId: string; success: boolean;
+    identityLevel: "EXACT" | "FAMILY_TRANSFER" }>;
+}
 export interface RoutingKnowledgeSource {
   id: string;
   type: ExternalEvidenceType;
@@ -66,6 +87,18 @@ export interface RoutingKnowledgeSource {
   status: "ok" | "partial" | "failed";
   detail?: string;
 }
+export interface RoutingPolicyValidation {
+  sourceId: string;
+  evaluatedTasks: number;
+  selectedSuccessRate: number;
+  referenceSuccessRate: number;
+  observedRegret: number;
+  upperRegret95: number;
+  selectedCostUsd: number;
+  referenceCostUsd: number;
+  maxAllowedRegret: number;
+  passed: boolean;
+}
 export interface RoutingKnowledgeSnapshot {
   /** V1 remains readable as a last-known-good snapshot. */
   schemaVersion: number;
@@ -73,10 +106,14 @@ export interface RoutingKnowledgeSnapshot {
   createdAt: string;
   observations: RoutingKnowledgeObservation[];
   pairwiseEvidence?: PairwiseRoutingEvidence[];
+  taskCases?: RoutingTaskCase[];
+  validation?: RoutingPolicyValidation;
   sources?: RoutingKnowledgeSource[];
 }
 export interface ModelRoutingKnowledge {
   snapshotId: string;
   observations: RoutingKnowledgeObservation[];
   pairwiseEvidence?: PairwiseRoutingEvidence[];
+  taskCases?: RoutingTaskCase[];
+  contextualValidated?: boolean;
 }

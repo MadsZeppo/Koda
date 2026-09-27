@@ -11,17 +11,34 @@ import type { VerificationCandidate, CheckKind } from "../repo/ecosystem.js";
 import type { WriteScope } from "../repo/writeScope.js";
 import { command } from "../repo/commands.js";
 import type { CommandResult, VerificationResult } from "../types.js";
-import { dependenciesForWorkspace, inheritDependencyEnvironment } from "../repo/dependencies.js";
+import {
+  dependenciesForWorkspace,
+  inheritDependencyEnvironment,
+} from "../repo/dependencies.js";
 export const runtimeInfrastructureFailure = (check: CommandResult) => {
   const output = `${check.stdout}\n${check.stderr}`;
-  if (!/\b(?:AssertionError|assert\s|FAILED\s+\S+::)/i.test(output) &&
-      /Temporary failure in name resolution|Network is unreachable|No route to host|Name or service not known|nodename nor servname provided|socket\.gaierror|ProxyError:.*(?:proxy|connect)/i.test(output))
+  if (
+    !/\b(?:AssertionError|assert\s|FAILED\s+\S+::)/i.test(output) &&
+    /Temporary failure in name resolution|Network is unreachable|No route to host|Name or service not known|nodename nor servname provided|socket\.gaierror|ProxyError:.*(?:proxy|connect)/i.test(
+      output,
+    )
+  )
     return "verification_network_environment";
-  if ([126, 127].includes(check.exitCode) &&
-      /(?:python(?:\d+(?:\.\d+)?)?|pytest|tox)["']?:.*(?:not found|No such file|Permission denied)/i.test(output))
+  if (
+    [126, 127].includes(check.exitCode) &&
+    /(?:python(?:\d+(?:\.\d+)?)?|pytest|tox)["']?:.*(?:not found|No such file|Permission denied)/i.test(
+      output,
+    )
+  )
     return "python_environment_inaccessible";
-  if (/pyvenv\.cfg|virtualenv|virtual environment|Fatal Python error:.*path/i.test(output) &&
-      /PermissionError|Operation not permitted|Permission denied|EACCES|ENOENT|No such file/i.test(output))
+  if (
+    /pyvenv\.cfg|virtualenv|virtual environment|Fatal Python error:.*path/i.test(
+      output,
+    ) &&
+    /PermissionError|Operation not permitted|Permission denied|EACCES|ENOENT|No such file/i.test(
+      output,
+    )
+  )
     return "python_environment_inaccessible";
   if (
     /(?:EINVAL|ENAMETOOLONG)/.test(output) &&
@@ -36,19 +53,38 @@ export const runtimeInfrastructureFailure = (check: CommandResult) => {
     return "pnpm_dependency_environment";
   if (/sandbox-exec|\bbwrap\b|spawn .* ENOENT|command not found/i.test(output))
     return "verification_sandbox_or_tool_unavailable";
-  if (/\.git\/worktrees\//.test(output) &&
-      /ENOENT|No such file|not found|invalid|cannot|failed/i.test(output))
+  if (
+    /\.git\/worktrees\//.test(output) &&
+    /ENOENT|No such file|not found|invalid|cannot|failed/i.test(output)
+  )
     return "verification_git_worktree_environment";
   return undefined;
 };
 const normalizedFailureOutput = (check: CommandResult) =>
   `${check.stdout}\n${check.stderr}`
     .replace(/\x1b\[[\d;]*m/g, "")
-    .replace(/\/[^\s:'"]*\/koda-verify-[^/\s:'"]+\/repo/g, "<verification-repo>")
+    .replace(
+      /\/[^\s:'"]*\/koda-verify-[^/\s:'"]+\/repo/g,
+      "<verification-repo>",
+    )
     .replace(/\/(?:private\/)?tmp\/koda-[^\s/:]+/g, "<workspace>")
     .split("\n")
-    .filter((line) => !/^=+\s*(?:short test summary|\d+ (?:passed|failed)|warnings?).*=*$/i.test(line.trim()))
-    .join("\n").trim();
+    .filter(
+      (line) =>
+        !/^=+\s*(?:short test summary|\d+ (?:passed|failed)|warnings?).*=*$/i.test(
+          line.trim(),
+        ),
+    )
+    .join("\n")
+    .trim();
+
+const tapFailureIdentities = (check: CommandResult) =>
+  normalizedFailureOutput(check)
+    .split("\n")
+    .flatMap((line) => {
+      const match = line.match(/^\s*not ok\s+\d+\s+-\s+(.+?)\s*$/);
+      return match ? [`tap:${match[1]!.trim()}`] : [];
+    });
 
 const tapFailureUnits = (check: CommandResult) => {
   const lines = normalizedFailureOutput(check).split("\n");
@@ -58,7 +94,10 @@ const tapFailureUnits = (check: CommandResult) => {
     if (!match) continue;
     const details: string[] = [];
     for (let cursor = index + 1; cursor < lines.length; cursor++) {
-      if (/^\s*(?:not )?ok\s+\d+\s+-\s+/.test(lines[cursor]!) || /^\s*1\.\.\d+/.test(lines[cursor]!))
+      if (
+        /^\s*(?:not )?ok\s+\d+\s+-\s+/.test(lines[cursor]!) ||
+        /^\s*1\.\.\d+/.test(lines[cursor]!)
+      )
         break;
       const detail = lines[cursor]!.trim().match(
         /^(error|code|name|expected|actual|operator):\s*(.*)$/,
@@ -76,45 +115,69 @@ export const verificationFailureIdentities = (check: CommandResult) => {
   // paths and environment text. Its terminal summary provides stable test
   // identities, which are the authoritative regression unit. Comparing the
   // entire trace made an unchanged failing baseline look like a new failure.
-  const pytestTests = [...normalized.matchAll(
-    /^(?:FAILED|ERROR)\s+(.+?)(?:\s+-\s+.*|\s*)$/gm,
-  )].map((match) => match[1]!).sort();
+  const pytestTests = [
+    ...normalized.matchAll(/^(?:FAILED|ERROR)\s+(.+?)(?:\s+-\s+.*|\s*)$/gm),
+  ]
+    .map((match) => match[1]!)
+    .sort();
   if (pytestTests.length) return [...new Set(pytestTests)];
-  const tapTests = tapFailureUnits(check).map((unit) =>
-    unit.split(":").slice(0, 2).join(":"));
+  const tapTests = tapFailureIdentities(check);
   if (tapTests.length) return [...new Set(tapTests)];
   return [];
 };
 const failureSignature = (check: CommandResult) => {
   const normalized = normalizedFailureOutput(check)
     .replace(/\b\d+(?:\.\d+)?(?:ms|s)\b/g, "<duration>")
-    .replace(/\b(?:duration_ms|duration|time):\s*\d+(?:\.\d+)?/g, "duration: <duration>");
+    .replace(
+      /\b(?:duration_ms|duration|time):\s*\d+(?:\.\d+)?/g,
+      "duration: <duration>",
+    );
   const pytestTests = verificationFailureIdentities(check);
   if (pytestTests.length)
     return pytestTests.map((test) => `pytest:${test}`).join("\n");
-  const diagnostics = normalized.split("\n").filter((line) =>
-    /\b(?:FAILED|FAIL|AssertionError|SyntaxError|TypeError|error TS\d+|error\[E\d+\])\b|\b(?:Error|expected|actual):|(?:!==|===|!=|==)|^\s*E\s+|^\s*✖\s+[^()]+$/i.test(line));
+  const diagnostics = normalized
+    .split("\n")
+    .filter((line) =>
+      /\b(?:FAILED|FAIL|AssertionError|SyntaxError|TypeError|error TS\d+|error\[E\d+\])\b|\b(?:Error|expected|actual):|(?:!==|===|!=|==)|^\s*E\s+|^\s*✖\s+[^()]+$/i.test(
+        line,
+      ),
+    );
   return diagnostics.length ? diagnostics.join("\n") : normalized;
 };
 
-const introducedFailure = (previous: CommandResult, check: CommandResult) => {
+const introducedFailure = (
+  previous: CommandResult,
+  check: CommandResult,
+  candidateChangedPaths: readonly string[] = [],
+) => {
   // Do not hide interrupted runs or a verifier's integrity rejection behind
   // an otherwise unchanged test summary.
-  if (check.timedOut || previous.timedOut || check.exitCode !== previous.exitCode ||
-      /Verification modified repository source/.test(check.stderr)) return true;
+  if (
+    check.timedOut ||
+    previous.timedOut ||
+    check.exitCode !== previous.exitCode ||
+    /Verification modified repository source/.test(check.stderr)
+  )
+    return true;
   const compilerDiagnostics = (result: CommandResult) =>
-    normalizedFailureOutput(result).split("\n")
+    normalizedFailureOutput(result)
+      .split("\n")
       .filter((line) => /error TS\d+|error\[E\d+\]|INTERNALERROR>/.test(line))
       .map((line) => line.replace(/\x1b\[[\d;]*m/g, "").trim());
   const knownDiagnostics = new Set(compilerDiagnostics(previous));
-  if (compilerDiagnostics(check).some((line) => !knownDiagnostics.has(line))) return true;
+  if (compilerDiagnostics(check).some((line) => !knownDiagnostics.has(line)))
+    return true;
   const pytestUnits = (result: CommandResult) =>
-    [...normalizedFailureOutput(result).matchAll(
-      /^(FAILED|ERROR)\s+(.+?)(?:\s+-\s+(.*)|\s*)$/gm,
-    )].map((match) => {
+    [
+      ...normalizedFailureOutput(result).matchAll(
+        /^(FAILED|ERROR)\s+(.+?)(?:\s+-\s+(.*)|\s*)$/gm,
+      ),
+    ].map((match) => {
       const reason = match[3] ?? "";
-      const exception = reason.match(/\b[\w.]*(?:Error|Exception)\b/)?.[0] ?? "";
-      const missingModule = reason.match(/No module named ['"]([^'"]+)['"]/)?.[1] ?? "";
+      const exception =
+        reason.match(/\b[\w.]*(?:Error|Exception)\b/)?.[0] ?? "";
+      const missingModule =
+        reason.match(/No module named ['"]([^'"]+)['"]/)?.[1] ?? "";
       return `${match[1]}:${match[2]}:${exception}:${missingModule}`;
     });
   const before = pytestUnits(previous);
@@ -123,17 +186,72 @@ const introducedFailure = (previous: CommandResult, check: CommandResult) => {
     const known = new Set(before);
     return after.some((identity) => !known.has(identity));
   }
-  const beforeTap = tapFailureUnits(previous);
-  const afterTap = tapFailureUnits(check);
+  // Node's test title is the stable regression unit. Assertion details often
+  // change when one upstream defect is fixed while the same downstream test
+  // remains red; treating those details as identity made improvements look
+  // like newly introduced failures.
+  const beforeTap = tapFailureIdentities(previous);
+  const afterTap = tapFailureIdentities(check);
   if (beforeTap.length && afterTap.length) {
     const known = new Set(beforeTap);
-    return afterTap.some((identity) => !known.has(identity));
+    if (afterTap.some((identity) => !known.has(identity))) return true;
+    // Removing named failures is candidate improvement. A remaining test may
+    // expose a different assertion only because an upstream defect no longer
+    // masks it, so its title remains the attribution boundary in that case.
+    if (new Set(afterTap).size < new Set(beforeTap).size) {
+      // A reduced TAP failure set is normally an improvement. Keep a
+      // remaining changed failure attributable when its concrete test file
+      // corresponds to a file the candidate edited (for example src/a.cjs ->
+      // tests/a.test.cjs). This prevents a partial fix from hiding a bad edit,
+      // while allowing an upstream fix to reveal a different assertion in an
+      // otherwise untouched downstream test.
+      const changedStems = new Set(
+        candidateChangedPaths.map((path) =>
+          path
+            .split("/")
+            .at(-1)!
+            .replace(/(?:\.test|\.spec)?\.[^.]+$/, ""),
+        ),
+      );
+      if (changedStems.size) {
+        const beforeUnits = new Set(tapFailureUnits(previous));
+        const changedRemaining = normalizedFailureOutput(check)
+          .split("\n")
+          .some((line, index, lines) => {
+            if (!/^\s*not ok\s+\d+\s+-\s+/.test(line)) return false;
+            const unit = tapFailureUnits({
+              ...check,
+              stdout: lines.slice(index).join("\n"),
+              stderr: "",
+            })[0];
+            if (!unit || beforeUnits.has(unit)) return false;
+            for (let cursor = index + 1; cursor < lines.length; cursor++) {
+              if (/^\s*(?:not )?ok\s+\d+\s+-\s+/.test(lines[cursor]!)) break;
+              const file = lines[cursor]!.match(
+                /(?:file:\/\/)?[^\s():]+\/([^/\s():]+?)(?:\.test|\.spec)?\.[cm]?[jt]sx?(?::\d+|:\d+:\d+|\))/,
+              )?.[1];
+              if (file && changedStems.has(file)) return true;
+            }
+            return false;
+          });
+        if (changedRemaining) return true;
+      }
+      return false;
+    }
+    // With no removed failures, retain strict detail comparison so a patch
+    // cannot change an existing test's failure mode and call it baseline.
+    const knownUnits = new Set(tapFailureUnits(previous));
+    return tapFailureUnits(check).some((unit) => !knownUnits.has(unit));
   }
   const previousSignature = failureSignature(previous);
   const candidateSignature = failureSignature(check);
   const beforeDiagnostics = previousSignature.split("\n");
   const afterDiagnostics = candidateSignature.split("\n");
-  if ([...beforeDiagnostics, ...afterDiagnostics].every((line) => /error TS\d+|error\[E\d+\]/.test(line))) {
+  if (
+    [...beforeDiagnostics, ...afterDiagnostics].every((line) =>
+      /error TS\d+|error\[E\d+\]/.test(line),
+    )
+  ) {
     const known = new Set(beforeDiagnostics);
     return afterDiagnostics.some((line) => !known.has(line));
   }
@@ -141,30 +259,56 @@ const introducedFailure = (previous: CommandResult, check: CommandResult) => {
 };
 
 /** A failed check is patch-attributable only if it is new or changed from baseline. */
-export function verificationRegressed(baseline: VerificationResult, after: VerificationResult) {
-  return verificationRegressions(baseline, after).length > 0;
+export function verificationRegressed(
+  baseline: VerificationResult,
+  after: VerificationResult,
+  candidateChangedPaths: readonly string[] = [],
+) {
+  return (
+    verificationRegressions(baseline, after, candidateChangedPaths).length > 0
+  );
 }
 
 /** A candidate may proceed to final verification when only optional tooling is missing. */
 export function advisoryInfrastructureOnly(result: VerificationResult) {
-  return result.status === "NOT_FULLY_VERIFIED" &&
-    result.checks.some((check) =>
-      !!check.unavailable && check.requirement === "advisory") &&
-    !result.checks.some((check) =>
-      check.outcome === "CHECK_FAIL" ||
-      (!!check.unavailable && (check.requirement ?? "required") === "required"));
+  return (
+    result.status === "NOT_FULLY_VERIFIED" &&
+    result.checks.some(
+      (check) => !!check.unavailable && check.requirement === "advisory",
+    ) &&
+    !result.checks.some(
+      (check) =>
+        check.outcome === "CHECK_FAIL" ||
+        (!!check.unavailable &&
+          (check.requirement ?? "required") === "required"),
+    )
+  );
 }
 
 /** Return only failure identities introduced or changed by the candidate. */
-export function verificationRegressions(baseline: VerificationResult, after: VerificationResult) {
+export function verificationRegressions(
+  baseline: VerificationResult,
+  after: VerificationResult,
+  candidateChangedPaths: readonly string[] = [],
+) {
   return after.checks.filter((check) => {
     // Infrastructure attribution is authoritative even when a legacy caller
     // also left a non-zero exit code or CHECK_FAIL-shaped result behind.
     if (check.unavailable || check.outcome !== "CHECK_FAIL") return false;
-    const previous = baseline.checks.find((item) => item.command === check.command && item.cwd === check.cwd);
-    if (previous?.unavailable || previous?.outcome === "INFRA_FAILURE" || previous?.outcome === "CHECK_UNAVAILABLE") return false;
-    return !previous || previous.outcome !== "CHECK_FAIL" ||
-      introducedFailure(previous, check);
+    const previous = baseline.checks.find(
+      (item) => item.command === check.command && item.cwd === check.cwd,
+    );
+    if (
+      previous?.unavailable ||
+      previous?.outcome === "INFRA_FAILURE" ||
+      previous?.outcome === "CHECK_UNAVAILABLE"
+    )
+      return false;
+    return (
+      !previous ||
+      previous.outcome !== "CHECK_FAIL" ||
+      introducedFailure(previous, check, candidateChangedPaths)
+    );
   });
 }
 
@@ -172,26 +316,74 @@ export function verificationRegressions(baseline: VerificationResult, after: Ver
 export function verificationAgainstBaseline(
   baseline: VerificationResult,
   after: VerificationResult,
+  candidateChangedPaths: readonly string[] = [],
 ) {
-  const regressions = new Set(verificationRegressions(baseline, after));
-  return verificationResult(after.checks.map((check) => {
-    const previous = baseline.checks.find((item) => item.command === check.command && item.cwd === check.cwd);
-    if ((check.outcome === "INFRA_FAILURE" || check.outcome === "CHECK_UNAVAILABLE") &&
-        (previous?.outcome === "INFRA_FAILURE" || previous?.outcome === "CHECK_UNAVAILABLE") &&
+  const regressions = new Set(
+    verificationRegressions(baseline, after, candidateChangedPaths),
+  );
+  const compared = after.checks.map((check) => {
+      const previous = baseline.checks.find(
+        (item) => item.command === check.command && item.cwd === check.cwd,
+      );
+      if (
+        (check.outcome === "INFRA_FAILURE" ||
+          check.outcome === "CHECK_UNAVAILABLE") &&
+        (previous?.outcome === "INFRA_FAILURE" ||
+          previous?.outcome === "CHECK_UNAVAILABLE") &&
         check.unavailable === previous.unavailable &&
-        failureSignature(check) === failureSignature(previous))
-      return { ...check,
-        source: `${check.source ?? "verification"}:baseline_environment_unchanged` };
-    if (check.outcome !== "CHECK_FAIL" || regressions.has(check)) return { ...check };
-    if (previous?.unavailable || previous?.outcome === "INFRA_FAILURE" || previous?.outcome === "CHECK_UNAVAILABLE")
-      return { ...check, unavailable: "baseline_verification_unavailable", outcome: "INFRA_FAILURE" as const,
-        stderr: `${check.stderr}\nBaseline verification unavailable: ${previous.unavailable ?? previous.stderr}` };
-    if (!previous || previous.outcome !== "CHECK_FAIL" ||
-        introducedFailure(previous, check)) return { ...check };
-    return { ...check, exitCode: 0, outcome: "CHECK_PASS" as const,
-      source: `${check.source ?? "verification"}:baseline_unchanged`,
-      stdout: `UNCHANGED BASELINE FAILURE (neutral for candidate)\n${check.stdout}` };
-  }));
+        failureSignature(check) === failureSignature(previous)
+      )
+        return {
+          ...check,
+          source: `${check.source ?? "verification"}:baseline_environment_unchanged`,
+        };
+      if (check.outcome !== "CHECK_FAIL" || regressions.has(check))
+        return { ...check };
+      if (
+        previous?.unavailable ||
+        previous?.outcome === "INFRA_FAILURE" ||
+        previous?.outcome === "CHECK_UNAVAILABLE"
+      )
+        return {
+          ...check,
+          unavailable: "baseline_verification_unavailable",
+          outcome: "INFRA_FAILURE" as const,
+          stderr: `${check.stderr}\nBaseline verification unavailable: ${previous.unavailable ?? previous.stderr}`,
+        };
+      if (
+        !previous ||
+        previous.outcome !== "CHECK_FAIL" ||
+        introducedFailure(previous, check, candidateChangedPaths)
+      )
+        return { ...check };
+      return {
+        ...check,
+        source: `${check.source ?? "verification"}:baseline_unchanged`,
+        stdout: `UNCHANGED BASELINE FAILURE (neutral for candidate)\n${check.stdout}`,
+      };
+    });
+  const result = verificationResult(compared);
+  const baselineOnlyFailures =
+    result.status === "FAILED" &&
+    regressions.size === 0 &&
+    compared.some((check) => check.source?.endsWith(":baseline_unchanged")) &&
+    compared.every((check) =>
+      check.outcome !== "CHECK_FAIL" ||
+      check.source?.endsWith(":baseline_unchanged"));
+  if (!baselineOnlyFailures) return result;
+  const improved = compared.some((check) => {
+    if (check.outcome !== "CHECK_FAIL") return false;
+    const previous = baseline.checks.find(
+      (item) => item.command === check.command && item.cwd === check.cwd,
+    );
+    return !!previous && failureSignature(previous) !== failureSignature(check);
+  });
+  return {
+    ...result,
+    status: improved
+      ? ("CANDIDATE_IMPROVEMENT" as const)
+      : ("CANDIDATE_NEUTRAL" as const),
+  };
 }
 export function verificationResult(
   checks: CommandResult[],
@@ -204,15 +396,25 @@ export function verificationResult(
         ? "CHECK_PASS"
         : "CHECK_FAIL";
   }
-  const failedChecks = checks.filter((check) => check.outcome === "CHECK_FAIL").length;
-  const required = checks.filter((check) => (check.requirement ?? "required") === "required");
-  const requiredUnavailable = required.some((check) => !!check.unavailable ||
-    check.outcome === "INFRA_FAILURE" || check.outcome === "CHECK_UNAVAILABLE");
+  const failedChecks = checks.filter(
+    (check) => check.outcome === "CHECK_FAIL",
+  ).length;
+  const required = checks.filter(
+    (check) => (check.requirement ?? "required") === "required",
+  );
+  const requiredUnavailable = required.some(
+    (check) =>
+      !!check.unavailable ||
+      check.outcome === "INFRA_FAILURE" ||
+      check.outcome === "CHECK_UNAVAILABLE",
+  );
   const executableEvidence = checks.some(
     (check) => check.outcome === "CHECK_PASS",
   );
-  const output = checks.filter((c) => !c.source?.endsWith(":baseline_unchanged"))
-    .map((c) => c.stdout + "\n" + c.stderr).join("\n");
+  const output = checks
+    .filter((c) => !c.source?.endsWith(":baseline_unchanged"))
+    .map((c) => c.stdout + "\n" + c.stderr)
+    .join("\n");
   const counts = [
     ...output.matchAll(/(?:(?:#|ℹ) fail\s+(\d+)|(\d+) failed)/g),
   ].map((m) => Number(m[1] ?? m[2]));
@@ -235,8 +437,12 @@ export function verificationResult(
             kind,
             rows.some((c) => c.outcome === "CHECK_FAIL")
               ? "FAIL"
-              : rows.some((c) => c.unavailable || c.outcome === "INFRA_FAILURE" ||
-                    c.outcome === "CHECK_UNAVAILABLE")
+              : rows.some(
+                    (c) =>
+                      c.unavailable ||
+                      c.outcome === "INFRA_FAILURE" ||
+                      c.outcome === "CHECK_UNAVAILABLE",
+                  )
                 ? "UNAVAILABLE"
                 : rows.some((c) =>
                       /(?:#|ℹ) tests\s+0\b|Ran 0 tests\b|no tests found|no tests ran/i.test(
@@ -337,10 +543,26 @@ export async function verify(
       try {
         const limit = typeof timeout === "function" ? timeout() : timeout;
         const started = Date.now();
-        const execute = (strict: boolean) => candidate
-          ? isolatedVerification(path, cmd, Math.max(1, limit - (Date.now() - started)), false, scope, strict,
-              candidate.cwd)
-          : command(path, cmd, Math.max(1, limit - (Date.now() - started)), false, scope, undefined, strict);
+        const execute = (strict: boolean) =>
+          candidate
+            ? isolatedVerification(
+                path,
+                cmd,
+                Math.max(1, limit - (Date.now() - started)),
+                false,
+                scope,
+                strict,
+                candidate.cwd,
+              )
+            : command(
+                path,
+                cmd,
+                Math.max(1, limit - (Date.now() - started)),
+                false,
+                scope,
+                undefined,
+                strict,
+              );
         const pythonCommand =
           /\b(?:python(?:\d+(?:\.\d+)?)?|pytest|tox)\b/i.test(cmd);
         const candidateRequirement =
@@ -358,11 +580,13 @@ export async function verify(
         const environmentFailure =
           c.exitCode !== 0 && runtimeInfrastructureFailure(c);
 
-        if (!strictDependencyEnvironment &&
-            environmentFailure &&
-            environmentFailure !== "verification_network_environment" &&
-            pythonCommand &&
-            limit - (Date.now() - started) > 100) {
+        if (
+          !strictDependencyEnvironment &&
+          environmentFailure &&
+          environmentFailure !== "verification_network_environment" &&
+          pythonCommand &&
+          limit - (Date.now() - started) > 100
+        ) {
           c = await execute(true);
           c.infrastructureRecoveryAttempts = 1;
         }
@@ -394,7 +618,8 @@ export async function verify(
       c.kind = candidate.kind;
       c.cwd = candidate.cwd;
       c.source = candidate.source;
-      c.requirement = candidate.requirement ??
+      c.requirement =
+        candidate.requirement ??
         (candidate.origin === "inferred" || candidate.origin === "generic"
           ? "advisory"
           : "required");

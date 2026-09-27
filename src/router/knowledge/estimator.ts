@@ -2,6 +2,7 @@ import type { SpecialistEvidence } from "../capabilityRegistry.js";
 import type { TaskFingerprint } from "../taskFingerprint.js";
 import { normalizeRoutingTaskFamily } from "./identity.js";
 import type { ModelRoutingKnowledge, RoutingKnowledgeObservation } from "./schema.js";
+import { contextualQuality } from "./contextual.js";
 
 const clamp = (n: number) => Math.max(0.05, Math.min(0.995, n));
 const taskFamily = (fp: TaskFingerprint) => normalizeRoutingTaskFamily(fp.taskFamily ?? fp.primary);
@@ -49,7 +50,7 @@ export interface QualityEstimate {
  * fused later in routeOptimizer and eventually dominates this cold-start prior.
  */
 export function estimateQuality(qualityPrior: number, fp: TaskFingerprint,
-  knowledge: ModelRoutingKnowledge | undefined, legacy: SpecialistEvidence[]): QualityEstimate {
+  knowledge: ModelRoutingKnowledge | undefined, legacy: SpecialistEvidence[], modelId?: string): QualityEstimate {
   const anchor = 0.70 + 0.25 * qualityPrior;
   const relevant = (knowledge?.observations ?? []).filter((row) =>
     row.category !== "efficiency" && row.category !== "provider_capability" &&
@@ -88,6 +89,23 @@ export function estimateQuality(qualityPrior: number, fp: TaskFingerprint,
   const totalUncertainty = Math.max(0.018, Math.min(0.20, evidenceUncertainty + sparsePenalty));
   const exactSupported = relevant.some((row) =>
     row.identityLevel === "EXACT" && taskWeight(row, fp) === 1 && (row.sampleSize ?? 0) >= 20);
+
+  const contextual = modelId && knowledge?.contextualValidated
+    ? contextualQuality(modelId, qualityPrior, fp, knowledge) : undefined;
+  if (contextual) {
+    const supported = contextual.identityLevel === "EXACT" &&
+      contextual.effectiveSamples >= 20 && contextual.uncertainty <= 0.08;
+    return {
+      estimatedSuccess: contextual.mean,
+      conservativeSuccess: contextual.lowerBound,
+      uncertainty: contextual.uncertainty,
+      confidence: supported ? "high" : contextual.effectiveSamples >= 6 ? "medium" : "low",
+      evidenceUsed: contextual.sourceIds.map((source) => `${source}:task-neighborhood`),
+      evidenceFreshness: 1,
+      evidenceLevel: supported ? "SUPPORTED" : "PROMISING",
+      observationCount: Math.round(contextual.effectiveSamples),
+    };
+  }
 
   return {
     estimatedSuccess,

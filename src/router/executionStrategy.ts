@@ -59,6 +59,7 @@ export function chooseExecutionStrategy(
   // stays narrow for direct execution, while `concreteMentions` lets us tell
   // a genuinely multi-component request from broad lexical matches.
   const concreteMentions = exactPaths.length ? exactPaths : basenameMatches;
+  const exactSourceMentions = exactPaths.filter(isSourcePath);
 
   // Repository profiles contain files, not directory entries. Build the
   // directory set so an explicitly named bounded directory can still act as
@@ -177,6 +178,16 @@ export function chooseExecutionStrategy(
         "Bounded inspect, fix, and test task uses one stable worker",
       likelyFiles: stableTargets,
     };
+  }
+
+  // Three or more repository-backed source paths are enough evidence that one
+  // repository-wide Stable worker would hide useful ownership boundaries. The
+  // planner can inspect their actual imports and focused tests, then either
+  // build a safe dependency DAG or retain a coupled plan. This is deliberately
+  // based on exact paths rather than lexical filename matches: incidental
+  // terms must not manufacture parallel work.
+  if (exactSourceMentions.length >= 3) {
+    return planned("Several explicit source targets require dependency-aware planning");
   }
 
   const boundedFeature =

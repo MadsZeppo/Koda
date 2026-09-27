@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 import { dirname, join } from "node:path";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import type { CatalogIdentity, CurrentPricing, EvidenceSourceInput, ExternalEvidenceRecord } from "./ingest.js";
+import { routingTerms } from "./contextual.js";
 
 // Runtime priors use only the public probing split. The held-out ID test split
 // stays untouched so Koda can later measure routing regret honestly.
@@ -10,8 +11,12 @@ export const CODEROUTER_RESULTS_URL =
   "https://huggingface.co/datasets/Lance1573/CodeRouterBench/resolve/main/id_probing_results_long.csv";
 export const CODEROUTER_TEST_RESULTS_URL =
   "https://huggingface.co/datasets/Lance1573/CodeRouterBench/resolve/main/id_test_results_long.csv";
+export const CODEROUTER_TEST_TASKS_URL =
+  "https://huggingface.co/datasets/Lance1573/CodeRouterBench/resolve/main/id_test_tasks.jsonl";
 export const CODEROUTER_MODELS_URL =
   "https://huggingface.co/datasets/Lance1573/CodeRouterBench/resolve/main/models.json";
+export const CODEROUTER_TASKS_URL =
+  "https://huggingface.co/datasets/Lance1573/CodeRouterBench/resolve/main/id_probing_tasks.jsonl";
 export const SWE_REBENCH_TREE_URL =
   "https://huggingface.co/api/datasets/ibragim-bad/swe_rebench_07_2026_trajectories/tree/main?recursive=true&expand=false";
 export const SWE_REBENCH_RESOLVE_ROOT =
@@ -65,18 +70,38 @@ function explicitModelMap(payload: any) {
   }
   return result;
 }
+const declaredModelNames = (payload: any) => new Set(
+  (Array.isArray(payload?.models) ? payload.models : Array.isArray(payload) ? payload : [])
+    .flatMap((item: any) => string(item?.model, item?.name, item?.id) ?? []),
+);
+
+const taskDescriptors = (jsonl = "") => jsonl.split("\n").filter((line) => line.trim()).flatMap((line) => {
+  const row = JSON.parse(line);
+  const taskKey = firstString(row, ["task_id", "id", "instance_id"]);
+  const taskFamily = firstString(row, ["dimension", "task_family", "category", "metadata.dimension"]);
+  const text = firstString(row, ["prompt", "instruction", "problem", "description", "query",
+    "task", "input", "metadata.prompt", "metadata.description"]);
+  const languageValue = at(row, "languages") ?? at(row, "language") ?? at(row, "metadata.language");
+  const languages = Array.isArray(languageValue) ? languageValue.filter((item): item is string =>
+    typeof item === "string") : typeof languageValue === "string" ? [languageValue] : undefined;
+  if (!taskKey) return [];
+  return [{ taskKey, taskFamily, languages,
+    routingTerms: routingTerms([taskFamily, text].filter(Boolean).join(" ")) }];
+});
 
 export function codeRouterSource(csv: string, modelsPayload: any,
-  generatedAt = new Date().toISOString()): EvidenceSourceInput {
+  generatedAt = new Date().toISOString(), tasksJsonl = ""): EvidenceSourceInput {
   const exact = explicitModelMap(modelsPayload);
+  const declared = declaredModelNames(modelsPayload);
   const records = parseCsv(csv).map((row): ExternalEvidenceRecord => {
     const model = row.model;
     const canonicalModelId = canonicalId(model) ?? (model ? exact.get(model) : undefined);
+    const declaredRevision = !!model && declared.has(model);
     const score = number(row.score);
     return {
       taskKey: row.task_id, taskFamily: row.dimension || undefined,
-      externalModelName: model, canonicalModelId,
-      identityLevel: canonicalModelId ? "EXACT" : "UNKNOWN",
+      externalModelName: model, canonicalModelId: canonicalModelId ?? (declaredRevision ? model : undefined),
+      identityLevel: canonicalModelId ? "EXACT" : declaredRevision ? "FAMILY_TRANSFER" : "UNKNOWN",
       revision: model || undefined,
       success: score === 0 || score === 1 ? score === 1 : undefined,
       benchmarkScore: score,
@@ -86,7 +111,8 @@ export function codeRouterSource(csv: string, modelsPayload: any,
     };
   });
   return { id: "coderouterbench-id", type: "paired_task_model", version: "huggingface-main",
-    date: generatedAt.slice(0, 10), harness: "CodeRouterBench ID probing task-by-model matrix", records };
+    date: generatedAt.slice(0, 10), harness: "CodeRouterBench ID probing task-by-model matrix", records,
+    tasks: taskDescriptors(tasksJsonl) };
 }
 
 export function sweRebenchRecord(row: any): ExternalEvidenceRecord {
@@ -147,11 +173,25 @@ async function writeAtomic(output: string, source: EvidenceSourceInput) {
 
 export async function prepareCodeRouterBench(output: string, fetcher: typeof fetch = fetch,
   now = new Date().toISOString()) {
-  const [csv, models] = await Promise.all([
+  const [csv, models, tasks] = await Promise.all([
     response(fetcher, CODEROUTER_RESULTS_URL).then((item) => item.text()),
     response(fetcher, CODEROUTER_MODELS_URL).then((item) => item.json()),
+    response(fetcher, CODEROUTER_TASKS_URL).then((item) => item.text()),
   ]);
-  return writeAtomic(output, codeRouterSource(csv, models, now));
+  return writeAtomic(output, codeRouterSource(csv, models, now, tasks));
+}
+
+export async function prepareCodeRouterBenchHoldout(output: string, fetcher: typeof fetch = fetch,
+  now = new Date().toISOString()) {
+  const [csv, models, tasks] = await Promise.all([
+    response(fetcher, CODEROUTER_TEST_RESULTS_URL).then((item) => item.text()),
+    response(fetcher, CODEROUTER_MODELS_URL).then((item) => item.json()),
+    response(fetcher, CODEROUTER_TEST_TASKS_URL).then((item) => item.text()),
+  ]);
+  const source = codeRouterSource(csv, models, now, tasks);
+  source.id = "coderouterbench-id-holdout";
+  source.harness = "CodeRouterBench held-out ID task-by-model matrix";
+  return writeAtomic(output, source);
 }
 
 async function trajectoryPaths(fetcher: typeof fetch) {
@@ -172,17 +212,47 @@ export async function prepareSWERebench(output: string, fetcher: typeof fetch = 
   now = new Date().toISOString()) {
   const paths = await trajectoryPaths(fetcher);
   if (!paths.length) throw Error("SWE-rebench index contained no trajectory shards");
-  const lines: string[] = [];
-  for (const path of paths) {
-    const url = `${SWE_REBENCH_RESOLVE_ROOT}/${path.split("/").map(encodeURIComponent).join("/")}`;
-    const compressed = Buffer.from(await (await response(fetcher, url)).arrayBuffer());
-    lines.push(...gunzipSync(compressed).toString("utf8").split("\n").filter(Boolean));
+  await mkdir(dirname(output), { recursive: true });
+  const temporary = `${output}.${randomUUID()}.tmp`;
+  const file = await open(temporary, "w");
+  const hash = createHash("sha256");
+  let records = 0;
+  const write = async (value: string) => { hash.update(value); await file.write(value); };
+  const metadata = { id: "swe-rebench-2026-07-trajectories", type: "agentic_economics",
+    version: "2026-07", date: now.slice(0, 10),
+    harness: "SWE-rebench normalized repeated-run trajectories" };
+  try {
+    await write(`${JSON.stringify(metadata).slice(0, -1)},"records":[`);
+    for (const path of paths) {
+      const url = `${SWE_REBENCH_RESOLVE_ROOT}/${path.split("/").map(encodeURIComponent).join("/")}`;
+      const compressed = Buffer.from(await (await response(fetcher, url)).arrayBuffer());
+      const content = gunzipSync(compressed).toString("utf8");
+      const batch: string[] = [];
+      for (const line of content.split("\n")) {
+        if (!line.trim()) continue;
+        batch.push(JSON.stringify(sweRebenchRecord(JSON.parse(line))));
+        records++;
+        if (batch.length === 500) {
+          await write(`${records - batch.length > 0 ? "," : ""}${batch.join(",")}`);
+          batch.length = 0;
+        }
+      }
+      if (batch.length) await write(`${records - batch.length > 0 ? "," : ""}${batch.join(",")}`);
+    }
+    await write("]}");
+    await file.close();
+    await rename(temporary, output);
+    return { output, records, sha256: hash.digest("hex") };
+  } catch (error) {
+    await file.close().catch(() => undefined);
+    await unlink(temporary).catch(() => undefined);
+    throw error;
   }
-  return writeAtomic(output, sweRebenchSource(lines, now));
 }
 
 export const evidenceInputPaths = (directory: string) => ({
   codeRouterBench: join(directory, "evidence", "coderouterbench.json"),
+  codeRouterBenchHoldout: join(directory, "evidence", "coderouterbench-holdout.json"),
   sweRebench: join(directory, "evidence", "swe-rebench.json"),
 });
 

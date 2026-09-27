@@ -17,6 +17,10 @@ export interface NormalizedCapabilityEvidence {
   capability: string;
   quality: number;
   source: "configured" | "benchmark" | "metadata";
+  uncertainty: number;
+  effectiveEvidenceCount: number;
+  recency: number;
+  sourceDiversity: number;
 }
 export interface SpecialistModel {
   model: PoolModel;
@@ -72,6 +76,11 @@ export class CapabilityRegistry {
   forTask(fingerprint: TaskFingerprint) {
     // The raw snapshot is shared; task-specific market evidence is computed per subtask.
     return this.load().then((models) => this.withMarket(models, fingerprint));
+  }
+  /** Rebuild from already acquired on-disk catalog data without doing research. */
+  async reloadCachedForTask(fingerprint: TaskFingerprint) {
+    this.pending = this.cachedSnapshot().then((snapshot) => this.build(snapshot));
+    return this.pending.then((models) => this.withMarket(models, fingerprint));
   }
   /** Explicit metadata refresh, never called while selecting a worker model. */
   async refresh() {
@@ -202,6 +211,7 @@ export class CapabilityRegistry {
   }
   private async build(snapshot: ModelSnapshot) {
     const configured = this.config.modelPool?.models ?? [];
+    const configuredById = new Map(configured.map((model) => [model.id, model]));
     const raw = new Map<string, any>(snapshot.models.filter((m) => typeof m?.id === "string").map((m) => [m.id, m]));
     const benchmarks = new Map<string, any[]>();
     for (const row of snapshot.benchmarks) {
@@ -226,7 +236,7 @@ export class CapabilityRegistry {
     const dynamic: [string, Metadata][] = [];
     for (const id of ids) {
       const source = raw.get(id);
-      const existing = configured.find((m) => m.id === id);
+      const existing = configuredById.get(id);
       if (!existing && !source) continue;
       const rows = benchmarks.get(id) ?? [];
       const coding = rows.map((row) => finite(row.coding_index)).find((n) => n !== undefined);
@@ -248,14 +258,23 @@ export class CapabilityRegistry {
       const capabilityEvidence: NormalizedCapabilityEvidence[] = [
         ...(existing?.strengths ?? []).map((capability) => ({
           capability, quality: existing!.qualityPrior, source: "configured" as const,
+          uncertainty: 0.2, effectiveEvidenceCount: 0, recency: 1,
+          sourceDiversity: 1,
         })),
-        ...(coding === undefined ? [] : [{ capability: "coding", quality: clamp(coding / 100), source: "benchmark" as const }]),
-        ...(agentic === undefined ? [] : [{ capability: "repo_reasoning", quality: clamp(agentic / 100), source: "benchmark" as const }]),
-        ...(reasoning === undefined ? [] : [{ capability: "reasoning", quality: clamp(reasoning / 100), source: "benchmark" as const }]),
-        ...(terminal === undefined ? [] : [{ capability: "terminal", quality: clamp(terminal / 100), source: "benchmark" as const }]),
-        ...(design === undefined ? [] : [{ capability: "frontend_ui", quality: clamp((design - 1000) / 1000), source: "benchmark" as const }]),
-        ...(metadata.contextLength === undefined ? [] : [{ capability: "long_context", quality: clamp(metadata.contextLength / 200000), source: "metadata" as const }]),
-        ...(metadata.supportedParameters?.includes("tools") ? [{ capability: "tool_use", quality: 1, source: "metadata" as const }] : []),
+        ...([ ["coding", coding], ["repo_reasoning", agentic],
+          ["reasoning", reasoning], ["terminal", terminal] ] as const)
+          .flatMap(([capability, score]) => score === undefined ? [] : [{
+            capability, quality: clamp(score / 100), source: "benchmark" as const,
+            uncertainty: 0.1, effectiveEvidenceCount: Math.max(1, rows.length),
+            recency: 1, sourceDiversity: new Set(rows.map((row) => row.source)).size,
+          }]),
+        ...(design === undefined ? [] : [{ capability: "frontend_ui", quality: clamp((design - 1000) / 1000), source: "benchmark" as const,
+          uncertainty: 0.12, effectiveEvidenceCount: Math.max(1, designs.length), recency: 1,
+          sourceDiversity: new Set(designs.map((row) => row.source)).size }]),
+        ...(metadata.contextLength === undefined ? [] : [{ capability: "long_context", quality: clamp(metadata.contextLength / 200000), source: "metadata" as const,
+          uncertainty: 0, effectiveEvidenceCount: 1, recency: 1, sourceDiversity: 1 }]),
+        ...(metadata.supportedParameters?.includes("tools") ? [{ capability: "tool_use", quality: 1, source: "metadata" as const,
+          uncertainty: 0, effectiveEvidenceCount: 1, recency: 1, sourceDiversity: 1 }] : []),
       ];
       if (existing) evidence.push({ source: "configured_prior", value: existing.qualityPrior, detail: "Koda configured quality prior" });
       const external = rows.some((row) => row.source === "artificial-analysis");
@@ -305,12 +324,18 @@ export class CapabilityRegistry {
   private market: any[] = [];
   private withMarket(models: SpecialistModel[], fingerprint: TaskFingerprint) {
     const pattern = marketPattern(fingerprint.primary);
+    const entries = this.market.filter((row) => pattern.test(String(row.tag ?? "")));
+    const sharesByModel = new Map<string, number>();
+    for (const row of entries)
+      for (const item of row.models ?? [])
+        if (typeof item?.id === "string" && Number.isFinite(Number(item.tag_usage_share)))
+          sharesByModel.set(item.id, Math.max(sharesByModel.get(item.id) ?? 0,
+            Number(item.tag_usage_share)));
     return models.map((model) => {
-      const entries = this.market.filter((row) => pattern.test(String(row.tag ?? "")));
-      const shares = entries.flatMap((row) => (row.models ?? []).filter((item: any) => item.id === model.model.id).map((item: any) => Number(item.tag_usage_share ?? 0)));
+      const share = sharesByModel.get(model.model.id);
       return {
         ...model,
-        evidence: shares.length ? [...model.evidence, { source: "task_market" as const, value: Math.max(...shares), detail: "OpenRouter task-classification usage share (popularity proxy, not success rate)" }] : model.evidence,
+        evidence: share !== undefined ? [...model.evidence, { source: "task_market" as const, value: share, detail: "OpenRouter task-classification usage share (popularity proxy, not success rate)" }] : model.evidence,
       };
     });
   }

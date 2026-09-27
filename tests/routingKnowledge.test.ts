@@ -10,6 +10,8 @@ import { modelSchema, routingSchema } from "../src/router/pool.js";
 import type { TaskFingerprint } from "../src/router/taskFingerprint.js";
 import { extractFeatures } from "../src/router/features.js";
 import type { OperationalCall } from "../src/router/history.js";
+import type { Attempt } from "../src/router/history.js";
+import { estimateEfficiency } from "../src/router/knowledge/efficiency.js";
 
 const fp = (strength: TaskFingerprint["verificationStrength"] = "weak"): TaskFingerprint => ({
   taskFamily: "localized_bugfix", primary: "debugging", secondary: ["testing"],
@@ -58,6 +60,32 @@ test("versioned knowledge uses explicit canonical IDs and leaves display-name-on
   assert.equal(store.unmapped().length, 1);
 });
 
+test("knowledge lookup indexes the snapshot once instead of rescanning it per routed model", () => {
+  let iterations = 0;
+  const source = Array.from({ length: 2_000 }, (_, index) => ({
+    ...row(`vendor/claude-sonnet-${index}`, "result_at_1", .8, "agentic_swe"),
+    canonicalModelId: `vendor/claude-sonnet-${index}`,
+  }));
+  const observations = new Proxy(source, {
+    get(target, property, receiver) {
+      if (property === Symbol.iterator) return function* () {
+        iterations++;
+        yield* target;
+      };
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const store = new RoutingKnowledgeStore({ schemaVersion: 2,
+    snapshotId: "indexed", createdAt: "2026-09-01", observations });
+  const constructionIterations = iterations;
+  for (let index = 0; index < 200; index++)
+    store.forModel(`vendor/claude-sonnet-${index}`);
+  assert.equal(iterations, constructionIterations,
+    "routing model expansion must use the prebuilt family index");
+  assert.equal(store.forModel("vendor/claude-sonnet-1"),
+    store.forModel("vendor/claude-sonnet-1"), "model views are memoized");
+});
+
 test("agentic benchmark evidence adjusts a task prior without becoming its literal success probability", () => {
   const observation = row("measured", "result_at_1", .42, "agentic_swe");
   const estimate = estimateQuality(.96, fp(), knowledge("measured", [observation]), []);
@@ -103,4 +131,96 @@ test("long-tail p90 latency can demote an otherwise equivalent economical plan",
   } as Config, 100, operations);
   assert.equal(result.selectedPlan?.models[0], "stable");
   assert.ok(result.considered.find((entry) => entry.model.id === "long-tail")!.latencyP90Ms! > 80_000);
+});
+
+test("sparse trajectory economics distinguish DirectEdit from mini-SWE and learn limit overruns", () => {
+  const direct = fp("strong");
+  const agentic = { ...direct, executionStrategy: "stable", scope: "multi-file" as const,
+    expectedFiles: 3, localizationConfidence: "high" as const };
+  const directEstimate = estimateEfficiency(direct, 4_000, 8_192, undefined, []);
+  const agenticPrior = estimateEfficiency(agentic, 4_000, 8_192, undefined, []);
+  assert.ok(agenticPrior.expectedTotalTokens > directEstimate.expectedTotalTokens * 3);
+  assert.ok(agenticPrior.p99TotalTokens > agenticPrior.p90TotalTokens);
+  const overrun: Attempt = { timestamp: "2026-09-01", runId: "limit", subtaskId: "fix",
+    modelRequested: "agentic", modelServed: "agentic", features,
+    fingerprint: agentic, verification: "NOT_FULLY_VERIFIED", wallClockMs: 43_100,
+    inputTokens: 20_000, outputTokens: 3_689, costUsd: .174645, escalated: false,
+    terminationReason: "cost_limit", executionEngine: "mini-swe-agent",
+    contextStrategy: "agentic" };
+  const learned = estimateEfficiency(agentic, 4_000, 8_192, undefined, [overrun]);
+  const wrongEngine = estimateEfficiency(direct, 4_000, 8_192, undefined, [overrun]);
+  assert.equal(learned.expectedTotalTokens, 23_689);
+  assert.ok(learned.p90TotalTokens >= learned.expectedTotalTokens);
+  assert.ok(learned.p99TotalTokens >= learned.p90TotalTokens);
+  assert.equal(wrongEngine.expectedTotalTokens, directEstimate.expectedTotalTokens,
+    "agentic overruns cannot inflate DirectEdit economics");
+});
+
+test("legacy DirectEdit usage cannot collapse a multi-turn agent token forecast", () => {
+  const direct = fp("strong");
+  const agentic = { ...direct, executionStrategy: "planned" as const,
+    scope: "multi-file" as const, expectedFiles: 3,
+    localizationConfidence: "high" as const };
+  const legacyDirect: Attempt = {
+    timestamp: "2026-09-01", runId: "legacy-direct", subtaskId: "fix-one",
+    modelRequested: "economical", modelServed: "economical", features,
+    fingerprint: direct, verification: "VERIFIED_SUCCESS", wallClockMs: 8_432,
+    inputTokens: 1_405, outputTokens: 157, costUsd: .000095,
+    escalated: false, turns: 1,
+  };
+  const prior = estimateEfficiency(agentic, 1_270, 8_192, undefined, []);
+  const estimate = estimateEfficiency(agentic, 1_270, 8_192, undefined,
+    [legacyDirect]);
+  assert.deepEqual(estimate, prior,
+    "an inferable legacy DirectEdit row is not mini-SWE efficiency evidence");
+  assert.ok(estimate.p90TotalTokens > 10_000);
+  const agenticFeatures = { ...features, executionStrategy: "planned",
+    estimatedFiles: 3, implementationFiles: 3,
+    likelyWritePaths: ["src/a.ts", "src/b.ts", "src/c.ts"] } as typeof features;
+  const routed = optimizeSpecialists([model("economical", 1)], agentic,
+    agenticFeatures, [], { maxOutputTokens: 8192,
+      routing: routingSchema.parse({}) } as Config, 10, [], new Set(),
+    [legacyDirect]);
+  assert.ok(routed.considered[0]!.expectedTotalTokens > 10_000,
+    "the production optimizer retains the agentic trajectory estimate");
+});
+
+test("stale public token quantiles cannot undercut a newer trajectory estimate", () => {
+  const agentic = { ...fp("strong"), executionStrategy: "stable" as const,
+    scope: "multi-file" as const, expectedFiles: 3,
+    localizationConfidence: "high" as const };
+  const observations = [
+    { ...row("agentic", "total_tokens", 20_000), engine: "mini-swe-agent" as const },
+    { ...row("agentic", "total_tokens_p90", 1_529), engine: "mini-swe-agent" as const },
+    { ...row("agentic", "total_tokens_p99", 1_000), engine: "mini-swe-agent" as const },
+  ];
+  const estimate = estimateEfficiency(agentic, 4_000, 8_192,
+    knowledge("agentic", observations), []);
+  assert.equal(estimate.expectedTotalTokens, 20_000);
+  assert.ok(estimate.p90TotalTokens >= estimate.expectedTotalTokens);
+  assert.ok(estimate.p99TotalTokens >= estimate.p90TotalTokens);
+});
+
+test("agentic overruns transfer by engine and task region without becoming quality evidence", () => {
+  const agenticFeatures = { ...features, executionStrategy: "planned",
+    estimatedFiles: 3, implementationFiles: 3,
+    likelyWritePaths: ["src/a.ts", "src/b.ts", "src/c.ts"] } as typeof features;
+  const agentic = { ...fp("strong"), executionStrategy: "planned" as const,
+    scope: "multi-file" as const, expectedFiles: 3,
+    localizationConfidence: "high" as const };
+  const overrun: Attempt = { timestamp: "2026-09-01", runId: "overrun",
+    subtaskId: "flow", modelRequested: "agentic", modelServed: "agentic",
+    features: agenticFeatures, fingerprint: agentic,
+    verification: "NOT_FULLY_VERIFIED", wallClockMs: 43_100,
+    inputTokens: 20_000, outputTokens: 3_689, costUsd: .174645,
+    escalated: false, terminationReason: "cost_limit",
+    executionEngine: "mini-swe-agent", contextStrategy: "agentic" };
+  const result = optimizeSpecialists([model("agentic", 1)], agentic,
+    agenticFeatures, [], { maxOutputTokens: 8192,
+      routing: routingSchema.parse({}) } as Config, 10, [], new Set(), [overrun]);
+  const candidate = result.considered[0]!;
+  assert.equal(candidate.expectedTotalTokens, 23_689);
+  assert.ok(candidate.tokenEfficiency.p90TotalTokens >= 23_689);
+  assert.equal(candidate.localQualityEvidence, 0,
+    "an efficiency overrun must not become semantic quality evidence");
 });

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { ROUTING_KNOWLEDGE_VERSION, type ExternalEvidenceType,
   type ModelIdentityLevel, type PairwiseRoutingEvidence,
   type RoutingKnowledgeObservation, type RoutingKnowledgeSnapshot,
-  type RoutingKnowledgeSource } from "./schema.js";
+  type RoutingKnowledgeSource, type RoutingExecutionEngine } from "./schema.js";
 
 export interface ExternalEvidenceRecord {
   taskKey?: string; taskFamily?: string; languages?: string[];
@@ -11,10 +11,21 @@ export interface ExternalEvidenceRecord {
   inputTokens?: number; outputTokens?: number; cachedTokens?: number;
   totalTokens?: number; turns?: number; latencyMs?: number;
   reportedCostUsd?: number; benchmarkScore?: number; marketShare?: number;
+  engine?: RoutingExecutionEngine;
+}
+export interface ExternalTaskDescriptor {
+  taskKey: string;
+  taskFamily?: string;
+  languages?: string[];
+  routingTerms: string[];
 }
 export interface EvidenceSourceInput {
   id: string; type: ExternalEvidenceType; version?: string; date?: string;
-  harness?: string; records: ExternalEvidenceRecord[];
+  harness?: string; records: ExternalEvidenceRecord[]; tasks?: ExternalTaskDescriptor[];
+  engine?: RoutingExecutionEngine;
+  /** 0..1 source-level evidence reliability and likely non-contamination. */
+  evidenceQuality?: number;
+  contaminationConfidence?: number;
 }
 export type CurrentPricing = Record<string, {
   inputPrice: number; outputPrice: number; cachedInputPrice?: number;
@@ -35,8 +46,16 @@ export function resolveSourceIdentities(input: EvidenceSourceInput,
     if (direct) return { ...row, canonicalModelId: direct.id, identityLevel: "EXACT" as const };
     const family = catalog.filter((item) => item.id.split("/").at(-1)?.toLowerCase() ===
       row.externalModelName!.toLowerCase());
-    return family.length === 1 ? { ...row, canonicalModelId: family[0]!.id,
-      identityLevel: "FAMILY_TRANSFER" as const } : row;
+    if (family.length === 1) return { ...row, canonicalModelId: family[0]!.id,
+      identityLevel: "FAMILY_TRANSFER" as const };
+    // A benchmark's versioned model label is a stable source identity, though
+    // it is not proof of equivalence to a current provider endpoint. Preserve
+    // it only as explicit family-transfer evidence so task-level matrices are
+    // usable without fabricating an exact canonical mapping.
+    return row.revision === row.externalModelName
+      ? { ...row, canonicalModelId: row.externalModelName,
+          identityLevel: "FAMILY_TRANSFER" as const }
+      : row;
   }) };
 }
 const finite = (value: unknown): value is number =>
@@ -78,12 +97,39 @@ export function pairwiseOutcomes(sourceId: string, records: ExternalEvidenceReco
     a.candidateModelId.localeCompare(b.candidateModelId) || a.referenceModelId.localeCompare(b.referenceModelId));
 }
 
+/** Build a compact task x model matrix without retaining benchmark prompts. */
+export function taskCases(input: EvidenceSourceInput) {
+  if (!input.tasks?.length) return [];
+  const descriptors = new Map(input.tasks.map((task) => [task.taskKey, task]));
+  const grouped = new Map<string, Array<{ modelId: string; success: boolean;
+    identityLevel: "EXACT" | "FAMILY_TRANSFER" }>>();
+  for (const row of input.records) {
+    if (!row.taskKey || !descriptors.has(row.taskKey) || identity(row) === "UNKNOWN" ||
+      !row.canonicalModelId || typeof row.success !== "boolean") continue;
+    const outcomes = grouped.get(row.taskKey) ?? [];
+    outcomes.push({ modelId: row.canonicalModelId, success: row.success,
+      identityLevel: identity(row) as "EXACT" | "FAMILY_TRANSFER" });
+    grouped.set(row.taskKey, outcomes);
+  }
+  return [...grouped].flatMap(([taskKey, outcomes]) => {
+    const task = descriptors.get(taskKey)!;
+    const unique = new Map(outcomes.map((outcome) => [outcome.modelId, outcome]));
+    return unique.size < 2 ? [] : [{ sourceId: input.id, taskKey,
+      taskFamily: task.taskFamily, languages: task.languages,
+      harness: input.harness, engine: input.engine ?? "unknown",
+      evidenceQuality: input.evidenceQuality,
+      contaminationConfidence: input.contaminationConfidence,
+      routingTerms: [...new Set(task.routingTerms)].slice(0, 96),
+      outcomes: [...unique.values()].sort((a, b) => a.modelId.localeCompare(b.modelId)) }];
+  }).sort((a, b) => a.taskKey.localeCompare(b.taskKey));
+}
+
 export function ingestEvidenceSource(input: EvidenceSourceInput, snapshotDate: string,
   pricing: CurrentPricing = {}) {
   const observations: RoutingKnowledgeObservation[] = [];
   const groups = new Map<string, ExternalEvidenceRecord[]>();
   for (const row of input.records) {
-    const key = `${canonical(row) ?? row.externalModelName ?? "unknown"}\0${row.taskFamily ?? "all"}\0${identity(row)}`;
+    const key = `${canonical(row) ?? row.externalModelName ?? "unknown"}\0${row.taskFamily ?? "all"}\0${identity(row)}\0${row.engine ?? input.engine ?? "unknown"}`;
     const list = groups.get(key) ?? []; list.push(row); groups.set(key, list);
   }
   for (const rows of groups.values()) {
@@ -92,7 +138,10 @@ export function ingestEvidenceSource(input: EvidenceSourceInput, snapshotDate: s
       displayModel: first.externalModelName ?? model ?? "unknown", externalModelName: first.externalModelName,
       canonicalModelId: model, revision: first.revision, reasoningConfig: first.reasoningConfig,
       identityLevel: identity(first), evidenceType: input.type,
-      taskFamilies: family ? [family] : undefined, languages: first.languages, harness: input.harness } as const;
+      taskFamilies: family ? [family] : undefined, languages: first.languages,
+      harness: input.harness, engine: first.engine ?? input.engine ?? "unknown",
+      evidenceQuality: input.evidenceQuality,
+      contaminationConfidence: input.contaminationConfidence } as const;
     const add = (metric: RoutingKnowledgeObservation["metric"], value: number,
       unit: RoutingKnowledgeObservation["unit"], category: RoutingKnowledgeObservation["category"],
       extra: Partial<RoutingKnowledgeObservation> = {}) => observations.push({
@@ -121,12 +170,14 @@ export function ingestEvidenceSource(input: EvidenceSourceInput, snapshotDate: s
       if (metric === "total_tokens") {
         add("total_tokens_p75", quantile(samples, .75)!, "tokens", "efficiency", { sampleSize: samples.length });
         add("total_tokens_p90", quantile(samples, .9)!, "tokens", "efficiency", { sampleSize: samples.length });
+        add("total_tokens_p99", quantile(samples, .99)!, "tokens", "efficiency", { sampleSize: samples.length });
       }
     }
     const latency = values("latencyMs");
     if (latency.length) {
       add("completion_latency_p50_ms", quantile(latency, .5)!, "milliseconds", "efficiency", { sampleSize: latency.length });
       add("completion_latency_p90_ms", quantile(latency, .9)!, "milliseconds", "efficiency", { sampleSize: latency.length });
+      add("completion_latency_p99_ms", quantile(latency, .99)!, "milliseconds", "efficiency", { sampleSize: latency.length });
     }
     const cachedRatios = rows.flatMap((row) => finite(row.cachedTokens) && finite(row.inputTokens) && row.inputTokens > 0
       ? [Math.min(1, row.cachedTokens / row.inputTokens)] : []);
@@ -158,6 +209,7 @@ export function buildKnowledgeSnapshot(inputs: EvidenceSourceInput[], now = new 
   const body = { schemaVersion: ROUTING_KNOWLEDGE_VERSION, createdAt: now,
     observations: parts.flatMap((item) => item.observations),
     pairwiseEvidence: parts.flatMap((item) => item.pairwiseEvidence),
+    taskCases: inputs.flatMap(taskCases),
     sources: parts.map((item) => item.source) };
   const digest = createHash("sha256").update(JSON.stringify(body)).digest("hex").slice(0, 16);
   return { ...body, snapshotId: `routing-knowledge-v2-${digest}` };

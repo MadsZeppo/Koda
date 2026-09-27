@@ -42,22 +42,27 @@ export function normalizePlan(input: Plan) {
   };
   for (const task of plan.subtasks) {
     const paths = task.likelyWritePaths.map(key);
-    const group = groups.find(
-      (g) =>
-        task.readOnly !== true &&
-        g.task.readOnly !== true &&
-        !task.reusableArtifact &&
-        !g.task.reusableArtifact &&
-        level(g.task.id) === level(task.id) &&
-        !paths
-          .concat(g.task.likelyWritePaths)
-          .some((p) => p === "." || /[*?\[\]]/.test(p)) &&
-        paths.filter((p) =>
-          g.task.likelyWritePaths.some((q) => pathOverlap(p, key(q))),
-        ).length /
-          Math.max(1, Math.min(paths.length, g.task.likelyWritePaths.length)) >=
-          0.5,
-    );
+    const group = groups.find((g) => {
+      if (task.readOnly === true || g.task.readOnly === true ||
+          task.reusableArtifact || g.task.reusableArtifact ||
+          level(g.task.id) !== level(task.id) ||
+          paths.concat(g.task.likelyWritePaths)
+            .some((p) => p === "." || /[*?\[\]]/.test(p))) return false;
+      const overlap = paths.filter((p) =>
+        g.task.likelyWritePaths.some((q) => pathOverlap(p, key(q)))).length /
+        Math.max(1, Math.min(paths.length, g.task.likelyWritePaths.length));
+      const sharedRequiredCheck = task.verificationCommands.some((command) =>
+        g.task.verificationCommands.includes(command));
+      const dependencyConnected =
+        paths.some((write) => g.task.likelyReadPaths.some((read) =>
+          pathOverlap(write, key(read)))) ||
+        g.task.likelyWritePaths.some((write) => task.likelyReadPaths.some((read) =>
+          pathOverlap(key(write), key(read))));
+      // Separate write scopes that share a required check are one atomic unit
+      // when the inspected read graph directly connects them. This keeps
+      // shared invariants together without merging independent siblings.
+      return overlap >= 0.5 || (sharedRequiredCheck && dependencyConnected);
+    });
     if (!group) {
       groups.push({ task: structuredClone(task), members: [task.id] });
       aliases.set(task.id, task.id);

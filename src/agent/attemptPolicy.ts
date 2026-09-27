@@ -22,6 +22,19 @@ export interface AttemptLimitPolicyInput {
   completionPricePerMillion?: number;
   remainingMs: number;
   configuredTimeoutMs: number;
+  plannedLatencyP90Ms?: number;
+}
+
+/** True when Koda will execute this fingerprint through the one-call editor. */
+export function usesDirectEditEngine(fingerprint: TaskFingerprint) {
+  const localization = fingerprint.localizationConfidence ??
+    (fingerprint.scope === "single" ? "high" : "low");
+  const localized = localization === "high" &&
+    (fingerprint.expectedFiles ?? 1) <= 1 &&
+    !fingerprint.architectureHeavy && !fingerprint.repoReasoningHeavy;
+  return localized && fingerprint.scope === "single" &&
+    (fingerprint.executionStrategy === "direct" ||
+      fingerprint.executionStrategy === "planned");
 }
 
 /** A bounded attempt must be able to execute its selected engine before it starts. */
@@ -34,8 +47,7 @@ export function attemptLimitPolicy(input: AttemptLimitPolicyInput) {
   // DirectEditWorker. That engine makes one structured model call and then
   // hands the mutation back to Koda for verification. Do not price its
   // viability as a four-turn mini-SWE inspect/edit/verify loop.
-  const directEdit = input.fingerprint.executionStrategy === "direct" &&
-    input.fingerprint.scope === "single" && localized;
+  const directEdit = usesDirectEditEngine(input.fingerprint);
 
   const complex = !localized && (input.effort === "complex" ||
     input.fingerprint.architectureHeavy || input.fingerprint.repoReasoningHeavy ||
@@ -78,7 +90,21 @@ export function attemptLimitPolicy(input: AttemptLimitPolicyInput) {
     input.plannedBudgetUsd, minimumViableCostUsd ?? 0));
 
   const minimumViableMs = localized ? 10_000 : complex ? 30_000 : 20_000;
-  const timeoutMs = Math.min(input.configuredTimeoutMs, input.remainingMs, 45_000);
+  // DIRECT is a single structured request. Once routing has a usable p90,
+  // waiting many multiples of it only delays operational recovery. Keep a
+  // 10s viability floor and 1.5 p90s of headroom; unknown latency retains
+  // the configured hard deadline.
+  const predictedDirectDeadline = directEdit &&
+      Number.isFinite(input.plannedLatencyP90Ms) &&
+      (input.plannedLatencyP90Ms ?? 0) > 0
+    ? Math.max(10_000, Math.ceil(input.plannedLatencyP90Ms! * 1.5))
+    : Infinity;
+  const timeoutMs = Math.min(
+    input.configuredTimeoutMs,
+    input.remainingMs,
+    45_000,
+    predictedDirectDeadline,
+  );
   const nonViableLimitKind: AttemptLimitKind | undefined =
     maxSteps < viableCalls ? "step_limit" :
       tokenCapacity < minimumViableTokens ? "token_limit" :

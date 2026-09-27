@@ -42,6 +42,23 @@ export function isRouteEndpointIncompatibility(error: unknown) {
     error instanceof OpenAI.APIError && [400, 404].includes(error.status ?? 0)
   );
 }
+/** Provider reasoning depth follows semantic work, not consequence vocabulary. */
+export function implementationReasoningEffort(route: any, fingerprint: any):
+  "low" | "medium" | "high" {
+  const semantic = fingerprint?.semanticComplexity ??
+    fingerprint?.difficulty?.technicalComplexity ?? "medium";
+  const coupling = fingerprint?.architecturalCoupling ??
+    fingerprint?.difficulty?.architecturalComplexity ?? "medium";
+  const localization = fingerprint?.localizationUncertainty ??
+    fingerprint?.difficulty?.contextUncertainty ?? "medium";
+  if (route?.verification_strength === "weak" || semantic === "high" ||
+      coupling === "high" || localization === "high" ||
+      fingerprint?.architectureHeavy || fingerprint?.crossComponent)
+    return "high";
+  if (route?.verification_strength === "strong" && semantic === "low" &&
+      coupling === "low" && localization === "low") return "low";
+  return "medium";
+}
 export class Gateway {
   private sdk: OpenAI;
   private readonly phaseSpent = { discovery: 0, planning: 0 };
@@ -144,15 +161,8 @@ export class Gateway {
       max_price: { prompt: promptPrice, completion: completionPrice },
     };
     const openrouter = (this.config.modelPool?.provider ?? "openrouter") === "openrouter";
-    const role = this.logger.events.findLast((event) =>
-      event.type === "route" && event.subtaskId === subtaskId)?.role;
     const reasoningEffort = metadata?.supportedParameters?.includes("reasoning") && stage === "implement"
-      ? role === "FRONTIER_MODEL" || route?.task_risk === "high" ||
-          fingerprint?.difficulty?.changeRisk === "high" ||
-          route?.verification_strength === "weak"
-        ? "high"
-        : (route?.verification_strength === "strong" && route?.task_risk === "low")
-          ? "low" : "medium"
+      ? implementationReasoningEffort(route, fingerprint)
       : undefined;
     const sessionId = `${this.logger.runId}/${subtaskId}`;
     this.logger.log("provider_policy", { subtaskId, stage, model,
