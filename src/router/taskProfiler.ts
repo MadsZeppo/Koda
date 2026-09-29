@@ -4,6 +4,20 @@ import type { RepoProfile } from "../types.js";
 import type { ExecutionStrategy } from "./executionStrategy.js";
 
 export type ProfileConfidence = "high" | "medium" | "low";
+
+export interface SemanticTaskAssessment {
+  semanticDifficulty: "easy" | "normal" | "hard" | "frontier";
+  repoReasoning: "low" | "medium" | "high";
+  localizationDifficulty: "low" | "medium" | "high";
+  verificationStrength: "strong" | "medium" | "weak";
+  consequenceRisk: "low" | "medium" | "high";
+  expectedChangeSize: "single-file" | "few-files" | "multi-component";
+  startingTier: "cheap" | "strong" | "frontier";
+  frontierJustified: boolean;
+  confidence: number;
+  reason: string;
+}
+
 export interface DeterministicTaskProfile {
   profileVersion: 1;
   /** Stable routing region derived from repository facts, not prompt prose. */
@@ -28,6 +42,8 @@ export interface DeterministicTaskProfile {
   scopeConfidence: ProfileConfidence;
   decompositionConfidence: ProfileConfidence;
   evidence: string[];
+  /** Optional LLM semantic judgment. Repository facts above remain authoritative. */
+  semanticAssessment?: SemanticTaskAssessment;
 }
 
 export interface RoutingScoutResult {

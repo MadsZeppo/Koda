@@ -84,6 +84,7 @@ import {
   profileTask,
   type DeterministicTaskProfile,
 } from "./router/taskProfiler.js";
+import { interpretTask } from "./router/taskInterpreter.js";
 export interface RunOptions {
   repo: string;
   /** Calibration may freeze source separately while reusing original installed dependencies. */
@@ -317,6 +318,17 @@ export async function run(options: RunOptions) {
       checks: canonicalVerification.checks,
       elapsed_ms: Date.now() - routingBaselineStarted,
     });
+    const semanticAssessment = await interpretTask(
+      gateway,
+      options.task,
+      profile,
+      canonicalTaskProfile,
+      canonicalVerification,
+    );
+    const interpretedTaskProfile: DeterministicTaskProfile =
+      semanticAssessment
+        ? { ...canonicalTaskProfile, semanticAssessment }
+        : canonicalTaskProfile;
     const routingResume = await buildTaskResume(
       options.task,
       profile,
@@ -482,7 +494,7 @@ export async function run(options: RunOptions) {
           tokens: call ? call.promptTokens + call.completionTokens : 0,
         };
       },
-      canonicalTaskProfile,
+      interpretedTaskProfile,
     );
     const routingResearchCalls = logger.events.filter(
       (event) =>
@@ -771,7 +783,12 @@ export async function run(options: RunOptions) {
               finalVerificationOnly: true,
               evidence: sharedRoutingEvidence,
               canonicalTaskProfile: routingResume.profile,
-              canonicalVerification: preflight.verification,
+              canonicalVerification:
+                preflight.verification.checks.length
+                  ? preflight.verification
+                  : requestsTestMutation(options.task)
+                    ? preflight.verification
+                    : canonicalVerification,
               executionPlan: preselectedExecutionPlan,
             },
           );

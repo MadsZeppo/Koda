@@ -64,6 +64,18 @@ const schema = z.object({
   modelPool: poolSchema.optional(),
   adaptiveCoding: z.boolean().default(false),
   specialistRouting: z.boolean().default(false),
+  semanticRouter: z.object({
+    enabled: z.boolean().default(false),
+    model: z.string().min(1).default("typesafe/jev-1.13"),
+    // Retained for backwards-compatible config parsing. Decisions models do
+    // not generate prose, so this is not used by the Jev path.
+    maxOutputTokens: z.number().int().min(64).max(1024).default(320),
+    timeoutMs: z.number().int().positive().max(30000).default(8000),
+    maxCostUsd: z.number().positive().max(0.01).default(0.001),
+    // Frontier is exceptional. Jev must assign at least this probability to
+    // explicit frontier justification before a frontier starting tier is kept.
+    frontierThreshold: z.number().min(0.5).max(0.999).default(0.9),
+  }).default({}),
   modelsFile: z.string().optional(),
   routing: routingSchema,
   forceModel: z.string().optional(),

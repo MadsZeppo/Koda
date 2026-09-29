@@ -1,0 +1,10 @@
+{
+  "semanticRouter": {
+    "enabled": true,
+    "model": "typesafe/jev-1.13",
+    "maxOutputTokens": 320,
+    "timeoutMs": 8000,
+    "maxCostUsd": 0.001,
+    "frontierThreshold": 0.9
+  }
+}

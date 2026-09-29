@@ -759,7 +759,12 @@ export function optimizeSpecialists(
   // Quality parity is relative to the strongest candidate that can actually
   // execute under the same hard constraints as the selected plan.
   const reference = eligible
-    .filter((candidate) => !excludedInitial.has(candidate.model.id))
+    .filter(
+      (candidate) =>
+        !excludedInitial.has(candidate.model.id) &&
+        (fp.frontierJustified !== false ||
+          candidate.model.tier !== "frontier"),
+    )
     .sort(
       (a, b) =>
         b.conservativeQuality - a.conservativeQuality ||
@@ -1008,6 +1013,9 @@ export function optimizeSpecialists(
       ? "no technically compatible priced reference"
       : excludedInitial.has(initial.model.id)
         ? "already reserved for race"
+        : fp.frontierJustified === false &&
+            initial.model.tier === "frontier"
+          ? "frontier first attempt requires semantic justification"
         : // Historical attempt cost predicts retries; it cannot veto an affordable
           // first call. Rescue credit still requires funds for both reservations.
           initial.reservationCost +

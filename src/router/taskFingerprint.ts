@@ -62,6 +62,30 @@ export function preserveCanonicalTaskEvidence(
   const groundedHighConsequence =
     fingerprint.publicApiRisk || fingerprint.schemaRisk ||
     fingerprint.architectureHeavy || evidence?.securitySensitive === true;
+  const semantic = evidence?.semanticAssessment;
+  const semanticComplexity: Difficulty = semantic
+    ? semantic.semanticDifficulty === "easy"
+      ? "low"
+      : semantic.semanticDifficulty === "normal"
+        ? "medium"
+        : "high"
+    : (fingerprint.semanticComplexity ??
+      fingerprint.difficulty.technicalComplexity);
+  const semanticStrongVerification =
+    semantic?.verificationStrength === "strong" &&
+    observedFailures > 0 &&
+    !crossComponent &&
+    semantic.expectedChangeSize !== "multi-component";
+  const deterministicFrontierJustification =
+    semanticComplexity === "high" &&
+    verificationStrength === "weak" &&
+    (fingerprint.architectureHeavy ||
+      crossComponent ||
+      fingerprint.publicApiRisk ||
+      fingerprint.schemaRisk);
+  const frontierJustified = semantic
+    ? semantic.frontierJustified || deterministicFrontierJustification
+    : fingerprint.frontierJustified;
   return {
     ...fingerprint,
     verificationStrength,
@@ -72,12 +96,36 @@ export function preserveCanonicalTaskEvidence(
       fingerprint.architectureHeavy || evidence?.architectureRisk === true,
     crossComponent,
     localizationConfidence,
+    semanticComplexity,
+    startingModelTier:
+      semantic?.startingTier ?? fingerprint.startingModelTier,
+    frontierJustified,
+    semanticAssessmentConfidence:
+      semantic?.confidence ?? fingerprint.semanticAssessmentConfidence,
+    difficulty: {
+      ...fingerprint.difficulty,
+      technicalComplexity: semanticComplexity,
+      repoReasoningComplexity:
+        semantic?.repoReasoning ??
+        fingerprint.difficulty.repoReasoningComplexity,
+      contextUncertainty:
+        semantic?.localizationDifficulty ??
+        fingerprint.difficulty.contextUncertainty,
+      changeRisk:
+        groundedHighConsequence
+          ? fingerprint.difficulty.changeRisk
+          : (semantic?.consequenceRisk ??
+            fingerprint.difficulty.changeRisk),
+    },
     localizationUncertainty:
-      localizationConfidence === "high"
+      semantic?.localizationDifficulty ??
+      (localizationConfidence === "high"
         ? "low"
         : localizationConfidence === "medium"
           ? "medium"
-          : "high",
+          : "high"),
+    toolExplorationNeed:
+      semantic?.repoReasoning ?? fingerprint.toolExplorationNeed,
     targetedExecutableVerification:
       fingerprint.targetedExecutableVerification ||
       observedFailures > 0 ||
@@ -92,11 +140,15 @@ export function preserveCanonicalTaskEvidence(
       observedFailures,
     ),
     consequenceRisk:
-      boundedReproduction && !groundedHighConsequence
-        ? "low"
-        : fingerprint.consequenceRisk,
+      groundedHighConsequence
+        ? fingerprint.consequenceRisk
+        : boundedReproduction
+          ? "low"
+          : (semantic?.consequenceRisk ?? fingerprint.consequenceRisk),
     verifierFalseAcceptRisk:
-      boundedReproduction ? "low" : fingerprint.verifierFalseAcceptRisk,
+      boundedReproduction || semanticStrongVerification
+        ? "low"
+        : fingerprint.verifierFalseAcceptRisk,
     recoveryDetectability:
       fingerprint.recoveryDetectability === "high" ||
       verificationStrength === "strong"
@@ -115,6 +167,9 @@ export function preserveCanonicalTaskEvidence(
       observedExecutable
         ? `canonical baseline verification preserved (${observedFailures} failing checks)`
         : "canonical preflight task evidence preserved across execution engines",
+      ...(semantic
+        ? [`semantic router: ${semantic.startingTier} (${semantic.reason})`]
+        : []),
     ],
   };
 }
@@ -152,6 +207,11 @@ export interface TaskFingerprint {
   repoComplexity?: Features["repoSizeBucket"];
   contextRequirementTokens?: number;
   observedCheckFailures?: number;
+  /** Semantic router recommendation; concrete model selection remains deterministic. */
+  startingModelTier?: "cheap" | "strong" | "frontier";
+  /** Frontier may start only when explicitly justified by semantic or hard-risk evidence. */
+  frontierJustified?: boolean;
+  semanticAssessmentConfidence?: number;
   /** Semantic work required to produce the patch; consequence is separate. */
   semanticComplexity?: Difficulty;
   /** Uncertainty about where the change belongs, derived from inspected scope. */
