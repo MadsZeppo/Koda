@@ -1186,8 +1186,9 @@ test("stable mode locks scope, preserves work across transient fallback, and ver
     const firstCodingStart = events.findIndex((event) => event.type === "coding_worker_start");
     assert.equal(events.slice(0, firstCodingStart).some((event) =>
       (event.type === "verification" || event.type === "final_verification") &&
-      /(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:build|test)\b/.test(event.command ?? "")), false,
-    "ambiguous Stable does not run broad repository verification before mutation");
+      event.subtaskId === "routing-preflight" &&
+      /(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:build|test)\b/.test(event.command ?? "")), true,
+    "routing observes one bounded repository check before selecting the model and engine");
 
     assert.equal(codingStarts.length, 2);
     assert.equal(codingStops.length, 2);

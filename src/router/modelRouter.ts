@@ -13,6 +13,7 @@ import {
 } from "./capabilityRegistry.js";
 import {
   optimizeSpecialists,
+  type ExecutionPlanEstimate,
   type SpecialistEstimate,
 } from "./routeOptimizer.js";
 import type { TaskFingerprint } from "./taskFingerprint.js";
@@ -45,6 +46,11 @@ export interface FrozenExecutionPlan extends FrozenExecutionPolicy<SpecialistEst
   readonly expectedLatencyP50Ms?: number;
   readonly expectedLatencyP90Ms?: number;
   readonly expectedTotalCostUsd?: number;
+  readonly optimizerScore?: number;
+  readonly allowedQualityRegret?: number;
+  readonly discoveredModelCount?: number;
+  readonly evaluatedCandidates?: readonly SpecialistEstimate[];
+  readonly evaluatedPlans?: readonly ExecutionPlanEstimate[];
   readonly whySelected: string;
   readonly verificationStrength: TaskFingerprint["verificationStrength"];
   readonly stopConditions: readonly string[];
@@ -123,11 +129,10 @@ export function rankCandidates(
         : (inputTokens * md.inputPrice + outputTokens * md.outputPrice) / 1e6;
     const plannerUnsupported =
       features.taskKind === "planning" &&
-      (protocolKnown
-        ? !["structured_outputs", "response_format"].some((parameter) =>
-            supportsParameters(md, [parameter]),
-          )
-        : !model.strengths.includes("structured_output"));
+      protocolKnown &&
+      !["structured_outputs", "response_format"].some((parameter) =>
+        supportsParameters(md, [parameter]),
+      );
     const rejected = plannerUnsupported
       ? "structured planning unsupported"
       : !model.enabled
@@ -139,14 +144,13 @@ export function rankCandidates(
             : md.contextLength && inputTokens + outputTokens > md.contextLength
               ? "context limit"
               : features.taskKind !== "planning" &&
-                  (protocolKnown
-                    ? !supportsParameters(
-                        md,
-                        features.executionStrategy === "stable"
-                          ? ["tools", "tool_choice"]
-                          : ["tools"],
-                      )
-                    : !model.strengths.includes("tool_use"))
+                  protocolKnown &&
+                  !supportsParameters(
+                    md,
+                    features.executionStrategy === "stable"
+                      ? ["tools", "tool_choice"]
+                      : ["tools"],
+                  )
                 ? "tools unsupported"
                 : cost > (limits.budgetUsd ?? Infinity)
                   ? "remaining budget"
@@ -214,6 +218,154 @@ export class PoolRouter {
       adapter,
       dir,
     );
+  }
+  async freezeRunSnapshot() {
+    await this.capabilities.freezeRunSnapshot();
+  }
+  async selectJointExecutionPlan(
+    variants: ReadonlyArray<{
+      executionStrategy: TaskFingerprint["executionStrategy"];
+      fingerprint: TaskFingerprint;
+      features: Features;
+      prerequisiteCostUsd?: number;
+      prerequisiteLatencyMs?: number;
+    }>,
+    subtaskId: string,
+    budgetUsd: number,
+  ) {
+    const evaluated = [] as Array<{
+      executionStrategy: TaskFingerprint["executionStrategy"];
+      plan: FrozenExecutionPlan;
+    }>;
+    for (const variant of variants) {
+      const plan = await this.selectExecutionPlan(
+        variant.fingerprint,
+        variant.features,
+        `${subtaskId}:${variant.executionStrategy}`,
+        budgetUsd,
+      );
+      const prerequisiteCost = variant.prerequisiteCostUsd ?? 0;
+      const prerequisiteLatency = variant.prerequisiteLatencyMs ?? 0;
+      const conservativeQuality = Math.max(0.05, plan.conservativeQuality);
+      const adjusted = prerequisiteCost || prerequisiteLatency
+        ? Object.freeze({
+            ...plan,
+            expectedTotalCostUsd:
+              (plan.expectedTotalCostUsd ?? 0) + prerequisiteCost,
+            expectedCostPerVerifiedSolve:
+              ((plan.expectedTotalCostUsd ?? 0) + prerequisiteCost) /
+              conservativeQuality,
+            expectedLatencyMs: plan.expectedLatencyMs + prerequisiteLatency,
+            expectedLatencyP50Ms:
+              (plan.expectedLatencyP50Ms ?? plan.expectedLatencyMs) +
+              prerequisiteLatency,
+            expectedLatencyP90Ms:
+              (plan.expectedLatencyP90Ms ?? plan.expectedLatencyMs) +
+              prerequisiteLatency,
+            optimizerScore:
+              (plan.optimizerScore ?? 0) +
+              prerequisiteCost / conservativeQuality +
+              (this.config.routing.latencyWeight * prerequisiteLatency /
+                conservativeQuality / 1000) * 0.00005,
+            whySelected:
+              `${plan.whySelected}; includes executable planning prerequisite`,
+          })
+        : plan;
+      evaluated.push({ executionStrategy: variant.executionStrategy, plan: adjusted });
+    }
+    const reference = Math.max(...evaluated.flatMap(({ plan }) =>
+      (plan.evaluatedPlans ?? [])
+        .filter((candidate) => !candidate.hardRejection)
+        .map((candidate) => candidate.conservativeFinalSuccess)));
+    const safe = evaluated.filter(({ plan }) =>
+      reference - plan.conservativeQuality <= (plan.allowedQualityRegret ?? 0) + 1e-9);
+    const selected = safe.sort((a, b) =>
+      (a.plan.optimizerScore ?? Infinity) - (b.plan.optimizerScore ?? Infinity) ||
+      (a.plan.expectedLatencyP90Ms ?? a.plan.expectedLatencyMs) -
+        (b.plan.expectedLatencyP90Ms ?? b.plan.expectedLatencyMs) ||
+      a.plan.initialModel.localeCompare(b.plan.initialModel))[0];
+    if (!selected) throw Error("No quality-safe model + execution strategy plan");
+    const selectedCandidate = selected.plan.evaluatedCandidates?.find((candidate) =>
+      candidate.model.id === selected.plan.initialModel);
+    const planRows = evaluated.flatMap(({ executionStrategy, plan }) =>
+      (plan.evaluatedPlans ?? []).map((candidatePlan) => ({
+        execution_engine: executionStrategy,
+        model: candidatePlan.models[0] ?? null,
+        models: candidatePlan.models,
+        expected_quality: candidatePlan.expectedFinalSuccess,
+        conservative_quality: candidatePlan.conservativeFinalSuccess,
+        uncertainty: plan.evaluatedCandidates?.find((candidate) =>
+          candidate.model.id === candidatePlan.models[0])?.uncertainty ?? null,
+        quality_safe:
+          candidatePlan.eligible &&
+          reference - candidatePlan.conservativeFinalSuccess <=
+            (plan.allowedQualityRegret ?? 0) + 1e-9,
+        expected_total_cost_usd: candidatePlan.expectedCompletionCost,
+        expected_latency_p50_ms: candidatePlan.completionLatencyP50Ms,
+        expected_latency_p90_ms: candidatePlan.completionLatencyP90Ms,
+        rejection_reason: candidatePlan.hardRejection ??
+          (!candidatePlan.eligible ? candidatePlan.reason :
+            reference - candidatePlan.conservativeFinalSuccess >
+              (plan.allowedQualityRegret ?? 0) + 1e-9
+              ? "QUALITY_REJECTED"
+              : null),
+      })),
+    );
+    const plannedModels = new Set(planRows.flatMap((row) => row.models));
+    const rejectedRows = evaluated.flatMap(({ executionStrategy, plan }) =>
+      (plan.evaluatedCandidates ?? [])
+        .filter((candidate) => !plannedModels.has(candidate.model.id) || candidate.hardRejection)
+        .map((candidate) => ({
+          execution_engine: executionStrategy,
+          model: candidate.model.id,
+          models: [candidate.model.id],
+          expected_quality: candidate.quality,
+          conservative_quality: candidate.conservativeQuality,
+          uncertainty: candidate.uncertainty,
+          quality_safe: false,
+          expected_total_cost_usd: candidate.expectedAttemptCost,
+          expected_latency_p50_ms: candidate.latencyP50Ms,
+          expected_latency_p90_ms: candidate.latencyP90Ms,
+          rejection_reason: candidate.hardRejection ?? candidate.rejected ??
+            "NO_EXECUTABLE_PLAN",
+        })),
+    );
+    const diagnostics = [...planRows, ...rejectedRows];
+    this.logger.log("joint_execution_route", {
+      subtaskId,
+      total_discovered_models: new Set(evaluated.flatMap(({ plan }) =>
+        (plan.evaluatedCandidates ?? []).map((candidate) => candidate.model.id))).size,
+      total_compatible_models: new Set(evaluated.flatMap(({ plan }) =>
+        (plan.evaluatedCandidates ?? [])
+          .filter((candidate) => !candidate.hardRejection)
+          .map((candidate) => candidate.model.id))).size,
+      total_generated_model_engine_plans: planRows.length,
+      quality_safe_plan_count: diagnostics.filter((row) => row.quality_safe).length,
+      selected_engine: selected.executionStrategy,
+      selected_model: selected.plan.initialModel,
+      selected_plan: {
+        execution_engine: selected.executionStrategy,
+        models: selected.plan.qualityCascadeModelIds,
+        expected_quality: selectedCandidate?.quality ?? null,
+        conservative_quality: selected.plan.conservativeQuality,
+        uncertainty: selectedCandidate?.uncertainty ?? null,
+        expected_total_cost_usd: selected.plan.expectedTotalCostUsd,
+        expected_latency_p50_ms: selected.plan.expectedLatencyP50Ms,
+        expected_latency_p90_ms: selected.plan.expectedLatencyP90Ms,
+      },
+      ordered_frozen_recovery_plans: safe
+        .filter((entry) => entry !== selected)
+        .map((entry) => ({
+          execution_engine: entry.executionStrategy,
+          models: entry.plan.qualityCascadeModelIds,
+          expected_total_cost_usd: entry.plan.expectedTotalCostUsd,
+          expected_latency_p50_ms: entry.plan.expectedLatencyP50Ms,
+          expected_latency_p90_ms: entry.plan.expectedLatencyP90Ms,
+          conservative_quality: entry.plan.conservativeQuality,
+        })),
+      plans: diagnostics,
+    });
+    return selected;
   }
   async selectExecutionPlan(
     fingerprint: TaskFingerprint,
@@ -293,7 +445,8 @@ export class PoolRouter {
           quality_floor_passed: candidate.qualityFloorPassed,
           expected_attempt_cost: candidate.expectedAttemptCost,
           reservation_cost: candidate.reservationCost,
-          expected_latency_ms: candidate.expectedAttemptLatencyMs,
+          expected_latency_ms: candidate.latencyEvidenceKnown
+            ? candidate.expectedAttemptLatencyMs : null,
           latency_p90_ms: candidate.latencyP90Ms,
           deadline_feasible: candidate.deadlineFeasible,
           evidence_level: candidate.evidenceLevel,
@@ -306,7 +459,8 @@ export class PoolRouter {
           hard_rejection: plan.hardRejection ?? null,
           quality_gap: plan.qualityGap,
           expected_cost: plan.expectedCompletionCost,
-          expected_latency_ms: plan.expectedCompletionLatencyMs,
+          expected_latency_ms: plan.latencyEvidenceKnown
+            ? plan.expectedCompletionLatencyMs : null,
           conservative_final_success: plan.conservativeFinalSuccess,
         })),
       };
@@ -333,32 +487,41 @@ export class PoolRouter {
     // bounded, quality-safe alternative first leg for provider/protocol
     // failure. Its own optimizer-approved cascade preserves the same final
     // quality floor; it is never eligible for coding-quality de-escalation.
-    const qualityCandidates = cascade.filter(
-      (candidate) => !candidate.hardRejection,
-    );
-    const qualityIds = new Set(
-      qualityCandidates.map((candidate) => candidate.model.id),
-    );
-    const operationalRecovery = result.considered
-      .filter((candidate) =>
-        !qualityIds.has(candidate.model.id) &&
-        !candidate.rejected &&
-        !candidate.hardRejection &&
-        candidate.qualityFloorPassed &&
-        candidate.deadlineFeasible,
-      )
-      .sort((a, b) =>
-        a.score - b.score ||
-        a.operationalErrorRate - b.operationalErrorRate ||
-        a.expectedAttemptLatencyMs - b.expectedAttemptLatencyMs ||
-        a.expectedAttemptCost - b.expectedAttemptCost ||
-        a.model.id.localeCompare(b.model.id),
-      )
-      .slice(0, 1);
-    const approvedCandidateSet = [
+    const selectedOptimizerPlan = result.selectedPlan;
+    const qualitySafePlans = result.plans
+      .filter((candidate) => candidate.eligible && !candidate.hardRejection)
+      .sort((a, b) => a.score - b.score ||
+        (a.completionLatencyP90Ms ?? a.expectedCompletionLatencyMs) -
+          (b.completionLatencyP90Ms ?? b.expectedCompletionLatencyMs) ||
+        a.models.join("\0").localeCompare(b.models.join("\0")));
+    const byModel = new Map(result.considered.map((candidate) =>
+      [candidate.model.id, candidate] as const));
+    const safeModelIds = new Set(qualitySafePlans.flatMap((candidate) =>
+      candidate.models));
+    const qualityCandidates = [...new Map([
+      ...cascade.map((candidate) => [candidate.model.id, candidate] as const),
+      ...result.considered
+        .filter((candidate) => safeModelIds.has(candidate.model.id) &&
+          !candidate.hardRejection && !candidate.rejected &&
+          candidate.conservativeQuality + 1e-9 >= cascade[0]!.conservativeQuality)
+        .sort((a, b) => a.conservativeQuality - b.conservativeQuality ||
+          a.expectedAttemptCost - b.expectedAttemptCost)
+        .map((candidate) => [candidate.model.id, candidate] as const),
+    ]).values()];
+    const orderedRecoveryModelIds = [...new Set(qualitySafePlans
+      .filter((candidate) => candidate !== selectedOptimizerPlan)
+      .map((candidate) => candidate.models[0])
+      .filter((id): id is string => !!id && id !== cascade[0]!.model.id))];
+    const operationalRecovery = orderedRecoveryModelIds
+      .map((id) => byModel.get(id))
+      .filter((candidate): candidate is SpecialistEstimate =>
+        !!candidate && !candidate.hardRejection && !candidate.rejected &&
+        candidate.deadlineFeasible)
+      .slice(0, Math.max(0, Math.min(2, this.config.maxIterations - 1)));
+    const approvedCandidateSet = [...new Map([
       ...qualityCandidates,
       ...operationalRecovery,
-    ];
+    ].map((candidate) => [candidate.model.id, candidate] as const)).values()];
     const planId = `route-${createHash("sha256")
       .update(
         JSON.stringify({
@@ -392,6 +555,9 @@ export class PoolRouter {
       operationalRecoveryModelIds: operationalRecovery.map(
         (candidate) => candidate.model.id,
       ),
+      orderedRecoveryModelIds: operationalRecovery.map(
+        (candidate) => candidate.model.id,
+      ),
       activeBoard: board.board,
       referenceModel: result.reference.model.id,
       initialModel: cascade[0]!.model.id,
@@ -410,9 +576,16 @@ export class PoolRouter {
       expectedLatencyMs:
         result.selectedPlan?.expectedCompletionLatencyMs ??
         cascade[0]!.expectedCompletionLatencyMs,
-      expectedLatencyP50Ms: result.selectedPlan?.completionLatencyP50Ms,
-      expectedLatencyP90Ms: result.selectedPlan?.completionLatencyP90Ms,
+      expectedLatencyP50Ms:
+        result.selectedPlan?.completionLatencyP50Ms ?? undefined,
+      expectedLatencyP90Ms:
+        result.selectedPlan?.completionLatencyP90Ms ?? undefined,
       expectedTotalCostUsd: result.selectedPlan?.expectedCompletionCost,
+      optimizerScore: result.selectedPlan?.score,
+      allowedQualityRegret: result.allowedRegret,
+      discoveredModelCount: result.considered.length,
+      evaluatedCandidates: result.considered,
+      evaluatedPlans: result.plans,
       whySelected: result.selectedPlan?.reason ?? result.reason,
       totalBudgetUsd: budgetUsd,
       latencyBudgetMs: this.config.stageMaxMinutes * 60_000,
@@ -457,6 +630,17 @@ export class PoolRouter {
       approved_recovery_candidates: approvedCandidateSet
         .slice(1)
         .map((candidate) => candidate.model.id),
+      ordered_frozen_recovery_plans: qualitySafePlans
+        .filter((candidate) => candidate !== selectedOptimizerPlan)
+        .slice(0, Math.max(0, plan.maxCodingAttempts - 1))
+        .map((candidate) => ({
+          models: candidate.models,
+          expected_final_success: candidate.expectedFinalSuccess,
+          conservative_final_success: candidate.conservativeFinalSuccess,
+          expected_total_cost_usd: candidate.expectedCompletionCost,
+          latency_p50_ms: candidate.completionLatencyP50Ms,
+          latency_p90_ms: candidate.completionLatencyP90Ms,
+        })),
       quality_recovery_candidates: qualityCandidates
         .slice(1)
         .map((candidate) => candidate.model.id),
@@ -483,7 +667,8 @@ export class PoolRouter {
       reference_expected_cost_usd:
         result.referencePlan?.expectedCompletionCost ?? null,
       reference_expected_latency_ms:
-        result.referencePlan?.expectedCompletionLatencyMs ?? null,
+        result.referencePlan?.latencyEvidenceKnown
+          ? result.referencePlan.expectedCompletionLatencyMs : null,
       selected_model: cascade[0]?.model.id ?? null,
       selected_plan: result.selectedPlan ?? null,
       expected_standalone_success: result.selectedPlan
@@ -509,7 +694,8 @@ export class PoolRouter {
       risk_adjusted_cost_per_verified_solve:
         result.selectedPlan?.riskAdjustedCostPerVerifiedCompletion ?? null,
       expected_completion_latency_ms:
-        result.selectedPlan?.expectedCompletionLatencyMs ?? null,
+        result.selectedPlan?.latencyEvidenceKnown
+          ? result.selectedPlan.expectedCompletionLatencyMs : null,
       expected_completion_latency_p50_ms:
         result.selectedPlan?.completionLatencyP50Ms ?? null,
       expected_completion_latency_p90_ms:
@@ -576,9 +762,8 @@ export class PoolRouter {
         )
           ? candidate.expectedCompletionCost
           : null,
-        expected_completion_latency_ms: Number.isFinite(
-          candidate.expectedCompletionLatencyMs,
-        )
+        expected_completion_latency_ms: candidate.latencyEvidenceKnown &&
+          Number.isFinite(candidate.expectedCompletionLatencyMs)
           ? candidate.expectedCompletionLatencyMs
           : null,
         expected_input_tokens: candidate.expectedInputTokens,
@@ -597,9 +782,10 @@ export class PoolRouter {
         evidence_level: candidate.evidenceLevel,
         observation_count: candidate.observationCount,
         evidence_freshness: candidate.evidenceFreshness,
-        latency_ms: candidate.latency,
+        latency_ms: candidate.latencyEvidenceKnown ? candidate.latency : null,
         call_count: candidate.callCount,
-        latency_ewma_ms: candidate.latencyEwmaMs,
+        latency_ewma_ms: candidate.latencyEvidenceKnown
+          ? candidate.latencyEwmaMs : null,
         latency_p99_ms: candidate.latencyP99Ms,
         latency_p50_ms: candidate.latencyP50Ms,
         latency_p90_ms: candidate.latencyP90Ms,

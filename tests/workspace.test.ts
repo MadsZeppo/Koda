@@ -1224,14 +1224,16 @@ test("localized README dogfood task is DIRECT and makes zero planner calls", asy
       result.verification.checks.map((check: any) => check.command),
       ["pnpm run lint", "internal:tiny-documentation-structure"],
     );
-    assert.equal(result.verificationCalls, 1);
+    assert.equal(result.verificationCalls, 2,
+      "one bounded routing preflight plus final verification");
     const events = (await readFile(join(f.output, "events.jsonl"), "utf8"))
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line));
     assert.equal(
-      events.filter((event) => event.type === "verification").length,
-      0,
+      events.filter((event) => event.type === "verification" &&
+        event.subtaskId === "routing-preflight").length,
+      1,
     );
     assert.ok(
       events.findIndex((event) => event.type === "final_verification") >
@@ -1242,6 +1244,7 @@ test("localized README dogfood task is DIRECT and makes zero planner calls", asy
         (event) =>
           (event.type === "verification" ||
             event.type === "final_verification") &&
+          event.subtaskId !== "routing-preflight" &&
           /(?:test|typecheck)/.test(event.command ?? ""),
       ),
     );
@@ -1274,7 +1277,8 @@ test("localized README dogfood task is DIRECT and makes zero planner calls", asy
       quiet: true,
     });
     assert.equal(noDocumentCheck.status, "VERIFIED_SUCCESS");
-    assert.equal(noDocumentCheck.verificationCalls, 1);
+    assert.equal(noDocumentCheck.verificationCalls, 2,
+      "one bounded routing preflight plus final documentation verification");
     assert.equal(noDocumentCheck.coderModelCalls, 1);
     assert.deepEqual(noDocumentCheck.changedFiles, ["README.md"]);
     assert.equal(
@@ -1400,7 +1404,8 @@ test("large README TINY request uses a bounded edit_file window and preserves su
     assert.equal(result.status, "VERIFIED_SUCCESS", JSON.stringify(result));
     assert.equal(result.coderModelCalls, 1);
     assert.equal(result.escalations, 0);
-    assert.equal(result.verificationCalls, 1);
+    assert.equal(result.verificationCalls, 2,
+      "one bounded routing preflight plus final verification");
     assert.equal(requests.length, 1);
     assert.ok(
       requests[0].tools.some((tool: any) => tool.function.name === "edit_file"),

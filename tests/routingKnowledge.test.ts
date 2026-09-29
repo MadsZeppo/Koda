@@ -44,7 +44,7 @@ const model = (id: string, price: number, qualityPrior = .95,
   observations: RoutingKnowledgeObservation[] = []): SpecialistModel => ({
   model: modelSchema.parse({ id, tier: "fast", qualityPrior, latencyPriorMs: 1000, strengths: ["coding", "tool_use", "debugging"] }),
   metadata: { available: true, inputPrice: price, outputPrice: price, contextLength: 20_000_000,
-    supportedParameters: ["tools"] }, configured: true, vision: false, evidence: [],
+    supportedParameters: ["tools", "tool_choice"] }, configured: true, vision: false, evidence: [],
   knowledge: knowledge(id, observations),
 });
 const route = (models: SpecialistModel[], maxOutputTokens = 4096, operations: OperationalCall[] = []) =>

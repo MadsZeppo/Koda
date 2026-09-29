@@ -262,7 +262,7 @@ const introducedFailure = (
 export function verificationRegressed(
   baseline: VerificationResult,
   after: VerificationResult,
-  candidateChangedPaths: readonly string[] = [],
+  candidateChangedPaths?: readonly string[],
 ) {
   return (
     verificationRegressions(baseline, after, candidateChangedPaths).length > 0
@@ -289,7 +289,7 @@ export function advisoryInfrastructureOnly(result: VerificationResult) {
 export function verificationRegressions(
   baseline: VerificationResult,
   after: VerificationResult,
-  candidateChangedPaths: readonly string[] = [],
+  candidateChangedPaths?: readonly string[],
 ) {
   return after.checks.filter((check) => {
     // Infrastructure attribution is authoritative even when a legacy caller
@@ -304,10 +304,22 @@ export function verificationRegressions(
       previous?.outcome === "CHECK_UNAVAILABLE"
     )
       return false;
+    // With no candidate diff, the candidate cannot have changed an existing
+    // failure. Stable test identities still guard against a newly appearing
+    // baseline command failure while ignoring volatile assertion details.
+    if (previous?.outcome === "CHECK_FAIL" &&
+        candidateChangedPaths !== undefined && candidateChangedPaths.length === 0) {
+      const before = verificationFailureIdentities(previous);
+      const after = verificationFailureIdentities(check);
+      if (before.length && after.length) {
+        const known = new Set(before);
+        return after.some((identity) => !known.has(identity));
+      }
+    }
     return (
       !previous ||
       previous.outcome !== "CHECK_FAIL" ||
-      introducedFailure(previous, check, candidateChangedPaths)
+      introducedFailure(previous, check, candidateChangedPaths ?? [])
     );
   });
 }
@@ -316,7 +328,7 @@ export function verificationRegressions(
 export function verificationAgainstBaseline(
   baseline: VerificationResult,
   after: VerificationResult,
-  candidateChangedPaths: readonly string[] = [],
+  candidateChangedPaths?: readonly string[],
 ) {
   const regressions = new Set(
     verificationRegressions(baseline, after, candidateChangedPaths),
@@ -350,11 +362,7 @@ export function verificationAgainstBaseline(
           outcome: "INFRA_FAILURE" as const,
           stderr: `${check.stderr}\nBaseline verification unavailable: ${previous.unavailable ?? previous.stderr}`,
         };
-      if (
-        !previous ||
-        previous.outcome !== "CHECK_FAIL" ||
-        introducedFailure(previous, check, candidateChangedPaths)
-      )
+      if (!previous || previous.outcome !== "CHECK_FAIL")
         return { ...check };
       return {
         ...check,

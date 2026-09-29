@@ -14,6 +14,55 @@ export interface PlannerCandidate {
   estimatedCallCost: number;
   rejected?: string;
 }
+async function plannerRanking(
+  pool: PoolRouter,
+  features: Features,
+  inputBound: number,
+  remainingBudgetUsd: number,
+  remainingTokens: number,
+) {
+  const catalog = await pool.catalog.get();
+  const discovered = pool.capabilities?.all
+    ? await pool.capabilities.all()
+    : pool.config.modelPool!.models.map((model) => ({
+        model,
+        metadata: catalog.get(model.id) ?? model.fallback ?? {},
+      }));
+  const allowed = pool.config.routing.plannerCandidates;
+  const specialists = discovered.filter((candidate) =>
+    !allowed || allowed.includes(candidate.model.id));
+  return rankPlanners(
+    specialists.map((candidate) => candidate.model),
+    new Map(specialists.map((candidate) =>
+      [candidate.model.id, catalog.get(candidate.model.id) ??
+        candidate.metadata] as const)),
+    pool.history.read(),
+    features.complexity as PlannerComplexity,
+    pool.config.planner,
+    inputBound,
+    Math.min(pool.config.planner.maxOutputTokens, pool.config.maxOutputTokens),
+    remainingBudgetUsd,
+    remainingTokens,
+    pool.history.readOperations?.() ?? [],
+  );
+}
+
+/** Plan-specific prerequisite used before a Planned coding trajectory competes. */
+export async function bestExecutablePlanner(
+  pool: PoolRouter,
+  features: Features,
+  inputBound: number,
+  remainingBudgetUsd: number,
+  remainingTokens: number,
+) {
+  return (await plannerRanking(
+    pool,
+    features,
+    inputBound,
+    remainingBudgetUsd,
+    remainingTokens,
+  )).find((candidate) => !candidate.rejected && !pool.disabled.has(candidate.model.id));
+}
 export function rankPlanners(
   models: PoolModel[],
   metadata: Map<string, Metadata>,
@@ -112,21 +161,12 @@ export async function selectPlanner(
 ) {
   const config = pool.config,
     settings = config.planner;
-  const candidates = rankPlanners(
-    config.modelPool!.models.filter(
-      (m) =>
-        !config.routing.plannerCandidates ||
-        config.routing.plannerCandidates.includes(m.id),
-    ),
-    await pool.catalog.get(),
-    pool.history.read(),
-    features.complexity as PlannerComplexity,
-    settings,
+  const candidates = await plannerRanking(
+    pool,
+    features,
     inputBound,
-    Math.min(settings.maxOutputTokens, config.maxOutputTokens),
     remainingBudgetUsd,
     remainingTokens,
-    pool.history.readOperations?.() ?? [],
   );
   const available = candidates.filter(
     (c) => !excluded.includes(c.model.id) && !pool.disabled.has(c.model.id),

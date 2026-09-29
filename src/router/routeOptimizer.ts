@@ -57,6 +57,7 @@ export interface SpecialistEstimate extends Candidate {
   latencyP50Ms: number | null;
   latencyP90Ms: number | null;
   latencyP99Ms: number | null;
+  latencyEvidenceKnown: boolean;
   latencySlaPassed: boolean;
   deadlineFeasible: boolean;
   operationalErrorRate: number;
@@ -70,9 +71,10 @@ export interface ExecutionPlanEstimate {
   conservativeFinalSuccess: number;
   expectedCompletionCost: number;
   expectedCompletionLatencyMs: number;
-  completionLatencyP50Ms: number;
-  completionLatencyP90Ms: number;
-  completionLatencyP99Ms: number;
+  completionLatencyP50Ms: number | null;
+  completionLatencyP90Ms: number | null;
+  completionLatencyP99Ms: number | null;
+  latencyEvidenceKnown: boolean;
   completionCostP50Usd: number;
   completionCostP90Usd: number;
   completionCostP99Usd: number;
@@ -115,6 +117,44 @@ export interface SpecialistRoute {
   referencePlan?: ExecutionPlanEstimate;
   allowedRegret: number;
   reason: string;
+}
+
+export interface JointExecutionRoute {
+  executionStrategy: TaskFingerprint["executionStrategy"];
+  route: SpecialistRoute;
+  plan: ExecutionPlanEstimate;
+}
+
+/** Compare complete model + engine trajectories under one attainable reference. */
+export function chooseJointExecutionRoute(
+  routes: ReadonlyArray<{
+    executionStrategy: TaskFingerprint["executionStrategy"];
+    route: SpecialistRoute;
+  }>,
+): JointExecutionRoute | undefined {
+  const executable = routes.flatMap(({ executionStrategy, route }) =>
+    route.plans
+      .filter((plan) => !plan.hardRejection)
+      .map((plan) => ({ executionStrategy, route, plan })),
+  );
+  if (!executable.length) return undefined;
+  const referenceQuality = Math.max(
+    ...executable.map((entry) => entry.plan.conservativeFinalSuccess),
+  );
+  const safe = executable.filter(
+    (entry) =>
+      entry.plan.eligible &&
+      referenceQuality - entry.plan.conservativeFinalSuccess <=
+        entry.route.allowedRegret + 1e-9,
+  );
+  return safe.sort(
+    (a, b) =>
+      a.plan.score - b.plan.score ||
+      (a.plan.completionLatencyP90Ms ?? a.plan.expectedCompletionLatencyMs) -
+        (b.plan.completionLatencyP90Ms ?? b.plan.expectedCompletionLatencyMs) ||
+      a.plan.models.join("\0").localeCompare(b.plan.models.join("\0")) ||
+      String(a.executionStrategy).localeCompare(String(b.executionStrategy)),
+  )[0];
 }
 
 const POLICY = {
@@ -367,13 +407,10 @@ export function optimizeSpecialists(
               reservationInput + output > md.contextLength
             ? "context limit"
             : (fp.toolsRequired || fp.executionStrategy === "stable") &&
-                (protocolKnown
-                  ? !supportsParameters(md, ["tools"])
-                  : !model.strengths.includes("tool_use"))
+                protocolKnown && !supportsParameters(md, ["tools"])
               ? "tools unsupported"
-            : (fp.executionStrategy === "stable" ||
-                  (usesDirectEditEngine(fp) &&
-                    md.routableParameterSets !== undefined)) &&
+            : (fp.executionStrategy === "stable" || usesDirectEditEngine(fp)) &&
+                  protocolKnown &&
                   !supportsParameters(md, ["tools", "tool_choice"])
                 ? "tool_choice unsupported"
                 : (fp.executionStrategy === "stable" || usesDirectEditEngine(fp)) &&
@@ -476,20 +513,30 @@ export function optimizeSpecialists(
     );
     let ewma = model.latencyPriorMs;
     for (const call of recent) ewma = 0.25 * call.wallClockMs + 0.75 * ewma;
+    const expectedEngine = usesDirectEditEngine(fp)
+      ? "direct-edit" as const : "mini-swe-agent" as const;
+    const attemptLatencyRows = efficiencyHistory.filter((row) =>
+      (row.modelServed ?? row.modelRequested) === model.id &&
+      observedExecutionEngine(row) === expectedEngine &&
+      (taskBucket(row.features) === taskBucket(features) ||
+        row.fingerprint?.taskFamily === fp.taskFamily));
     const latencyProfile = estimateLatency(
       model.latencyPriorMs,
       item.knowledge,
       fp,
       recent,
+      attemptLatencyRows,
     );
-    const p50 = latencyProfile.p50;
-    const p90 = latencyProfile.p90;
-    const p99 = latencyProfile.p99;
+    const latencyEvidenceKnown = item.latencyKnown !== false ||
+      latencyProfile.evidenceKnown;
+    const p50 = latencyEvidenceKnown ? latencyProfile.p50 : null;
+    const p90 = latencyEvidenceKnown ? latencyProfile.p90 : null;
+    const p99 = latencyEvidenceKnown ? latencyProfile.p99 : null;
     const operationalErrorRate = recent.length
       ? recent.filter((call) => call.outcome === "error").length /
         (recent.length + 4)
       : 0;
-    const latencySlaPassed = p90 <= POLICY.interactiveP90Ms;
+    const latencySlaPassed = p90 === null || p90 <= POLICY.interactiveP90Ms;
     const latency = ewma * (1 + operationalErrorRate);
     // A DIRECT model call cannot be a viable initial plan when Koda already
     // predicts that the request itself will outlive its hard implementation
@@ -503,7 +550,7 @@ export function optimizeSpecialists(
       ? config.codingAttemptTimeoutMs
       : Infinity;
     const requestDeadlineMs = Math.min(implementationTimeout, attemptTimeout);
-    const deadlineFeasible =
+    const deadlineFeasible = !latencyEvidenceKnown ||
       expectedFiniteLatency(latency, p50, p90) <= requestDeadlineMs;
     // Attempts may contain multiple model calls. Learn their token/time totals
     // at current prices; provider errors never enter the quality posterior.
@@ -613,7 +660,8 @@ export function optimizeSpecialists(
       // plan evaluation; uncertainty decides cheap-first versus safe-first.
       rejected,
       hardRejection: rejected,
-      softPenalties: latencySlaPassed ? [] : ["preferred latency exceeded"],
+      softPenalties: !latencyEvidenceKnown ? ["latency unknown"]
+        : latencySlaPassed ? [] : ["preferred latency exceeded"],
       rejection: rejected,
       confidence:
         localQualityEvidence >= 5
@@ -657,6 +705,7 @@ export function optimizeSpecialists(
       latencyP50Ms: p50,
       latencyP90Ms: p90,
       latencyP99Ms: p99,
+      latencyEvidenceKnown,
       latencySlaPassed,
       deadlineFeasible,
       operationalErrorRate,
@@ -890,12 +939,20 @@ export function optimizeSpecialists(
       escalationProbability * (rescue?.expectedAttemptLatencyMs ?? 0);
     const completionTokensExpected = initial.expectedTotalTokens +
       escalationProbability * (rescue?.expectedTotalTokens ?? 0);
-    const completionLatencyP50Ms =
-      initial.latencyP50Ms! +
-      escalationProbability * (rescue?.latencyP50Ms ?? 0);
-    const completionLatencyP90Ms =
-      initial.latencyP90Ms! +
-      escalationProbability * (rescue?.latencyP90Ms ?? 0);
+    const latencyEvidenceKnown = initial.latencyEvidenceKnown &&
+      (!rescue || rescue.latencyEvidenceKnown);
+    const scoredLatencyP50Ms =
+      (initial.latencyP50Ms ?? initial.expectedAttemptLatencyMs) +
+      escalationProbability *
+        (rescue?.latencyP50Ms ?? rescue?.expectedAttemptLatencyMs ?? 0);
+    const scoredLatencyP90Ms =
+      (initial.latencyP90Ms ?? initial.expectedAttemptLatencyMs) +
+      escalationProbability *
+        (rescue?.latencyP90Ms ?? rescue?.expectedAttemptLatencyMs ?? 0);
+    const completionLatencyP50Ms = latencyEvidenceKnown
+      ? scoredLatencyP50Ms : null;
+    const completionLatencyP90Ms = latencyEvidenceKnown
+      ? scoredLatencyP90Ms : null;
     // Mixture tails include recovery whenever its probability crosses the
     // requested quantile. These are trajectory bounds, not first-call price.
     const completionCostP50Usd = initial.p50AttemptCost +
@@ -905,8 +962,12 @@ export function optimizeSpecialists(
         ? rescue.conservativeAttemptCost : 0);
     const completionCostP99Usd = initial.p99AttemptCost +
       (rescue && escalationProbability >= 0.01 ? rescue.p99AttemptCost : 0);
-    const completionLatencyP99Ms = initial.latencyP99Ms! +
-      (rescue && escalationProbability >= 0.01 ? rescue.latencyP99Ms! : 0);
+    const scoredLatencyP99Ms =
+      (initial.latencyP99Ms ?? initial.expectedAttemptLatencyMs) +
+      (rescue && escalationProbability >= 0.01
+        ? rescue.latencyP99Ms ?? rescue.expectedAttemptLatencyMs : 0);
+    const completionLatencyP99Ms = latencyEvidenceKnown
+      ? scoredLatencyP99Ms : null;
     const completionTokensP50 = initial.tokenEfficiency.p50TotalTokens +
       (rescue && escalationProbability >= 0.50
         ? rescue.tokenEfficiency.p50TotalTokens : 0);
@@ -922,8 +983,8 @@ export function optimizeSpecialists(
     const deadlineMs = config.stageMaxMinutes * 60_000;
     const deadlineMissProbability = Math.min(1,
       initial.operationalErrorRate +
-      (completionLatencyP90Ms > deadlineMs ? 0.10 : 0) +
-      (completionLatencyP99Ms > deadlineMs ? 0.01 : 0));
+      (latencyEvidenceKnown && scoredLatencyP90Ms > deadlineMs ? 0.10 : 0) +
+      (latencyEvidenceKnown && scoredLatencyP99Ms > deadlineMs ? 0.01 : 0));
     // Shared task uncertainty cancels in regret; additional uncertainty about a
     // candidate still counts. There is no absolute uncertainty veto for weak checks.
     const modeledQualityGap = reference
@@ -1004,6 +1065,7 @@ export function optimizeSpecialists(
       completionLatencyP50Ms,
       completionLatencyP90Ms,
       completionLatencyP99Ms,
+      latencyEvidenceKnown,
       completionCostP50Usd,
       completionCostP90Usd,
       completionCostP99Usd,
@@ -1021,12 +1083,13 @@ export function optimizeSpecialists(
       recoveryEvidence: useRecorded ? recorded! : null,
       score:
         config.routing.costWeight * riskAdjustedCostPerVerifiedCompletion +
-        ((config.routing.latencyWeight * completionLatencyP90Ms) /
+        ((config.routing.latencyWeight * scoredLatencyP90Ms) /
           Math.max(expectedFinalSuccess, 0.05) /
           1000) *
           POLICY.latencyUsdPerSecond +
         config.routing.latencyWeight * deadlineMissProbability * 0.02 +
-        config.routing.latencyWeight * (initial.latencySlaPassed ? 0 : 0.02),
+        config.routing.latencyWeight * (initial.latencySlaPassed ? 0 : 0.02) +
+        config.routing.latencyWeight * (latencyEvidenceKnown ? 0 : 0.001),
       eligible: !rejection,
       hardRejection,
       softPenalties,
@@ -1042,10 +1105,13 @@ export function optimizeSpecialists(
       } } : {}),
     };
   };
-  for (const initial of shortlisted) {
+  // Score every executable model as a standalone model × engine plan. Keep
+  // cascade construction bounded to the evidence/economics shortlist so the
+  // broad dynamic catalog does not create an O(n²) recovery graph.
+  for (const initial of eligible) {
     const standalone = estimate(initial);
     const alternatives = [standalone];
-    for (const rescue of shortlisted) {
+    for (const rescue of shortlistIds.has(initial.model.id) ? shortlisted : []) {
       if (
         rescue === initial ||
         (rescue.quality <= initial.quality &&
@@ -1072,13 +1138,15 @@ export function optimizeSpecialists(
   const costFirst =
     economicalTrial && recoveryCoverage === "targeted" && !highRisk;
   const interactiveRank = (plan: ExecutionPlanEstimate) =>
-    plan.completionLatencyP90Ms <= POLICY.interactiveP90Ms ? 0 : 1;
+    plan.completionLatencyP90Ms === null ||
+      plan.completionLatencyP90Ms <= POLICY.interactiveP90Ms ? 0 : 1;
   const order = (a: ExecutionPlanEstimate, b: ExecutionPlanEstimate) =>
     costFirst
       ? interactiveRank(a) - interactiveRank(b) ||
         a.riskAdjustedCostPerVerifiedCompletion -
           b.riskAdjustedCostPerVerifiedCompletion ||
-        a.completionLatencyP90Ms - b.completionLatencyP90Ms ||
+        (a.completionLatencyP90Ms ?? a.expectedCompletionLatencyMs) -
+          (b.completionLatencyP90Ms ?? b.expectedCompletionLatencyMs) ||
         b.conservativeFinalSuccess - a.conservativeFinalSuccess ||
         a.models.join("\0").localeCompare(b.models.join("\0"))
       : a.score - b.score ||

@@ -108,6 +108,22 @@ test("Node TAP keeps a remaining test neutral when an upstream fix changes its a
     "CANDIDATE_IMPROVEMENT",
   );
 });
+
+test("zero-diff Node TAP failure with the same test identity is pre-existing", () => {
+  const detailed = (actual: string) => result([
+    "not ok 1 - required legacy assertion",
+    "  ---",
+    `  actual: ${actual}`,
+    "  expected: 5",
+    "  operator: strictEqual",
+    "  ...",
+    "1..1",
+    "# fail 1",
+  ].join("\n"), 1, "node --test tests/legacy.test.js");
+  const compared = verificationAgainstBaseline(detailed("-1"), detailed("-2"), []);
+  assert.equal(compared.status, "CANDIDATE_NEUTRAL");
+  assert.match(compared.checks[0]!.source ?? "", /baseline_unchanged/);
+});
 test("removing some or all baseline failures is improvement", () => {
   assert.equal(
     verificationAgainstBaseline(result(old + other), result(old)).status,

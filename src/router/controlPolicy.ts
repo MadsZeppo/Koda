@@ -49,6 +49,8 @@ export interface FrozenExecutionPolicy<T extends ControlCandidate = ControlCandi
   readonly qualityCascadeModelIds?: readonly string[];
   /** Bounded peers approved only for provider/protocol recovery. */
   readonly operationalRecoveryModelIds?: readonly string[];
+  /** Economically ranked quality-safe initial legs for operational recovery. */
+  readonly orderedRecoveryModelIds?: readonly string[];
   readonly activeBoard: readonly ActiveBoardEntry<T>[];
   readonly referenceModel: string;
   readonly initialModel: string;
@@ -206,6 +208,13 @@ export function chooseAdaptiveRecovery<T extends ControlCandidate>(
 
   if (!candidates.length) return undefined;
 
+  if (failureMode === "operational" && policy.orderedRecoveryModelIds) {
+    for (const modelId of policy.orderedRecoveryModelIds) {
+      const candidate = candidates.find((item) => item.model.id === modelId);
+      if (candidate) return candidate;
+    }
+  }
+
   const economics = (candidate: T) => candidate.conservativeQuality > 0
     ? candidate.expectedAttemptCost / candidate.conservativeQuality : Infinity;
 
@@ -240,6 +249,9 @@ export function freezeExecutionPolicy<P extends FrozenExecutionPolicy<ControlCan
       : undefined,
     operationalRecoveryModelIds: policy.operationalRecoveryModelIds
       ? Object.freeze([...policy.operationalRecoveryModelIds])
+      : undefined,
+    orderedRecoveryModelIds: policy.orderedRecoveryModelIds
+      ? Object.freeze([...policy.orderedRecoveryModelIds])
       : undefined,
     activeBoard: Object.freeze(policy.activeBoard.map((entry) => Object.freeze({ ...entry }))),
     providerConstraints: Object.freeze({ ...policy.providerConstraints }),

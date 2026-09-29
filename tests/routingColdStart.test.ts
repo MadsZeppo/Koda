@@ -83,7 +83,7 @@ const specialist = (id: string, price: number, qualityPrior: number, latencyPrio
     inputPrice: price,
     outputPrice: price,
     contextLength: 1_000_000,
-    supportedParameters: ["tools"],
+    supportedParameters: ["tools", "tool_choice"],
   },
   configured: true,
   vision: false,

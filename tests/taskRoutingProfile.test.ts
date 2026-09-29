@@ -4,6 +4,8 @@ import { extractFeatures } from "../src/router/features.js";
 import { taskFingerprint } from "../src/router/taskFingerprint.js";
 import type { Subtask } from "../src/planner/schemas.js";
 import type { RepoProfile, VerificationResult } from "../src/types.js";
+import { profileTask } from "../src/router/taskProfiler.js";
+import type { ExecutionStrategy } from "../src/router/executionStrategy.js";
 
 const work = (objective: string, paths: string[], commands: string[] = []): Subtask => ({
   id: "change", title: objective, objective, likelyReadPaths: paths, likelyWritePaths: paths,
@@ -55,6 +57,33 @@ test("test intent is determined from objective and accepts deterministic unit-te
   const featureFacts = extractFeatures(feature, featureRepo, 800);
   assert.equal(featureFacts.isTestWork, false);
   assert.equal(taskFingerprint(feature, featureRepo, featureFacts, "normal").primary, "implementation");
+});
+
+test("explicit local test target does not absorb unrelated textual matches into routing risk", () => {
+  const files = [
+    "tests/controlPolicy.test.ts",
+    "src/router/controlPolicy.ts",
+    "tests/fixtures/math/tests/control.test.ts",
+    "src/unrelated/controlPlane.ts",
+  ];
+  const repo = profile(files);
+  const strategy = {
+    execution_strategy: "direct",
+    execution_effort: "tiny",
+    strategy_reason: "explicit local target",
+    likelyFiles: ["tests/controlPolicy.test.ts", "src/router/controlPolicy.ts"],
+  } as ExecutionStrategy;
+  const routed = profileTask(
+    "In tests/controlPolicy.test.ts, add a deterministic test for maxCodingAttempts",
+    repo,
+    strategy,
+  );
+  assert.deepEqual(routed.likelyPaths, [
+    "tests/controlPolicy.test.ts",
+    "src/router/controlPolicy.ts",
+  ]);
+  assert.equal(routed.crossComponent, false);
+  assert.equal(routed.scopeConfidence, "high");
 });
 
 test("unlocalized task is uncertain even with a large context packet and a short prompt", () => {

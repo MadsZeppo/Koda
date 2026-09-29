@@ -31,6 +31,8 @@ import {
 } from "./context/compiler.js";
 import { normalizePlan } from "./orchestrator/coalesce.js";
 import { compileTask } from "./planner/taskCompiler.js";
+import { planningPolicy } from "./planner/policy.js";
+import { bestExecutablePlanner } from "./planner/routing.js";
 import { schedule } from "./orchestrator/scheduler.js";
 import { implement } from "./agent/miniSweExecutor.js";
 import { currentDiff, safePath } from "./agent/tools.js";
@@ -39,7 +41,6 @@ import { AttemptCheckpoint } from "./agent/attemptCheckpoint.js";
 import { WriteScope } from "./repo/writeScope.js";
 import { discover } from "./agent/discovery.js";
 import {
-  advisoryInfrastructureOnly,
   verify,
   verificationAgainstBaseline,
   verificationResult,
@@ -67,11 +68,20 @@ import {
 import { changeCode } from "./workspace/files.js";
 import { nextCodingTier, type CodingTier } from "./router/codingDemand.js";
 import { taskRelevantMutationPaths } from "./agent/mutationInvariant.js";
-import { stableNoChangePreflight } from "./agent/stableNoChangePreflight.js";
+import {
+  routingBaselinePreflight,
+  stableNoChangePreflight,
+} from "./agent/stableNoChangePreflight.js";
 import type { CodingWorker } from "./agent/codingWorker.js";
 import { extractFeatures } from "./router/features.js";
 import {
+  preserveCanonicalTaskEvidence,
+  taskFingerprint,
+} from "./router/taskFingerprint.js";
+import type { FrozenExecutionPlan } from "./router/modelRouter.js";
+import {
   buildTaskResume,
+  profileTask,
   type DeterministicTaskProfile,
 } from "./router/taskProfiler.js";
 export interface RunOptions {
@@ -238,11 +248,74 @@ export async function run(options: RunOptions) {
     const gateway = new Gateway(options.config, logger, budget);
     const codingWorker = options.codingWorkerFactory?.(gateway);
     poolRouter = gateway.modelRouter;
+    await poolRouter?.freezeRunSnapshot();
     strategy = chooseExecutionStrategy(options.task, profile);
     logger.log("execution_strategy", {
       execution_strategy: strategy.execution_strategy,
       execution_effort: strategy.execution_effort,
       strategy_reason: strategy.strategy_reason,
+    });
+    const initialTaskProfile = profileTask(options.task, profile, strategy);
+    const routingBaselineStarted = Date.now();
+    let canonicalVerification = await routingBaselinePreflight(
+      integration.path,
+      profile,
+      initialTaskProfile.likelyPaths,
+      () => Math.min(options.config.commandTimeoutMs, budget.remainingMs()),
+      (check) => logger.log("verification", { subtaskId: "routing-preflight", ...check }),
+    );
+
+    // Routing must observe one real, bounded repository signal before model/engine
+    // selection. Prefer build because it is normally much cheaper than a full suite.
+    const observedRepoCheck = canonicalVerification.checks.some((check) =>
+      /(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:build|test)\b/.test(check.command ?? ""),
+    );
+
+    if (!observedRepoCheck) {
+      const boundedRepoCommand =
+        profile.verificationCommands.find((command) =>
+          /(?:npm|pnpm|yarn)\s+(?:run\s+)?build\b/.test(command),
+        ) ??
+        profile.verificationCommands.find((command) =>
+          /(?:npm|pnpm|yarn)\s+(?:run\s+)?test\b/.test(command),
+        );
+
+      if (boundedRepoCommand) {
+        const boundedRepoVerification = await verify(
+          integration.path,
+          [boundedRepoCommand],
+          () => Math.min(options.config.commandTimeoutMs, budget.remainingMs()),
+          (check) =>
+            logger.log("verification", {
+              subtaskId: "routing-preflight",
+              ...check,
+            }),
+        );
+
+        canonicalVerification = verificationResult([
+          ...canonicalVerification.checks,
+          ...boundedRepoVerification.checks,
+        ]);
+      }
+    }
+
+    const observedRoutingChecks = canonicalVerification.checks.filter((check) =>
+      check.outcome === "CHECK_PASS" || check.outcome === "CHECK_FAIL");
+    const canonicalTaskProfile: DeterministicTaskProfile = observedRoutingChecks.length
+      ? {
+          ...initialTaskProfile,
+          verificationStrength: "strong",
+          evidence: [
+            ...initialTaskProfile.evidence,
+            ...observedRoutingChecks.map((check) =>
+              `observed baseline ${String(check.outcome).toLowerCase()}: ${check.command}`),
+          ],
+        }
+      : initialTaskProfile;
+    logger.log("routing_baseline_verification", {
+      status: canonicalVerification.status,
+      checks: canonicalVerification.checks,
+      elapsed_ms: Date.now() - routingBaselineStarted,
     });
     const routingResume = await buildTaskResume(
       options.task,
@@ -409,6 +482,7 @@ export async function run(options: RunOptions) {
           tokens: call ? call.promptTokens + call.completionTokens : 0,
         };
       },
+      canonicalTaskProfile,
     );
     const routingResearchCalls = logger.events.filter(
       (event) =>
@@ -432,7 +506,12 @@ export async function run(options: RunOptions) {
       relevantFiles: routingResume.relevantPaths,
       symbols: routingResume.scout?.symbols ?? [],
       reproduction: routingResume.scout?.reproduction ?? "",
-      failingTests: routingResume.profile.likelyTests,
+      failingTests: [
+        ...routingResume.profile.likelyTests,
+        ...canonicalVerification.checks
+          .filter((check) => check.outcome === "CHECK_FAIL")
+          .map((check) => check.command),
+      ],
       likelyRootCause: "",
       dependencies: [],
       uncertainty:
@@ -445,6 +524,150 @@ export async function run(options: RunOptions) {
         "Use repository-backed paths and inspect current definitions before mutation.",
       evidence: routingResume.evidence,
     };
+    let preselectedExecutionPlan: FrozenExecutionPlan | undefined;
+    if (
+      poolRouter &&
+      options.config.specialistRouting &&
+      !options.config.forceModel
+    ) {
+      const boundedWritePaths = directWritePaths(
+        routingResume.relevantPaths,
+        profile,
+        options.task,
+      );
+      const plannedPreview = await planningPolicy(
+        options.task,
+        profile,
+        options.config.planner,
+      );
+      const planningFeatures = extractFeatures(
+        {
+          id: "route-planner",
+          title: options.task,
+          objective: options.task,
+          dependsOn: [],
+          likelyReadPaths: routingResume.relevantPaths,
+          likelyWritePaths: boundedWritePaths,
+          integrationContract: "Produce an executable coding DAG",
+          verificationCommands: [],
+          estimatedDifficulty: plannedPreview.complexity === "complex"
+            ? "high" : "normal",
+          parallelSafe: false,
+        },
+        profile,
+        Buffer.byteLength(JSON.stringify(sharedRoutingEvidence)),
+      );
+      planningFeatures.taskKind = "planning";
+      planningFeatures.complexity = plannedPreview.complexity;
+      const plannerEstimate = plannedPreview.candidate
+        ? undefined
+        : await bestExecutablePlanner(
+            poolRouter,
+            planningFeatures,
+            Buffer.byteLength(JSON.stringify(sharedRoutingEvidence)) + 256,
+            budget.remainingUsd(),
+            budget.remainingTokens(),
+          );
+      const plannedExecutable = !!plannedPreview.candidate || !!plannerEstimate;
+      const strategies: ExecutionStrategy[] = [
+        ...(strategy.execution_strategy !== "planned" || plannedExecutable
+          ? [strategy]
+          : []),
+        ...(strategy.execution_strategy !== "stable"
+          ? [{
+              ...strategy,
+              execution_strategy: "stable" as const,
+              execution_effort: "normal" as const,
+              strategy_reason: "Joint router alternative",
+              preciseTarget: undefined,
+            }]
+          : []),
+        ...(strategy.execution_strategy !== "planned" && plannedExecutable
+          ? [{
+              ...strategy,
+              execution_strategy: "planned" as const,
+              execution_effort: "normal" as const,
+              strategy_reason: "Joint router alternative",
+            }]
+          : []),
+        ...(strategy.execution_strategy !== "direct" &&
+            routingResume.profile.scopeConfidence === "high" &&
+            boundedWritePaths.length >= 1 && boundedWritePaths.length <= 4
+          ? [{
+              ...strategy,
+              execution_strategy: "direct" as const,
+              execution_effort: "normal" as const,
+              strategy_reason: "Joint router alternative",
+              preciseTarget: boundedWritePaths.length === 1
+                ? boundedWritePaths[0]
+                : undefined,
+            }]
+          : []),
+      ].filter((candidate, index, all) => all.findIndex((item) =>
+        item.execution_strategy === candidate.execution_strategy) === index);
+      const variants = strategies.map((candidate) => {
+        const routeSubtask: Subtask = {
+          id: `route-${candidate.execution_strategy}`,
+          title: options.task,
+          objective: options.task,
+          dependsOn: [],
+          likelyReadPaths: routingResume.relevantPaths,
+          likelyWritePaths: candidate.execution_strategy === "stable"
+            ? ["."]
+            : boundedWritePaths,
+          integrationContract: "Preserve the task acceptance contract",
+          verificationCommands: profile.verificationCommands,
+          estimatedDifficulty: "normal",
+          parallelSafe: false,
+        };
+        const routeFeatures = extractFeatures(
+          routeSubtask,
+          profile,
+          Buffer.byteLength(JSON.stringify(sharedRoutingEvidence)),
+          canonicalVerification,
+          candidate.execution_strategy,
+        );
+        return {
+          executionStrategy: candidate.execution_strategy,
+          fingerprint: preserveCanonicalTaskEvidence(
+            taskFingerprint(
+              routeSubtask,
+              profile,
+              routeFeatures,
+              candidate.execution_effort,
+              canonicalVerification,
+            ),
+            routingResume.profile,
+            canonicalVerification,
+          ),
+          features: routeFeatures,
+          strategy: candidate,
+          prerequisiteCostUsd:
+            candidate.execution_strategy === "planned"
+              ? plannerEstimate?.estimatedCallCost ?? 0
+              : 0,
+          prerequisiteLatencyMs:
+            candidate.execution_strategy === "planned"
+              ? plannerEstimate?.latency ?? 0
+              : 0,
+        };
+      });
+      const joint = await poolRouter.selectJointExecutionPlan(
+        variants,
+        "run",
+        budget.remainingUsd(),
+      );
+      strategy = variants.find(
+        (variant) => variant.executionStrategy === joint.executionStrategy,
+      )!.strategy;
+      preselectedExecutionPlan = joint.plan;
+      logger.log("execution_strategy", {
+        execution_strategy: strategy.execution_strategy,
+        execution_effort: strategy.execution_effort,
+        strategy_reason: "quality-safe joint model + execution strategy economics",
+        model: joint.plan.initialModel,
+      });
+    }
     let taskVerificationCommands: string[] = [];
     let taskVerificationIsFocused = false;
     let stableRepairContext:
@@ -498,6 +721,8 @@ export async function run(options: RunOptions) {
         () => Math.min(options.config.commandTimeoutMs, budget.remainingMs()),
         (check) =>
           logger.log("verification", { subtaskId: subtask.id, ...check }),
+        canonicalVerification,
+        routingResume.relevantPaths,
       );
       logger.log("latency", {
         stable_no_change_preflight_ms: Date.now() - preflightStarted,
@@ -545,6 +770,9 @@ export async function run(options: RunOptions) {
               compiledContext: context,
               finalVerificationOnly: true,
               evidence: sharedRoutingEvidence,
+              canonicalTaskProfile: routingResume.profile,
+              canonicalVerification: preflight.verification,
+              executionPlan: preselectedExecutionPlan,
             },
           );
 
@@ -745,6 +973,9 @@ export async function run(options: RunOptions) {
           tinyDirect: strategy.execution_effort === "tiny",
           finalVerificationOnly: strategy.execution_effort === "tiny",
           evidence: sharedRoutingEvidence,
+          canonicalTaskProfile: routingResume.profile,
+          canonicalRoutingVerification: canonicalVerification,
+          executionPlan: preselectedExecutionPlan,
         },
       );
       // Preserve the authoritative DIRECT target even when the worker returns
@@ -945,6 +1176,12 @@ export async function run(options: RunOptions) {
                 initialRole,
                 stop,
                 raceGroup: suffix ? subtask.id : undefined,
+                canonicalTaskProfile: routingResume.profile,
+                canonicalRoutingVerification: canonicalVerification,
+                executionPlan:
+                  plan.subtasks.length === 1 && !suffix
+                    ? preselectedExecutionPlan
+                    : undefined,
                 evidence: combineEvidence([
                   nodeRoutingEvidence,
                   ...inheritedEvidence,
@@ -954,20 +1191,12 @@ export async function run(options: RunOptions) {
             if (
               result.verification.status !== "VERIFIED_SUCCESS" &&
               result.verification.status !== "CANDIDATE_NEUTRAL" &&
-              result.verification.status !== "CANDIDATE_IMPROVEMENT" &&
-              !advisoryInfrastructureOnly(result.verification)
+              result.verification.status !== "CANDIDATE_IMPROVEMENT"
             ) {
               if (result.verification.status === "NOT_FULLY_VERIFIED")
                 status = "NOT_FULLY_VERIFIED";
               throw Error(`${subtask.id}: ${result.verification.status}`);
             }
-            if (advisoryInfrastructureOnly(result.verification))
-              logger.log("verification_advisory_unavailable", {
-                subtaskId: subtask.id,
-                checks: result.verification.checks.filter(
-                  (check) => check.unavailable,
-                ),
-              });
             await assertWriteResponsibility(wt.path, subtask);
             const revision = await backend!.finalizeWorker(
               wt,
@@ -1227,7 +1456,11 @@ export async function run(options: RunOptions) {
           undefined,
           finalCandidates,
         );
-        executable = verificationAgainstBaseline(finalBaseline, executable);
+        executable = verificationAgainstBaseline(
+          finalBaseline,
+          executable,
+          changed.length === 0 ? [] : undefined,
+        );
       }
       const unavailableChecks = executable.checks.filter(
         (check) =>

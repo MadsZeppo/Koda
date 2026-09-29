@@ -62,7 +62,15 @@ export function profileTask(task: string, repo: RepoProfile, strategy: Execution
     score + (path.toLowerCase().includes(term) ? 2 : 0), 0) + (testPath(path) && /\btest\b/.test(lower) ? 2 : 0) }))
     .filter((item) => item.score > 0).sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
     .slice(0, 12).map((item) => item.path);
-  const likelyPaths = [...new Set([...explicit, ...strategy.likelyFiles.filter((path) => repo.files.includes(path)), ...ranked])].slice(0, 12);
+  // An explicit repository path plus the deterministic strategy graph is
+  // stronger localization evidence than loose task-word matches. Adding all
+  // textual matches here inflated local tasks into cross-component work.
+  const grounded = strategy.likelyFiles.filter((path) => repo.files.includes(path));
+  const likelyPaths = [...new Set([
+    ...explicit,
+    ...grounded,
+    ...(explicit.length || grounded.length ? [] : ranked),
+  ])].slice(0, 12);
   const likelyTests = likelyPaths.filter(testPath);
   const source = likelyPaths.filter((path) => !testPath(path));
   const components = [...new Set(source.map((path) => path.includes("/") ? path.split("/").slice(0, -1).join("/") : "."))];
@@ -83,11 +91,31 @@ export function profileTask(task: string, repo: RepoProfile, strategy: Execution
   ])];
   const verificationStrength = likelyTests.length && repo.verificationCommands.length ? "strong"
     : repo.verificationCommands.length ? "medium" : "weak";
-  const publicApiRisk = /\b(?:public api|exported|endpoint|contract|breaking)\b/.test(lower);
-  const schemaRisk = /\b(?:schema|migration|database|protocol|config(?:uration)?)\b/.test(lower);
+  const repositoryBoundaryEvidence = [
+    ...likelyPaths,
+    ...(repo.ecosystem?.configFiles ?? []),
+    ...(repo.ecosystem?.evidence ?? []).flatMap((item) => [item.source, item.fact]),
+  ].join(" ").toLowerCase();
+  const publicApiRisk =
+    /\b(?:public api|exported|endpoint|contract|breaking)\b/.test(lower) &&
+    /(?:openapi|swagger|routes?|controllers?|public|api(?:\/|\.|$))/.test(
+      repositoryBoundaryEvidence,
+    );
+  const schemaRisk =
+    /\b(?:schema|migration|database|protocol|config(?:uration)?)\b/.test(lower) &&
+    /(?:schema|migrations?|prisma|drizzle|typeorm|sequelize|alembic|django|sql(?:ite)?|postgres|database\.yml)/.test(
+      repositoryBoundaryEvidence,
+    );
   const concurrencyRisk = /\b(?:concurren|race condition|synchron|parallel|deadlock|atomic)\w*\b/.test(lower);
   const architectureRisk = /\b(?:architect|redesign|restructure|large refactor)\w*\b/.test(lower);
-  const securitySensitive = /\b(?:auth|permission|credential|secret|security|crypto|payment)\w*\b/.test(lower);
+  // Vocabulary identifies intent, not consequence.  Require a concrete
+  // repository security boundary before raising the risk class: a tiny
+  // in-memory service named "auth" or "payment" is still locally verifiable.
+  const securitySensitive =
+    /\b(?:auth|permission|credential|secret|security|crypto|payment)\w*\b/.test(lower) &&
+    /(?:oauth|openid|jwt|crypt|credentials?|secrets?|permissions?|polic(?:y|ies)|acl|security(?:\/|\.|$)|middleware)/.test(
+      repositoryBoundaryEvidence,
+    );
   const localizationEntropy = scopeConfidence === "high" ? "low"
     : scopeConfidence === "medium" ? "medium" : "high";
   const expectedBlastRadius = crossComponent ? "cross-component"
@@ -129,8 +157,9 @@ export async function buildTaskResume(
   strategy: ExecutionStrategy,
   policy: { globalBudgetUsd: number; absoluteCapUsd: number; fraction: number },
   scout?: (profile: DeterministicTaskProfile, capUsd: number) => Promise<{ result: RoutingScoutResult; costUsd: number; tokens: number } | undefined>,
+  preparedProfile?: DeterministicTaskProfile,
 ): Promise<TaskResume> {
-  const profile = profileTask(task, repo, strategy);
+  const profile = preparedProfile ?? profileTask(task, repo, strategy);
   const cap = researchBudgetUsd(policy.globalBudgetUsd, policy.absoluteCapUsd, policy.fraction);
   let inspected: Awaited<ReturnType<NonNullable<typeof scout>>>;
   let attempted = false;

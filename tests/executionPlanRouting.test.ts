@@ -5,8 +5,12 @@ import type { SpecialistModel } from "../src/router/capabilityRegistry.js";
 import { extractFeatures, taskBucket } from "../src/router/features.js";
 import type { Attempt, OperationalCall } from "../src/router/history.js";
 import { modelSchema, routingSchema } from "../src/router/pool.js";
-import { optimizeSpecialists } from "../src/router/routeOptimizer.js";
+import {
+  chooseJointExecutionRoute,
+  optimizeSpecialists,
+} from "../src/router/routeOptimizer.js";
 import type { TaskFingerprint } from "../src/router/taskFingerprint.js";
+import { preserveCanonicalTaskEvidence } from "../src/router/taskFingerprint.js";
 import type { RepoProfile } from "../src/types.js";
 
 const features = extractFeatures(
@@ -77,7 +81,7 @@ const model = (
     inputPrice: price,
     outputPrice: price,
     contextLength: 100000,
-    supportedParameters: ["tools"],
+    supportedParameters: ["tools", "tool_choice"],
   },
   configured: true,
   evidence: [],
@@ -192,6 +196,83 @@ test("detectable bounded consequence risk uses verified trajectory economics ins
     result.selectedPlan!.riskAdjustedCostPerVerifiedCompletion <
       result.referencePlan!.riskAdjustedCostPerVerifiedCompletion,
   );
+});
+
+test("model and execution strategy compete as one quality-safe economic plan", () => {
+  const cheap = model("economical", 0.98, 0.01, 500);
+  cheap.metadata.supportedParameters = ["tools"];
+  const strong = reference();
+  strong.metadata.supportedParameters = ["tools", "tool_choice"];
+  const stableFp = {
+    ...fingerprint(),
+    executionStrategy: "stable",
+    scope: "localized" as const,
+  };
+  const plannedFp = {
+    ...fingerprint(),
+    executionStrategy: "planned",
+    scope: "multi-file" as const,
+    localizationConfidence: "medium" as const,
+    expectedFiles: 2,
+  };
+  const stable = route([cheap, strong], stableFp);
+  const planned = route([cheap, strong], plannedFp);
+  assert.equal(
+    stable.considered.find((candidate) => candidate.model.id === cheap.model.id)
+      ?.hardRejection,
+    "tool_choice unsupported",
+  );
+  const selected = chooseJointExecutionRoute([
+    { executionStrategy: "stable", route: stable },
+    { executionStrategy: "planned", route: planned },
+  ]);
+  assert.equal(selected?.executionStrategy, "planned");
+  assert.equal(selected?.plan.models[0], cheap.model.id);
+  assert.ok(selected!.plan.qualityGap <= selected!.route.allowedRegret);
+});
+
+test("Stable cannot downgrade canonical preflight verification and state-flow evidence", () => {
+  const rebuilt = {
+    ...fingerprint("weak"),
+    executionStrategy: "stable",
+    concurrencyRisk: false,
+    localizationConfidence: "low" as const,
+    recoveryDetectability: "low" as const,
+    targetedExecutableVerification: false,
+  };
+  const preserved = preserveCanonicalTaskEvidence(rebuilt, {
+    verificationStrength: "weak",
+    concurrencyRisk: true,
+    scopeConfidence: "high",
+    recoveryDetectability: undefined,
+    likelyTests: [],
+    publicApiRisk: false,
+    schemaRisk: false,
+    architectureRisk: false,
+    crossComponent: false,
+    expectedBlastRadius: "package",
+  } as any, {
+    status: "FAILED",
+    checks: [{
+      command: "node --test",
+      outcome: "CHECK_FAIL",
+      kind: "test",
+      requirement: "required",
+      exitCode: 1,
+      stdout: "not ok 1 - preserves state",
+      stderr: "",
+      durationMs: 10,
+    }],
+  } as any);
+  assert.equal(preserved.verificationStrength, "strong");
+  assert.equal(preserved.concurrencyRisk, true);
+  assert.equal(preserved.localizationConfidence, "high");
+  assert.equal(preserved.targetedExecutableVerification, true);
+  assert.equal(preserved.focusedFailingReproduction, true);
+  assert.equal(preserved.observedCheckFailures, 1);
+  assert.equal(preserved.verifierFalseAcceptRisk, "low");
+  assert.equal(preserved.consequenceRisk, "low");
+  assert.equal(preserved.recoveryDetectability, "high");
 });
 
 test("a rescue cannot hide an initial model below the declared quality floor", () => {
@@ -663,6 +744,21 @@ test("latency preferences cannot eliminate the reference or every compatible pla
     allSlow.considered.every((candidate) => !candidate.latencySlaPassed),
   );
   assert.deepEqual(allSlow.selectedPlan?.models, ["reference"]);
+});
+
+test("one observed model by engine timeout recalibrates the whole trajectory latency", () => {
+  const timedOut = observation("efficient", fingerprint(), {
+    verification: "NOT_FULLY_VERIFIED",
+    wallClockMs: 49_000,
+    executionEngine: "direct-edit",
+    reason: "provider timeout",
+    operationalFailure: "timeout",
+  });
+  const result = route([efficient(), reference()], fingerprint(), [timedOut]);
+  const estimate = result.considered.find((candidate) =>
+    candidate.model.id === "efficient")!;
+  assert.ok((estimate.latencyP50Ms ?? 0) >= 49_000);
+  assert.ok((estimate.latencyP90Ms ?? 0) >= (estimate.latencyP50Ms ?? 0) * 1.5);
 });
 
 test("race-reserved models cannot define the reference or be selected as the initial model", () => {

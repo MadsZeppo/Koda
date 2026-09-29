@@ -22,9 +22,47 @@ import type { Subtask } from "../src/planner/schemas.js";
 import { summarize } from "../src/telemetry/summary.js";
 import { verificationResult } from "../src/verifier/verifier.js";
 import { prepareStableWorker } from "../src/agent/stable.js";
+import { stableNoChangePreflight } from "../src/agent/stableNoChangePreflight.js";
 import { compileContext } from "../src/context/compiler.js";
 
 const dogfoodTask = "Add a CLI flag --explain-routing that prints the selected coding model, task fingerprint, quality reference, estimated quality gap, estimated cost, and fallback chain before execution. Keep normal behavior unchanged when the flag is absent. Add focused tests for the new flag.";
+
+test("no_changes_required needs every relevant required acceptance check", async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-no-change-required-"));
+  try {
+    await mkdir(join(root, "src"));
+    await mkdir(join(root, "tests"));
+    await writeFile(join(root, "src/router.cjs"),
+      "module.exports=()=>({selected_model:'cheap',expected_completion_cost_usd:0.2});\n");
+    await writeFile(join(root, "tests/route.test.cjs"),
+      "const {test}=require('node:test');const assert=require('node:assert/strict');" +
+      "const route=require('../src/router.cjs');" +
+      "test('route telemetry',()=>{const event=route();" +
+      "assert.equal(event.selected_model,'cheap');" +
+      "assert.equal(event.expected_completion_cost_usd,0.2);});\n");
+    await writeFile(join(root, "build.cjs"), "process.exit(1);\n");
+    await writeFile(join(root, "package.json"), JSON.stringify({ scripts: {
+      test: "node --test tests/route.test.cjs",
+      build: "node build.cjs",
+    } }));
+    const repo = await profileRepo(root);
+    const proof = await stableNoChangePreflight(
+      root,
+      "Add a deterministic unit test that verifies route telemetry includes the selected model and expected completion cost.",
+      repo,
+      () => 5_000,
+      undefined,
+      undefined,
+      ["tests/route.test.cjs"],
+    );
+    assert.equal(proof.satisfied, false);
+    assert.notEqual(proof.verification.status, "VERIFIED_SUCCESS");
+    assert.ok(proof.verification.checks.some((check) =>
+      check.kind === "build" && check.outcome !== "CHECK_PASS"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("unknown Stable scope is acquired locally before coding starts", async () => {
   const root = await mkdtemp(join(tmpdir(), "koda-stable-local-discovery-"));
@@ -310,7 +348,7 @@ test("a verified no-change result never enters final coding repair", async () =>
   let verificationCalls = 0;
   const verificationServer = createServer((_request, response) => {
     verificationCalls++;
-    response.end(verificationCalls === 2 ? "fail" : "pass");
+    response.end(verificationCalls === 3 ? "fail" : "pass");
   });
   try {
     await new Promise<void>((resolve) =>

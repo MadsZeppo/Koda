@@ -256,6 +256,40 @@ test("operational recovery ignores prior tier and selects the cheapest quality-s
   assert.equal(selected?.model.id, cheapSafe.model.id);
 });
 
+test("operational recovery follows the frozen economic order before semantic escalation", () => {
+  const initial = candidate("initial", "cheap", 0.91, 0.002);
+  const economicalPeer = candidate("economical-peer", "fast", 0.91, 0.003);
+  const secondPeer = candidate("second-peer", "strong", 0.93, 0.01);
+  const semanticRescue = candidate("semantic-rescue", "frontier", 0.98, 0.08);
+  const frozen = freezeExecutionPolicy({
+    ...policy([initial, semanticRescue, secondPeer, economicalPeer]),
+    qualityCascadeModelIds: [initial.model.id, semanticRescue.model.id],
+    operationalRecoveryModelIds: [economicalPeer.model.id, secondPeer.model.id],
+    orderedRecoveryModelIds: [economicalPeer.model.id, secondPeer.model.id],
+  });
+  const first = chooseAdaptiveRecovery(frozen, {
+    failureMode: "operational",
+    failurePhase: "PROVIDER",
+    previousModel: initial.model.id,
+    mutationObserved: false,
+  }, new Set([initial.model.id]));
+  const second = chooseAdaptiveRecovery(frozen, {
+    failureMode: "operational",
+    failurePhase: "PROVIDER",
+    previousModel: economicalPeer.model.id,
+    mutationObserved: false,
+  }, new Set([initial.model.id, economicalPeer.model.id]));
+  const semantic = chooseAdaptiveRecovery(frozen, {
+    failureMode: "test_failure",
+    failurePhase: "VERIFICATION",
+    previousModel: initial.model.id,
+    mutationObserved: true,
+  }, new Set([initial.model.id]));
+  assert.equal(first?.model.id, economicalPeer.model.id);
+  assert.equal(second?.model.id, secondPeer.model.id);
+  assert.equal(semantic?.model.id, semanticRescue.model.id);
+});
+
 test("an explicit operational peer is tried before the quality rescue but cannot receive coding recovery", () => {
   const initial = candidate("initial", "cheap", 0.78, 0.001);
   const peer = candidate("sideways", "cheap", 0.76, 0.002);

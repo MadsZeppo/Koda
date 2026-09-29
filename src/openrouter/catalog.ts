@@ -94,8 +94,6 @@ export class Catalog {
       if (officialOpenRouter) {
         const key = process.env.OPENROUTER_API_KEY;
         const headers = key ? { Authorization: `Bearer ${key}` } : undefined;
-        for (const model of this.models.filter((item) => item.enabled &&
-          item.strengths.includes("tool_use"))) endpointSets.set(model.id, []);
         await Promise.all(this.models.filter((model) => model.enabled &&
           model.strengths.includes("tool_use")).map(async (model) => {
           try {

@@ -111,9 +111,14 @@ export function estimateEfficiency(fp: TaskFingerprint, contextTokens: number, m
 }
 
 export function estimateLatency(priorMs: number, knowledge: ModelRoutingKnowledge | undefined,
-  fp: TaskFingerprint, operations: OperationalCall[]) {
+  fp: TaskFingerprint, operations: OperationalCall[], attempts: Attempt[] = []) {
   const rows = relevant((knowledge?.observations ?? []).filter((row) => row.category === "efficiency"), fp);
   const samples = operations.map((row) => row.wallClockMs).filter((n) => n >= 0);
+  const engine = usesDirectEditEngine(fp) ? "direct-edit" : "mini-swe-agent";
+  const exactAttempts = attempts.filter((row) =>
+    observedExecutionEngine(row) === engine && Number.isFinite(row.wallClockMs) &&
+    row.wallClockMs >= 0);
+  const attemptSamples = exactAttempts.map((row) => row.wallClockMs);
   const directOneCall = usesDirectEditEngine(fp);
   const defaultTurns = fp.effort === "complex" || fp.scope === "cross-component"
     ? 7 : fp.scope === "multi-file" ? 5 : 4;
@@ -126,15 +131,28 @@ export function estimateLatency(priorMs: number, knowledge: ModelRoutingKnowledg
   const publicP50 = metric(rows, "completion_latency_p50_ms");
   const publicP90 = metric(rows, "completion_latency_p90_ms");
   const publicP99 = metric(rows, "completion_latency_p99_ms");
+  const evidenceKnown = attemptSamples.length > 0 || samples.length > 0 ||
+    (!directOneCall && [publicP50, publicP90, publicP99]
+      .some((value) => value !== undefined));
   const sparseTrajectoryP50 = priorMs * defaultTurns + 750;
   const callMultiplier = directOneCall ? 1 : defaultTurns;
-  const p50 = samples.length >= 3 ? quantile(samples, 0.5)! * callMultiplier
+  // Whole-attempt observations are authoritative for model × engine
+  // trajectory latency. A single timeout must immediately raise the
+  // conservative forecast instead of being hidden by a 5s request prior.
+  const p50 = attemptSamples.length
+    ? Math.max(priorMs, quantile(attemptSamples, 0.5)!)
+    : samples.length >= 3 ? quantile(samples, 0.5)! * callMultiplier
     : directOneCall ? priorMs : publicP50 ?? sparseTrajectoryP50;
-  const p90 = samples.length >= 5 ? quantile(samples, 0.9)! * callMultiplier
+  const p90 = attemptSamples.length >= 5 ? quantile(attemptSamples, 0.9)!
+    : attemptSamples.length ? Math.max(...attemptSamples, p50 * 1.5)
+    : samples.length >= 5 ? quantile(samples, 0.9)! * callMultiplier
     : directOneCall ? p50 * 1.8 : publicP90 ?? p50 * 1.8;
-  const p99 = samples.length >= 10 ? quantile(samples, 0.99)! * callMultiplier
+  const p99 = attemptSamples.length >= 10 ? quantile(attemptSamples, 0.99)!
+    : attemptSamples.length ? Math.max(p90, Math.max(...attemptSamples) * 1.25)
+    : samples.length >= 10 ? quantile(samples, 0.99)! * callMultiplier
     : directOneCall ? Math.max(p90, p50 * 2.5) : publicP99 ?? Math.max(p90, p50 * 2.5);
-  return { p50, p90, p99, sampleCount: samples.length,
-    confidence: samples.length >= 5 || (!directOneCall && rows.length)
+  return { p50, p90, p99, evidenceKnown,
+    sampleCount: Math.max(samples.length, attemptSamples.length),
+    confidence: attemptSamples.length >= 3 || samples.length >= 5 || (!directOneCall && rows.length)
       ? "medium" as const : "low" as const };
 }

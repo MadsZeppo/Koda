@@ -72,7 +72,7 @@ const cheap: SpecialistModel = {
     inputPrice: 0.1,
     outputPrice: 0.2,
     contextLength: 100000,
-    supportedParameters: ["tools"],
+    supportedParameters: ["tools", "tool_choice"],
   },
   vision: false,
   configured: true,
@@ -91,7 +91,7 @@ const strong: SpecialistModel = {
     inputPrice: 8,
     outputPrice: 12,
     contextLength: 100000,
-    supportedParameters: ["tools"],
+    supportedParameters: ["tools", "tool_choice"],
   },
   vision: false,
   configured: true,
@@ -154,7 +154,7 @@ test("universal selector considers every discovered model and chooses the cheape
       inputPrice: price,
       outputPrice: price,
       contextLength: 100000,
-      supportedParameters: ["tools"],
+      supportedParameters: ["tools", "tool_choice"],
     },
     vision: false,
     configured: true,
@@ -259,7 +259,7 @@ test("missing soft domain tags remain eligible when benchmark evidence supports 
       inputPrice: 0.1,
       outputPrice: 0.1,
       contextLength: 100000,
-      supportedParameters: ["tools"],
+      supportedParameters: ["tools", "tool_choice"],
     },
     vision: false,
     configured: true,
@@ -384,7 +384,7 @@ test("non-OpenRouter discovery adapter exposes every model but keeps unknown evi
         models: ["configured", "benchmarked", "unknown"].map((id) => ({
           id,
           context_length: 100000,
-          supported_parameters: ["tools"],
+          supported_parameters: ["tools", "tool_choice"],
           pricing: {
             prompt: id === "configured" ? "0.00001" : "0.0000002",
             completion: id === "configured" ? "0.00002" : "0.0000004",
@@ -401,7 +401,8 @@ test("non-OpenRouter discovery adapter exposes every model but keeps unknown evi
     ["src/state.ts"],
     ["node --test tests/state.test.ts"],
   );
-  await registry.refresh();
+  await registry.freezeRunSnapshot();
+  await registry.freezeRunSnapshot();
   const discovered = await registry.forTask(s.fingerprint);
   assert.equal(calls, 1);
   assert.deepEqual(discovered.map((item) => item.model.id).sort(), [
@@ -413,13 +414,34 @@ test("non-OpenRouter discovery adapter exposes every model but keeps unknown evi
     discovered.find((item) => item.model.id === "unknown")!.evidence,
     [],
   );
+  const routed = optimizeSpecialists(
+    discovered,
+    s.fingerprint,
+    s.features,
+    [],
+    {
+      ...settings,
+      codingAttemptTimeoutMs: 1_000,
+      modelTimeoutMs: { implementation: 1_000 },
+    } as any,
+    10,
+  );
   assert.equal(
-    route(s.fingerprint, s.features, [], discovered).cascade[0]?.model.id,
+    routed.cascade[0]?.model.id,
     "benchmarked",
     "an adapter-discovered qualified model can beat the configured pool",
   );
+  const benchmarked = routed.considered.find(
+    (candidate) => candidate.model.id === "benchmarked",
+  )!;
+  assert.equal(benchmarked.latencyEvidenceKnown, false);
+  assert.equal(benchmarked.latencyP50Ms, null);
+  assert.equal(benchmarked.latencyP90Ms, null);
+  assert.equal(benchmarked.deadlineFeasible, true,
+    "a synthetic latency fallback must not reject a discovered model");
+  assert.ok(benchmarked.softPenalties?.includes("latency unknown"));
   assert.match(
-    route(s.fingerprint, s.features, [], discovered).considered.find(
+    routed.considered.find(
       (candidate) => candidate.model.id === "unknown",
     )!.rejected!,
     /minimum quality|quality parity/,
@@ -1441,21 +1463,71 @@ test("Stable plans exclude tools-only models that cannot force the required tool
       supportedParameters: ["tools", "tool_choice"],
     },
   };
+  const toolsOnly = {
+    ...cheap,
+    metadata: {
+      ...cheap.metadata,
+      supportedParameters: ["tools"],
+    },
+  };
   for (const toolsRequired of [true, false]) {
     const result = route(
       { ...task.fingerprint, toolsRequired },
       task.features,
       [],
-      [cheap, compatible],
+      [toolsOnly, compatible],
     );
     assert.equal(
       result.considered.find(
-        (candidate) => candidate.model.id === cheap.model.id,
+        (candidate) => candidate.model.id === toolsOnly.model.id,
       )?.rejected,
       "tool_choice unsupported",
     );
     assert.deepEqual(result.selectedPlan?.models, [strong.model.id]);
   }
+});
+
+test("unknown protocol metadata remains eligible while explicit tool gaps are rejected per engine", () => {
+  const stableTask = scenario(
+    "Fix backend endpoint",
+    ["src/api.ts"],
+    ["node --test tests/api.test.ts"],
+    "stable",
+  );
+  const unknown = {
+    ...cheap,
+    model: { ...cheap.model, id: "unknown-protocol" },
+    metadata: {
+      available: true,
+      inputPrice: cheap.metadata.inputPrice,
+      outputPrice: cheap.metadata.outputPrice,
+      contextLength: cheap.metadata.contextLength,
+    },
+  };
+  const toolsOnly = {
+    ...cheap,
+    model: { ...cheap.model, id: "tools-without-forced-choice" },
+    metadata: { ...cheap.metadata, supportedParameters: ["tools"] },
+  };
+  const noTools = {
+    ...cheap,
+    model: { ...cheap.model, id: "explicitly-no-tools" },
+    metadata: { ...cheap.metadata, supportedParameters: [] },
+  };
+  const result = route(
+    stableTask.fingerprint,
+    stableTask.features,
+    [],
+    [unknown, toolsOnly, noTools, strong],
+  );
+  assert.equal(result.considered.find((candidate) =>
+    candidate.model.id === unknown.model.id)?.hardRejection, undefined);
+  assert.equal(result.considered.find((candidate) =>
+    candidate.model.id === toolsOnly.model.id)?.hardRejection,
+  "tool_choice unsupported");
+  assert.equal(result.considered.find((candidate) =>
+    candidate.model.id === noTools.model.id)?.hardRejection,
+  "tools unsupported");
 });
 
 test("localized PLANNED direct edits exclude endpoints without forced tool choice", () => {

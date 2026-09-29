@@ -20,7 +20,12 @@ import {
   workerReadPaths,
 } from "../context/compiler.js";
 import { extractFeatures } from "../router/features.js";
-import { taskFingerprint } from "../router/taskFingerprint.js";
+import {
+  preserveCanonicalTaskEvidence,
+  taskFingerprint,
+} from "../router/taskFingerprint.js";
+import type { DeterministicTaskProfile } from "../router/taskProfiler.js";
+import type { FrozenExecutionPlan } from "../router/modelRouter.js";
 import { requiredQualityClass } from "../router/controlPolicy.js";
 import { verificationPlan } from "../verifier/plan.js";
 import {
@@ -81,6 +86,11 @@ export interface MiniSweImplementationOptions {
   };
   tinyDirect?: boolean;
   adaptiveStartTier?: CodingTier;
+  canonicalTaskProfile?: DeterministicTaskProfile;
+  /** Run-level evidence for routing only; never substitutes for this worker's baseline. */
+  canonicalRoutingVerification?: VerificationResult;
+  canonicalVerification?: VerificationResult;
+  executionPlan?: FrozenExecutionPlan;
   /** Tests inject a deterministic worker; production never supplies this. */
   codingWorker?: CodingWorker;
 }
@@ -352,6 +362,8 @@ export async function implement(
   };
   let baseline = options.stableRepair?.baselineChecks?.length
     ? verificationResult(options.stableRepair.baselineChecks)
+    : options.canonicalVerification?.checks.length
+      ? options.canonicalVerification
     : options.tinyDirect
       ? verificationResult([])
       : commands.length
@@ -440,12 +452,10 @@ export async function implement(
       : subtask.estimatedDifficulty === "low"
         ? "tiny"
         : "normal");
-  const fingerprint = taskFingerprint(
-    subtask,
-    profile,
-    features,
-    effort,
-    baseline,
+  const fingerprint = preserveCanonicalTaskEvidence(
+    taskFingerprint(subtask, profile, features, effort, baseline),
+    options.canonicalTaskProfile,
+    options.canonicalRoutingVerification ?? options.canonicalVerification,
   );
   gateway.logger.log("task_fingerprint", {
     subtaskId: subtask.id,
@@ -478,7 +488,7 @@ export async function implement(
   const immutableSelector =
     specialistRequested &&
     typeof (pool as any).selectExecutionPlan === "function";
-  const executionPlan = immutableSelector
+  const executionPlan = options.executionPlan ?? (immutableSelector
     ? await pool!.selectExecutionPlan(
         fingerprint,
         features,
@@ -486,7 +496,7 @@ export async function implement(
         gateway.budget.remainingUsd(),
         options.raceGroup,
       )
-    : undefined;
+    : undefined);
   // Older injected test doubles expose the V1 array seam. Production always
   // receives the immutable plan object from PoolRouter.
   const legacyCascade =
@@ -595,7 +605,7 @@ export async function implement(
     // failure; the frozen task quality floor is the contract in that case.
     if (
       excluded.includes(next.model.id) ||
-      (!operational && rank < highestQualityTier)
+      (!executionPlan && !operational && rank < highestQualityTier)
     )
       return false;
     selected = next;

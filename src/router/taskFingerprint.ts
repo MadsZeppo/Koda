@@ -3,6 +3,7 @@ import type { Subtask } from "../planner/schemas.js";
 import type { RepoProfile, VerificationResult } from "../types.js";
 import { routingTaskText, type Features } from "./features.js";
 import { routingTerms } from "./knowledge/contextual.js";
+import type { DeterministicTaskProfile } from "./taskProfiler.js";
 
 export type TaskKind =
   | "implementation" | "debugging" | "frontend_ui" | "backend" | "fullstack"
@@ -20,6 +21,102 @@ export interface TaskDifficulty {
   repoReasoningComplexity: Difficulty;
   changeRisk: Difficulty;
   contextUncertainty: Difficulty;
+}
+
+const evidenceRank = { low: 0, medium: 1, high: 2 } as const;
+const stronger = <T extends keyof typeof evidenceRank>(a: T, b: T): T =>
+  evidenceRank[a] >= evidenceRank[b] ? a : b;
+const verificationRank = { weak: 0, medium: 1, strong: 2 } as const;
+const strongerVerification = <T extends keyof typeof verificationRank>(
+  a: T,
+  b: T,
+): T => (verificationRank[a] >= verificationRank[b] ? a : b);
+
+/** Engine-local routing may add evidence, but cannot erase preflight facts. */
+export function preserveCanonicalTaskEvidence(
+  fingerprint: TaskFingerprint,
+  evidence?: DeterministicTaskProfile,
+  verification?: VerificationResult,
+): TaskFingerprint {
+  if (!evidence && !verification) return fingerprint;
+  const observedChecks = verification?.checks.filter((check) =>
+    check.outcome === "CHECK_PASS" || check.outcome === "CHECK_FAIL") ?? [];
+  const observedFailures = observedChecks.filter(
+    (check) => check.outcome === "CHECK_FAIL",
+  ).length;
+  const observedExecutable = observedChecks.length > 0;
+  const verificationStrength = strongerVerification(
+    fingerprint.verificationStrength,
+    observedExecutable ? "strong" : (evidence?.verificationStrength ?? "weak"),
+  );
+  const localizationConfidence = stronger(
+    fingerprint.localizationConfidence ?? "low",
+    evidence?.scopeConfidence ?? "low",
+  );
+  const crossComponent = fingerprint.crossComponent || evidence?.crossComponent === true;
+  const boundedReproduction =
+    observedFailures > 0 &&
+    localizationConfidence === "high" &&
+    !crossComponent &&
+    evidence?.expectedBlastRadius !== "cross-component";
+  const groundedHighConsequence =
+    fingerprint.publicApiRisk || fingerprint.schemaRisk ||
+    fingerprint.architectureHeavy || evidence?.securitySensitive === true;
+  return {
+    ...fingerprint,
+    verificationStrength,
+    concurrencyRisk: fingerprint.concurrencyRisk || evidence?.concurrencyRisk,
+    publicApiRisk: fingerprint.publicApiRisk || evidence?.publicApiRisk,
+    schemaRisk: fingerprint.schemaRisk || evidence?.schemaRisk,
+    architectureHeavy:
+      fingerprint.architectureHeavy || evidence?.architectureRisk === true,
+    crossComponent,
+    localizationConfidence,
+    localizationUncertainty:
+      localizationConfidence === "high"
+        ? "low"
+        : localizationConfidence === "medium"
+          ? "medium"
+          : "high",
+    targetedExecutableVerification:
+      fingerprint.targetedExecutableVerification ||
+      observedFailures > 0 ||
+      (verificationStrength === "strong" && (evidence?.likelyTests.length ?? 0) > 0),
+    broaderProjectVerification:
+      fingerprint.broaderProjectVerification ||
+      observedExecutable || (evidence?.verificationStrength ?? "weak") !== "weak",
+    focusedFailingReproduction:
+      fingerprint.focusedFailingReproduction || observedFailures > 0,
+    observedCheckFailures: Math.max(
+      fingerprint.observedCheckFailures ?? 0,
+      observedFailures,
+    ),
+    consequenceRisk:
+      boundedReproduction && !groundedHighConsequence
+        ? "low"
+        : fingerprint.consequenceRisk,
+    verifierFalseAcceptRisk:
+      boundedReproduction ? "low" : fingerprint.verifierFalseAcceptRisk,
+    recoveryDetectability:
+      fingerprint.recoveryDetectability === "high" ||
+      verificationStrength === "strong"
+        ? "high"
+        : fingerprint.recoveryDetectability,
+    blastRadius:
+      fingerprint.blastRadius === "cross-component" ||
+      evidence?.expectedBlastRadius === "cross-component"
+        ? "cross-component"
+        : fingerprint.blastRadius === "package" ||
+            evidence?.expectedBlastRadius === "package"
+          ? "package"
+          : "single-file",
+    reasons: [
+      ...fingerprint.reasons,
+      observedExecutable
+        ? `canonical baseline verification preserved (${observedFailures} failing checks)`
+        : "canonical preflight task evidence preserved across execution engines",
+    ],
+  };
 }
 export interface TaskFingerprint {
   taskFamily?: TaskFamily;
@@ -135,6 +232,11 @@ export function taskFingerprint(
     : focusedCheck || checks.length || profile.verificationCommands.length ? "medium" : "weak";
   const high = (pattern: RegExp) => pattern.test(text);
   const repoRisk = (pattern: RegExp) => pattern.test(`${text} ${paths.join(" ")}`);
+  const repositoryBoundaryEvidence = [
+    ...paths,
+    ...(profile.ecosystem?.configFiles ?? []),
+    ...(profile.ecosystem?.evidence ?? []).flatMap((item) => [item.source, item.fact]),
+  ].join(" ").toLowerCase();
   const architecture = high(/\b(?:architect|migration|migrate|redesign|restructure|schema|cross.module)\w*\b/);
   const concurrency = repoRisk(/\b(?:concurren|race.condition|synchron|deadlock|atomic)\w*\b/);
   const interactions = high(/\b(?:interactive|animation|drag|workflow|form|navigation|accessibility)\w*\b/);
@@ -154,10 +256,20 @@ export function taskFingerprint(
   const publicApiRisk = repoRisk(
     /\b(?:change|modify|add|remove|rename|replace|break|migrate|expose|publish)\w*\b.{0,48}\b(?:public\s+api|exported\s+(?:api|interface)|endpoint|contract)\b|\b(?:public\s+api|exported\s+(?:api|interface)|endpoint|contract)\b.{0,48}\b(?:change|modify|add|remove|rename|replace|break|migrate|expose|publish)\w*\b/,
   );
-  const schemaRisk = repoRisk(/\b(?:schema|migration|database|protocol)\w*\b/);
+  const schemaRisk =
+    high(/\b(?:schema|migration|database|protocol)\w*\b/) &&
+    /(?:schema|migrations?|prisma|drizzle|typeorm|sequelize|alembic|django|sql(?:ite)?|postgres|database\.yml)/.test(
+      repositoryBoundaryEvidence,
+    );
   const configRisk = repoRisk(/\b(?:config|configuration|manifest)\w*\b/);
-  const securityRisk = repoRisk(/\b(?:security|auth|permission|credential|secret|crypto|payment)\w*\b/);
-  const consequenceRisk: Difficulty = publicApiRisk || schemaRisk || concurrency || securityRisk
+  const securityRisk =
+    high(/\b(?:security|auth|permission|credential|secret|crypto|payment)\w*\b/) &&
+    /(?:oauth|openid|jwt|crypt|credentials?|secrets?|permissions?|polic(?:y|ies)|acl|security(?:\/|\.|$)|middleware)/.test(
+      repositoryBoundaryEvidence,
+    );
+  const hazardousConcurrency = concurrency &&
+    (scope === "cross-component" || !focusedCheck);
+  const consequenceRisk: Difficulty = publicApiRisk || schemaRisk || hazardousConcurrency || securityRisk
     ? "high" : scope === "cross-component" ? "medium" : "low";
   const observedExecutableCheck = checks.some((check) =>
     check.outcome === "CHECK_PASS" || check.outcome === "CHECK_FAIL");

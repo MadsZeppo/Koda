@@ -74,8 +74,17 @@ test("research cap skips scouting when no budget is available", async () => {
 
 test("fingerprint V2 captures repository-backed risk dimensions", () => {
   const task = "Change the public API schema and synchronize concurrent callers in src/api.ts";
-  const strategy = chooseExecutionStrategy(task, repository);
-  const profile = profileTask(task, repository, strategy);
+  const repo = {
+    ...repository,
+    files: [...repository.files, "db/schema.sql"],
+    ecosystem: {
+      ...repository.ecosystem,
+      configFiles: ["db/schema.sql"],
+      evidence: [{ source: "db/schema.sql", fact: "database schema" }],
+    },
+  };
+  const strategy = chooseExecutionStrategy(task, repo);
+  const profile = profileTask(task, repo, strategy);
   assert.equal(profile.publicApiRisk, true);
   assert.equal(profile.schemaRisk, true);
   assert.equal(profile.concurrencyRisk, true);
@@ -92,6 +101,41 @@ test("canonical repo profile is stable across materially different task wording"
   assert.deepEqual(left.likelyPaths, right.likelyPaths);
   assert.equal(left.localizationEntropy, "low");
   assert.equal(left.expectedBlastRadius, "package");
+});
+
+test("risk vocabulary without a repository boundary does not fabricate high consequence", () => {
+  const repo = {
+    ...repository,
+    files: [
+      "src/authService.ts",
+      "src/sessionCache.ts",
+      "tests/authService.test.ts",
+      "package.json",
+    ],
+  };
+  const task = "Fix authorization and payment state in src/authService.ts; verify tests/authService.test.ts";
+  const strategy = chooseExecutionStrategy(task, repo);
+  const profile = profileTask(task, repo, strategy);
+  assert.equal(profile.securitySensitive, false);
+  assert.equal(profile.schemaRisk, false);
+
+  const subtask = {
+    id: "auth-state", title: task, objective: task, dependsOn: [],
+    likelyReadPaths: ["src/authService.ts", "src/sessionCache.ts", "tests/authService.test.ts"],
+    likelyWritePaths: ["src/authService.ts", "src/sessionCache.ts"],
+    integrationContract: "tests pass",
+    verificationCommands: ["node --test tests/authService.test.ts"],
+    estimatedDifficulty: "normal" as const, parallelSafe: false,
+  };
+  const baseline = { status: "FAILED", checks: [{
+    command: "node --test tests/authService.test.ts", outcome: "CHECK_FAIL",
+    kind: "test", requirement: "required",
+  }] } as any;
+  const features = extractFeatures(subtask, repo, 2500, baseline, "direct");
+  const fingerprint = taskFingerprint(subtask, repo, features, "normal", baseline);
+  assert.equal(fingerprint.consequenceRisk, "low");
+  assert.equal(fingerprint.verifierFalseAcceptRisk, "low");
+  assert.equal(fingerprint.recoveryDetectability, "high");
 });
 
 test("localized multi-file transaction evidence stays semantically bounded across paraphrases", () => {
@@ -116,7 +160,8 @@ test("localized multi-file transaction evidence stays semantically bounded acros
     assert.equal(fingerprint.semanticComplexity, "low");
     assert.equal(fingerprint.architecturalCoupling, "low");
     assert.equal(fingerprint.blastRadius, "package");
-    assert.equal(fingerprint.consequenceRisk, "high");
+    assert.equal(fingerprint.consequenceRisk, "low",
+      "payment vocabulary alone is not evidence of an external consequence boundary");
     assert.equal(fingerprint.verifierFalseAcceptRisk, "low");
     assert.equal(fingerprint.recoveryDetectability, "high");
     assert.equal(fingerprint.publicApiRisk, false,
@@ -143,7 +188,7 @@ test("broken localized multi-file baseline freezes an economical first attempt a
       modelPool: { provider: "fixture", models: [economical, reference] } });
     const pool = new PoolRouter(cfg, new Logger(dir, "broken-flow", true));
     const metadata = { available: true, inputPrice: .05, outputPrice: .1,
-      contextLength: 100000, supportedParameters: ["tools"] };
+      contextLength: 100000, supportedParameters: ["tools", "tool_choice"] };
     (pool.capabilities as any).forTask = async () => [economical, reference].map((model) => ({
       model, metadata: model.id === economical.id ? metadata :
         { ...metadata, inputPrice: 8, outputPrice: 12 },
@@ -175,6 +220,59 @@ test("broken localized multi-file baseline freezes an economical first attempt a
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+test("joint routing reports the complete discovered model by engine candidate field", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "koda-joint-diagnostics-"));
+  try {
+    const economical = modelSchema.parse({ id: "fixture/economical", tier: "cheap",
+      qualityPrior: .98, latencyPriorMs: 300, strengths: ["coding", "tool_use"] });
+    const reference = modelSchema.parse({ id: "fixture/reference", tier: "frontier",
+      qualityPrior: .99, latencyPriorMs: 2200,
+      strengths: ["coding", "tool_use", "reasoning"] });
+    const cfg = await config(undefined, { baseUrl: "http://127.0.0.1:1",
+      specialistRouting: true, routing: { stateDirectory: dir },
+      modelPool: { provider: "fixture", models: [economical, reference] } });
+    const logger = new Logger(dir, "joint", true);
+    const pool = new PoolRouter(cfg, logger);
+    (pool.capabilities as any).forTask = async () => [
+      { model: economical, metadata: { available: true, inputPrice: .01,
+        outputPrice: .02, contextLength: 100000,
+        supportedParameters: ["tools"] }, vision: false, configured: true,
+        evidence: [{ source: "agentic_benchmark", value: .98, detail: "fixture" }] },
+      { model: reference, metadata: { available: true, inputPrice: 5,
+        outputPrice: 10, contextLength: 100000,
+        supportedParameters: ["tools", "tool_choice"] }, vision: false, configured: true,
+        evidence: [{ source: "agentic_benchmark", value: .99, detail: "fixture" }] },
+    ];
+    const subtask = { id: "joint", title: "Fix src/math.ts", objective: "Fix src/math.ts",
+      likelyReadPaths: ["src/math.ts", "tests/math.test.ts"],
+      likelyWritePaths: ["src/math.ts", "src/api.ts"], dependsOn: [],
+      integrationContract: "tests pass", verificationCommands: ["pnpm test"],
+      estimatedDifficulty: "low" as const, parallelSafe: false };
+    const verification = { status: "FAILED", checks: [{ command: "pnpm test",
+      outcome: "CHECK_FAIL", kind: "test", requirement: "required" }] } as any;
+    const variants = (["stable", "planned"] as const).map((engine) => {
+      const features = extractFeatures(subtask, repository, 1000, verification, engine);
+      return { executionStrategy: engine, features,
+        fingerprint: taskFingerprint(subtask, repository, features, "normal", verification) };
+    });
+    const selected = await pool.selectJointExecutionPlan(variants, "joint", 1);
+    assert.equal(selected.executionStrategy, "planned");
+    assert.equal(selected.plan.initialModel, economical.id);
+    const event = logger.events.findLast((item) => item.type === "joint_execution_route")!;
+    assert.equal(event.total_discovered_models, 2);
+    assert.equal(event.total_compatible_models, 2);
+    assert.ok(Number(event.total_generated_model_engine_plans) >= 4);
+    const plans = event.plans as any[];
+    assert.ok(plans.some((plan) => plan.execution_engine === "stable" &&
+      plan.model === economical.id && /tool_choice/.test(plan.rejection_reason)));
+    assert.ok(plans.some((plan) => plan.execution_engine === "planned" &&
+      plan.model === economical.id && plan.quality_safe));
+    assert.ok(plans.every((plan) => "uncertainty" in plan));
+    assert.ok(Number(event.quality_safe_plan_count) >= 1);
+    assert.ok(Array.isArray(event.ordered_frozen_recovery_plans));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test("parallel economics uses additive cost and DAG critical-path latency", () => {
   const result = estimateDagEconomics([
     { id: "a", dependsOn: [], expectedCostUsd: .01, expectedLatencyMs: 100 },
@@ -199,7 +297,7 @@ test("selected specialist policy freezes limits and approved adaptive candidates
       modelPool: { provider: "local-compatible", models: [first, sideways, frontier] } });
     const pool = new PoolRouter(cfg, new Logger(dir, "frozen", true));
     const metadata = { available: true, inputPrice: .1, outputPrice: .2,
-      contextLength: 100000, supportedParameters: ["tools"] };
+      contextLength: 100000, supportedParameters: ["tools", "tool_choice"] };
     (pool.catalog as any).get = async () => new Map([first, sideways, frontier].map((model) => [model.id, metadata]));
     (pool.capabilities as any).forTask = async () => [first, sideways, frontier].map((model) => ({
       model, metadata, vision: false, configured: true,

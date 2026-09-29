@@ -26,6 +26,8 @@ export interface SpecialistModel {
   model: PoolModel;
   metadata: Metadata;
   vision: boolean;
+  /** False means latencyPriorMs is only an internal scoring fallback. */
+  latencyKnown?: boolean;
   evidence: SpecialistEvidence[];
   capabilityEvidence?: NormalizedCapabilityEvidence[];
   knowledge?: ModelRoutingKnowledge;
@@ -64,6 +66,7 @@ const marketPattern = (primary: TaskFingerprint["primary"]) => ({
 export class CapabilityRegistry {
   private pending?: Promise<SpecialistModel[]>;
   private refreshStarted = false;
+  private runSnapshotFrozen = false;
   private readonly knowledge: RoutingKnowledgeStore;
   constructor(
     readonly config: Config,
@@ -73,6 +76,25 @@ export class CapabilityRegistry {
   ) { this.knowledge = new RoutingKnowledgeStore(undefined,
     knowledgeDirectory ?? config.routing.stateDirectory); }
   all() { return this.load(); }
+  /** Resolve one immutable discovery snapshot before any routing decision. */
+  async freezeRunSnapshot() {
+    if (this.runSnapshotFrozen && this.pending) return this.pending;
+    const cached = await this.cachedSnapshot();
+    const stale = !cached.retrievedAt ||
+      Date.now() - cached.retrievedAt >= this.config.routing.cacheTtlMs;
+    const officialOpenRouter = (() => {
+      try {
+        return (this.config.modelPool?.provider ?? "openrouter") === "openrouter" &&
+          /(?:^|\.)openrouter\.ai$/i.test(new URL(this.config.baseUrl).hostname);
+      } catch { return false; }
+    })();
+    let snapshot = cached;
+    if (stale && (this.adapter || officialOpenRouter))
+      snapshot = await this.fetchSnapshot(true).catch(() => cached);
+    this.pending = this.build(snapshot);
+    this.runSnapshotFrozen = true;
+    return this.pending;
+  }
   forTask(fingerprint: TaskFingerprint) {
     // The raw snapshot is shared; task-specific market evidence is computed per subtask.
     return this.load().then((models) => this.withMarket(models, fingerprint));
@@ -202,7 +224,7 @@ export class CapabilityRegistry {
       // Routing never waits for catalog research. Use the last-known-good
       // snapshot immediately and refresh it opportunistically for later tasks.
       this.pending = this.cachedSnapshot().then((snapshot) => this.build(snapshot));
-      if (!this.adapter && process.env.OPENROUTER_API_KEY && !this.refreshStarted) {
+      if (!this.runSnapshotFrozen && !this.adapter && process.env.OPENROUTER_API_KEY && !this.refreshStarted) {
         this.refreshStarted = true;
         void this.refresh().catch(() => undefined);
       }
@@ -225,13 +247,6 @@ export class CapabilityRegistry {
     // routing rejection, not a reason to hide a model from the candidate set.
     const ids = new Set([...configured.map((m) => m.id), ...raw.keys(), ...benchmarks.keys()]);
     const catalog = this.adapter ? new Map<string, Metadata>() : await this.catalog.getCached();
-    const endpointProofRequired = !this.adapter && (() => {
-      try {
-        return /(?:^|\.)openrouter\.ai$/i.test(new URL(this.config.baseUrl).hostname);
-      } catch {
-        return false;
-      }
-    })();
     const result: SpecialistModel[] = [];
     const dynamic: [string, Metadata][] = [];
     for (const id of ids) {
@@ -243,15 +258,26 @@ export class CapabilityRegistry {
       const agentic = rows.map((row) => finite(row.agentic_index)).find((n) => n !== undefined);
       const reasoning = rows.map((row) => finite(row.reasoning_index)).find((n) => n !== undefined);
       const terminal = rows.map((row) => finite(row.terminal_index)).find((n) => n !== undefined);
+      const benchmarkLatencyMs = rows.map((row) =>
+        finite(row.latency_ms) ??
+        (finite(row.latency_seconds) === undefined
+          ? undefined
+          : finite(row.latency_seconds)! * 1000),
+      ).find((n) => n !== undefined && n > 0);
       const designs = rows.filter((row) => row.source === "design-arena" && /ui|design|component|web/i.test(String(row.category ?? row.benchmark_type ?? "")));
       const design = designs.map((row) => finite(row.elo) ?? finite(row.rating) ?? finite(row.score)).find((n) => n !== undefined);
       const cachedMetadata = catalog.get(id) ?? existing?.fallback ?? {};
+      const outputModalities = source?.architecture?.output_modalities;
+      if (Array.isArray(outputModalities) && outputModalities.length > 0 &&
+          !outputModalities.includes("text")) continue;
       const metadata: Metadata = source ? {
         inputPrice: price(source, "prompt"), outputPrice: price(source, "completion"),
         contextLength: finite(source.context_length), available: true,
         supportedParameters: Array.isArray(source.supported_parameters) ? source.supported_parameters : undefined,
+        // Absence of endpoint detail means unknown.  Only an explicit empty
+        // endpoint list proves that no endpoint can satisfy a protocol.
         routableParameterSets: endpointParameterSets(source) ??
-          cachedMetadata.routableParameterSets ?? (endpointProofRequired ? [] : undefined),
+          cachedMetadata.routableParameterSets,
       } : cachedMetadata;
       const vision = (source?.architecture?.input_modalities ?? []).includes("image") || /image/.test(source?.architecture?.modality ?? "") || !!existing?.strengths.includes("vision");
       const evidence: SpecialistEvidence[] = [];
@@ -291,7 +317,9 @@ export class CapabilityRegistry {
         ],
         qualityPrior: coding === undefined && agentic === undefined && reasoning === undefined && terminal === undefined ? 0.5
           : 0.78 + 0.18 * clamp((coding ?? agentic ?? reasoning ?? terminal!) / 100),
-        latencyPriorMs: 5000,
+        // PoolModel keeps a numeric fallback for legacy score arithmetic, but
+        // latencyKnown prevents this placeholder from becoming fake evidence.
+        latencyPriorMs: benchmarkLatencyMs ?? 5000,
       };
       const baseKnowledge = this.knowledge.forModel(id);
       const snapshotDate = new Date(snapshot.retrievedAt || 0).toISOString().slice(0, 10);
@@ -311,7 +339,9 @@ export class CapabilityRegistry {
       providerFact("availability", metadata.available === false ? 0 : 1, "ratio");
       providerFact("text_modality", 1, "ratio");
       if (vision) providerFact("vision_modality", 1, "ratio");
-      result.push({ model, metadata, vision, evidence, capabilityEvidence,
+      result.push({ model, metadata, vision,
+        latencyKnown: !!existing || benchmarkLatencyMs !== undefined,
+        evidence, capabilityEvidence,
         knowledge: { snapshotId: baseKnowledge.snapshotId,
           observations: [...baseKnowledge.observations, ...providerRows],
           pairwiseEvidence: baseKnowledge.pairwiseEvidence }, configured: !!existing });
