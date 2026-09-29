@@ -132,6 +132,7 @@ const evidenceRank: Record<EvidenceStrength, number> = {
   REJECTED: -1, UNKNOWN: 0, PROMISING: 1, SUPPORTED: 2, PROVEN: 3,
 };
 
+
 /**
  * Provider/protocol incompatibility is operational evidence, not evidence that
  * the model could not solve the coding task.
@@ -168,18 +169,82 @@ export function effectiveRecoveryFailureMode(
  * tier is not a quality contract and must not force a trivial task onto an
  * expensive model.
  */
+export function recoveryEvidenceSufficient<T extends ControlCandidate>(
+  candidate: T,
+  fp: TaskFingerprint,
+  minSamples = 3,
+): boolean {
+  if (
+    candidate.evidenceLevel === "PROVEN" ||
+    candidate.evidenceLevel === "SUPPORTED"
+  )
+    return true;
+
+  if (candidate.evidenceLevel !== "PROMISING") return false;
+
+  const consequence = fp.consequenceRisk ?? fp.difficulty.changeRisk;
+  const falseAccept =
+    fp.verifierFalseAcceptRisk ??
+    (fp.verificationStrength === "weak" ? "high" : "medium");
+  const detectable =
+    fp.recoveryDetectability ??
+    (fp.verificationStrength === "strong" ? "high" : "low");
+  const boundedBlastRadius =
+    (fp.blastRadius ??
+      (fp.scope === "cross-component"
+        ? "cross-component"
+        : fp.scope === "single"
+          ? "single-file"
+          : "package")) !== "cross-component";
+
+  return (
+    candidate.observationCount >= minSamples &&
+    fp.verificationStrength === "strong" &&
+    falseAccept === "low" &&
+    detectable === "high" &&
+    consequence !== "high" &&
+    boundedBlastRadius &&
+    !fp.architectureHeavy &&
+    !fp.publicApiRisk &&
+    !fp.schemaRisk &&
+    !fp.configRisk
+  );
+}
+
+/**
+ * Recovery stays inside the frozen quality contract.
+ *
+ * Provider/runtime failure is not evidence of weak coding quality. We simply
+ * remove the failed execution path and choose the cheapest remaining
+ * quality-evidenced candidate that still satisfies requiredQuality.
+ *
+ * Actual coding failure may prefer more conservative quality, but model tier
+ * is never itself the contract.
+ */
 export function chooseAdaptiveRecovery<T extends ControlCandidate>(
-  policy: FrozenExecutionPolicy<T>, observation: RecoveryObservation,
+  policy: FrozenExecutionPolicy<T>,
+  observation: RecoveryObservation,
   attempted: ReadonlySet<string>,
 ): T | undefined {
   if (attempted.size >= policy.maxCodingAttempts) return undefined;
 
   const failureMode = effectiveRecoveryFailureMode(observation);
-  const previous = policy.approvedCandidateSet.find((candidate) =>
-    candidate.model.id === observation.previousModel);
+  const previous = policy.approvedCandidateSet.find(
+    (candidate) => candidate.model.id === observation.previousModel,
+  );
 
-  let candidates = policy.approvedCandidateSet.filter((candidate) =>
-    !attempted.has(candidate.model.id) && !candidate.hardRejection);
+  let candidates = policy.approvedCandidateSet.filter(
+    (candidate) =>
+      !attempted.has(candidate.model.id) &&
+      !candidate.hardRejection &&
+      candidate.conservativeQuality + 1e-9 >= policy.requiredQuality &&
+      recoveryEvidenceSufficient(
+        candidate,
+        policy.taskFingerprint,
+      ),
+  );
+
+  if (!candidates.length) return undefined;
 
   const qualityCascade = policy.qualityCascadeModelIds
     ? new Set(policy.qualityCascadeModelIds)
@@ -188,56 +253,62 @@ export function chooseAdaptiveRecovery<T extends ControlCandidate>(
     policy.operationalRecoveryModelIds ?? [],
   );
 
-  if (failureMode !== "operational") {
-    if (qualityCascade)
-      candidates = candidates.filter((candidate) =>
-        qualityCascade.has(candidate.model.id));
-    if (previous)
-      candidates = candidates.filter((candidate) =>
-        tierRank[candidate.model.tier] >= tierRank[previous.model.tier] &&
-        candidate.conservativeQuality >= previous.conservativeQuality - 1e-9);
+  if (failureMode !== "operational" && qualityCascade) {
+    const qualityCandidates = candidates.filter((candidate) =>
+      qualityCascade.has(candidate.model.id),
+    );
+    if (qualityCandidates.length) candidates = qualityCandidates;
   }
+
+  if (failureMode !== "operational" && previous) {
+    const nonDegrading = candidates.filter(
+      (candidate) =>
+        candidate.conservativeQuality + 1e-9 >=
+        previous.conservativeQuality,
+    );
+    if (nonDegrading.length) candidates = nonDegrading;
+  }
+
+  const economics = (candidate: T) =>
+    candidate.conservativeQuality > 0
+      ? candidate.expectedAttemptCost / candidate.conservativeQuality
+      : Infinity;
 
   if (failureMode === "operational") {
-    // The frozen requiredQuality is the contract. Do not inherit the failed
-    // model's arbitrary marketing/configured tier as a new quality floor.
-    candidates = candidates.filter((candidate) =>
-      operationalRecovery.has(candidate.model.id) ||
-      candidate.conservativeQuality + 1e-9 >= policy.requiredQuality);
-  }
-
-  if (!candidates.length) return undefined;
-
-  if (failureMode === "operational" && policy.orderedRecoveryModelIds) {
-    for (const modelId of policy.orderedRecoveryModelIds) {
-      const candidate = candidates.find((item) => item.model.id === modelId);
-      if (candidate) return candidate;
-    }
-  }
-
-  const economics = (candidate: T) => candidate.conservativeQuality > 0
-    ? candidate.expectedAttemptCost / candidate.conservativeQuality : Infinity;
-
-  return candidates.sort((a, b) => {
-    if (failureMode === "operational")
-      return Number(!operationalRecovery.has(a.model.id)) -
+    return candidates.sort(
+      (a, b) =>
+        Number(!operationalRecovery.has(a.model.id)) -
           Number(!operationalRecovery.has(b.model.id)) ||
         a.operationalErrorRate - b.operationalErrorRate ||
         a.conservativeAttemptCost - b.conservativeAttemptCost ||
-        a.expectedAttemptCost - b.expectedAttemptCost ||
+        economics(a) - economics(b) ||
         a.expectedAttemptLatencyMs - b.expectedAttemptLatencyMs ||
         b.conservativeQuality - a.conservativeQuality ||
-        a.model.id.localeCompare(b.model.id);
+        a.model.id.localeCompare(b.model.id),
+    )[0];
+  }
 
-    if (failureMode === "no_mutation" || failureMode === "context_limit" ||
-        failureMode === "token_limit")
-      return a.tokenEfficiency.p90TotalTokens - b.tokenEfficiency.p90TotalTokens ||
-        b.conservativeQuality - a.conservativeQuality || economics(a) - economics(b);
+  if (
+    failureMode === "no_mutation" ||
+    failureMode === "context_limit" ||
+    failureMode === "token_limit"
+  ) {
+    return candidates.sort(
+      (a, b) =>
+        a.tokenEfficiency.p90TotalTokens -
+          b.tokenEfficiency.p90TotalTokens ||
+        b.conservativeQuality - a.conservativeQuality ||
+        economics(a) - economics(b),
+    )[0];
+  }
 
-    return b.conservativeQuality - a.conservativeQuality ||
+  return candidates.sort(
+    (a, b) =>
+      b.conservativeQuality - a.conservativeQuality ||
       evidenceRank[b.evidenceLevel] - evidenceRank[a.evidenceLevel] ||
-      economics(a) - economics(b);
-  })[0];
+      economics(a) - economics(b) ||
+      a.expectedAttemptLatencyMs - b.expectedAttemptLatencyMs,
+  )[0];
 }
 
 export function freezeExecutionPolicy<P extends FrozenExecutionPolicy<ControlCandidate>>(policy: P): Readonly<P> {

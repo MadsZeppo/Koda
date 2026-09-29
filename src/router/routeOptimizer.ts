@@ -165,6 +165,52 @@ const POLICY = {
   latencyUsdPerSecond: 0.001,
   interactiveP90Ms: 15000,
 } as const;
+
+export function hasSufficientQualityEvidence(
+  candidate: Pick<
+    SpecialistEstimate,
+    "evidenceLevel" | "observationCount" | "localQualityEvidence"
+  >,
+  fp: TaskFingerprint,
+  minSamples = 3,
+): boolean {
+  if (
+    candidate.evidenceLevel === "PROVEN" ||
+    candidate.evidenceLevel === "SUPPORTED"
+  )
+    return true;
+
+  if (candidate.evidenceLevel !== "PROMISING") return false;
+
+  const consequence = fp.consequenceRisk ?? fp.difficulty.changeRisk;
+  const falseAccept =
+    fp.verifierFalseAcceptRisk ??
+    (fp.verificationStrength === "weak" ? "high" : "medium");
+  const detectable =
+    fp.recoveryDetectability ??
+    (fp.verificationStrength === "strong" ? "high" : "low");
+  const boundedBlastRadius =
+    (fp.blastRadius ??
+      (fp.scope === "cross-component"
+        ? "cross-component"
+        : fp.scope === "single"
+          ? "single-file"
+          : "package")) !== "cross-component";
+
+  return (
+    candidate.observationCount >= minSamples &&
+    fp.verificationStrength === "strong" &&
+    falseAccept === "low" &&
+    detectable === "high" &&
+    consequence !== "high" &&
+    boundedBlastRadius &&
+    !fp.architectureHeavy &&
+    !fp.publicApiRisk &&
+    !fp.schemaRisk &&
+    !fp.configRisk
+  );
+}
+
 const clamp = (n: number) => Math.max(0.05, Math.min(0.995, n));
 const betaLowerBound = (
   successes: number,
@@ -762,6 +808,11 @@ export function optimizeSpecialists(
     .filter(
       (candidate) =>
         !excludedInitial.has(candidate.model.id) &&
+        hasSufficientQualityEvidence(
+          candidate,
+          fp,
+          config.routing.conditionalRecoveryMinSamples,
+        ) &&
         (fp.frontierJustified !== false ||
           candidate.model.tier !== "frontier"),
     )
@@ -787,16 +838,6 @@ export function optimizeSpecialists(
     if (candidate && shortlistIds.size < shortlistLimit)
       shortlistIds.add(candidate.model.id);
   };
-  // Reserve one bounded challenger slot for a technically executable,
-  // economically promising model with sparse evidence. It is evaluated, not
-  // declared safe: only strong deterministic verification plus a frozen
-  // quality-safe recovery can make its plan eligible.
-  if (economicalTrial && !highRisk)
-    add([...eligible]
-      .filter((candidate) => candidate.evidenceLevel === "UNKNOWN")
-      .sort((a, b) => a.conservativeAttemptCost - b.conservativeAttemptCost ||
-        a.expectedAttemptLatencyMs - b.expectedAttemptLatencyMs ||
-        a.model.id.localeCompare(b.model.id))[0]);
   add(
     [...eligible].sort(
       (a, b) =>
@@ -1010,29 +1051,51 @@ export function optimizeSpecialists(
         )
       : Infinity;
     const hardRejection = !reference
-      ? "no technically compatible priced reference"
+      ? "no technically compatible priced quality-evidenced reference"
       : excludedInitial.has(initial.model.id)
         ? "already reserved for race"
         : fp.frontierJustified === false &&
             initial.model.tier === "frontier"
           ? "frontier first attempt requires semantic justification"
-        : // Historical attempt cost predicts retries; it cannot veto an affordable
-          // first call. Rescue credit still requires funds for both reservations.
-          initial.reservationCost +
-              (rescue
-                ? Math.max(rescue.reservationCost, rescue.expectedAttemptCost)
-                : 0) >
-            budgetUsd
-          ? "completion budget"
-          : undefined;
+          : rescue &&
+              !hasSufficientQualityEvidence(
+                rescue,
+                fp,
+                config.routing.conditionalRecoveryMinSamples,
+              )
+            ? "recovery model lacks sufficient quality evidence"
+            : initial.callCount >=
+                  config.routing.conditionalRecoveryMinSamples &&
+                initial.operationalErrorRate > 0.5
+              ? "observed operational error rate too high"
+              : // Historical attempt cost predicts retries; it cannot veto an affordable
+                // first call. Rescue credit still requires funds for both reservations.
+                initial.reservationCost +
+                    (rescue
+                      ? Math.max(
+                          rescue.reservationCost,
+                          rescue.expectedAttemptCost,
+                        )
+                      : 0) >
+                  budgetUsd
+                ? "completion budget"
+                : undefined;
     const firstAttemptFloorFailed =
       initial.quality + 1e-9 < initial.firstAttemptQualityFloor &&
       (initial.localQualityEvidence >=
         config.routing.conditionalRecoveryMinSamples ||
         initial.quality < initial.firstAttemptQualityFloor -
           Math.max(0.08, allowedRegret * 4));
+    const evidenceSufficientForInitial = hasSufficientQualityEvidence(
+      initial,
+      fp,
+      config.routing.conditionalRecoveryMinSamples,
+    );
     const softPenalties = [
       ...(initial.softPenalties ?? []),
+      ...(!evidenceSufficientForInitial
+        ? ["insufficient quality evidence"]
+        : []),
       ...(firstAttemptFloorFailed ? ["first-attempt quality floor"] : []),
       ...(highRisk && initialGap > allowedRegret
         ? ["high-risk first-attempt quality"]
@@ -1042,20 +1105,20 @@ export function optimizeSpecialists(
         ? ["historical completion cost exceeds remaining budget"]
         : []),
     ];
+    const evidenceSufficient = hasSufficientQualityEvidence(
+      initial,
+      fp,
+      config.routing.conditionalRecoveryMinSamples,
+    );
     const qualityRejection =
-      reference &&
-      initial.evidenceLevel === "UNKNOWN" &&
-      (reference.evidenceLevel === "PROVEN" ||
-        reference.evidenceLevel === "SUPPORTED") &&
-      initial.model.id !== reference.model.id &&
-      !(rescue && recoveryCoverage === "targeted" && economicalTrial && !highRisk)
-        ? "unknown quality cannot displace supported reference"
+      !evidenceSufficient
+        ? "insufficient quality evidence for production first attempt"
         : highRisk && initialGap > allowedRegret
-            ? "high-risk first-attempt quality"
-            : qualityGap > allowedRegret
-              ? "quality parity"
-              : firstAttemptFloorFailed
-                ? "first-attempt quality floor"
+          ? "high-risk first-attempt quality"
+          : qualityGap > allowedRegret
+            ? "quality parity"
+            : firstAttemptFloorFailed
+              ? "first-attempt quality floor"
               : undefined;
     const rejection = hardRejection ?? qualityRejection;
     const costPerVerifiedCompletion =

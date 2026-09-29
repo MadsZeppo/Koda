@@ -122,7 +122,10 @@ export function profileTask(task: string, repo: RepoProfile, strategy: Execution
     /(?:schema|migrations?|prisma|drizzle|typeorm|sequelize|alembic|django|sql(?:ite)?|postgres|database\.yml)/.test(
       repositoryBoundaryEvidence,
     );
-  const concurrencyRisk = /\b(?:concurren|race condition|synchron|parallel|deadlock|atomic)\w*\b/.test(lower);
+  const concurrencyRisk =
+    /\b(?:concurren|race condition|synchron|deadlock|atomic|thread[- ]safe|lock[- ]free)\w*\b/.test(
+      lower,
+    );
   const architectureRisk = /\b(?:architect|redesign|restructure|large refactor)\w*\b/.test(lower);
   // Vocabulary identifies intent, not consequence.  Require a concrete
   // repository security boundary before raising the risk class: a tiny
