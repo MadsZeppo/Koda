@@ -591,7 +591,6 @@ export class PoolRouter {
       latencyBudgetMs: this.config.stageMaxMinutes * 60_000,
       maxCodingAttempts: Math.min(
         this.config.maxIterations,
-        3,
         approvedCandidateSet.length,
       ),
       maxScoutCalls: fingerprint.localizationConfidence === "low" ? 1 : 0,
