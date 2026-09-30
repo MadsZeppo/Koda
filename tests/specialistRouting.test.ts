@@ -136,6 +136,73 @@ const observed = (
       : undefined,
 });
 
+test("Aider rejects repeated failures of both edit formats before cheapest-worker economics", () => {
+  const s = scenario("Find and fix the bounded defect", ["."], [], "direct");
+  const fp = {
+    ...s.fingerprint,
+    boundedDiscovery: true,
+    localizationConfidence: "low" as const,
+    expectedFiles: 2,
+  };
+  const operations: OperationalCall[] = [0, 1].map((index) => ({
+    type: "operational_call",
+    timestamp: new Date(Date.now() - index * 1000).toISOString(),
+    runId: `format-${index}`,
+    subtaskId: "ui",
+    stage: "implement",
+    taskBucket: taskBucket(s.features),
+    modelRequested: cheap.model.id,
+    modelServed: cheap.model.id,
+    provider: "aider",
+    wallClockMs: 100,
+    outcome: "error",
+    costUsd: 0.0001,
+    editFormat: index === 0 ? "diff" : "whole",
+    failureKind: "edit_format",
+  }));
+  const result = route(fp, s.features, [], [cheap, strong], operations);
+  assert.equal(
+    result.considered.find((item) => item.model.id === cheap.model.id)
+      ?.hardRejection,
+    "observed Aider edit-format incompatibility",
+  );
+  assert.equal(result.cascade[0]?.model.id, strong.model.id);
+});
+
+test("cheap OpenRouter models remain eligible without a static Mini-SWE certificate", () => {
+  const s = scenario("Find and fix the bounded defect", ["."], [], "direct");
+  const fp = { ...s.fingerprint, boundedDiscovery: true,
+    localizationConfidence: "low" as const };
+  const uncertified = {
+    ...cheap,
+    model: { ...cheap.model, id: "inclusionai/ling-3.0-flash" },
+  };
+  const certified = {
+    ...strong,
+    model: { ...strong.model, id: "openai/gpt-5-mini" },
+  };
+  const result = route(fp, s.features, [], [uncertified, certified]);
+  assert.notEqual(result.considered.find((candidate) =>
+    candidate.model.id === uncertified.model.id)?.hardRejection,
+  "Mini-SWE protocol not certified");
+  assert.ok(result.cascade.some((candidate) =>
+    candidate.model.id === uncertified.model.id));
+});
+
+test("DeepSeek native tool models remain eligible for Mini-SWE", () => {
+  const s = scenario("Find and fix the bounded defect", ["."], [], "direct");
+  const fp = { ...s.fingerprint, boundedDiscovery: true,
+    localizationConfidence: "low" as const };
+  const deepseek = {
+    ...cheap,
+    model: { ...cheap.model, id: "deepseek/deepseek-v4.1-flash" },
+  };
+  const result = route(fp, s.features, [], [deepseek]);
+  assert.notEqual(result.considered[0]?.hardRejection,
+    "Mini-SWE protocol not certified");
+  assert.equal(result.cascade[0]?.model.id, deepseek.model.id);
+});
+
 test("universal selector considers every discovered model and chooses the cheapest quality-preserving plan", () => {
   const model = (
     id: string,
@@ -299,7 +366,7 @@ test("missing soft domain tags remain eligible when benchmark evidence supports 
       [noTools, reference],
     ).considered.find((entry) => entry.model.id === economical.model.id)
       ?.rejected,
-    "tools unsupported",
+    undefined,
   );
 });
 
@@ -1449,7 +1516,7 @@ test("race reservations select complete plans without silently removing their re
   }
 });
 
-test("Stable plans exclude tools-only models that cannot force the required tool call", () => {
+test("Aider Stable plans accept text models without forced tool choice", () => {
   const task = scenario(
     "Fix backend endpoint",
     ["src/api.ts"],
@@ -1481,13 +1548,13 @@ test("Stable plans exclude tools-only models that cannot force the required tool
       result.considered.find(
         (candidate) => candidate.model.id === toolsOnly.model.id,
       )?.rejected,
-      "tool_choice unsupported",
+      undefined,
     );
-    assert.deepEqual(result.selectedPlan?.models, [strong.model.id]);
+    assert.deepEqual(result.selectedPlan?.models, [cheap.model.id, strong.model.id]);
   }
 });
 
-test("unknown protocol metadata remains eligible while explicit tool gaps are rejected per engine", () => {
+test("Aider accepts unknown metadata and models without tool support", () => {
   const stableTask = scenario(
     "Fix backend endpoint",
     ["src/api.ts"],
@@ -1524,13 +1591,13 @@ test("unknown protocol metadata remains eligible while explicit tool gaps are re
     candidate.model.id === unknown.model.id)?.hardRejection, undefined);
   assert.equal(result.considered.find((candidate) =>
     candidate.model.id === toolsOnly.model.id)?.hardRejection,
-  "tool_choice unsupported");
+  undefined);
   assert.equal(result.considered.find((candidate) =>
     candidate.model.id === noTools.model.id)?.hardRejection,
-  "tools unsupported");
+  undefined);
 });
 
-test("localized PLANNED direct edits exclude endpoints without forced tool choice", () => {
+test("Aider localized PLANNED edits accept endpoints without forced tool choice", () => {
   const task = scenario(
     "Fix the isolated dashboard calculation",
     ["src/Dashboard.tsx"],
@@ -1556,12 +1623,12 @@ test("localized PLANNED direct edits exclude endpoints without forced tool choic
   const result = route(task.fingerprint, task.features, [], [toolsOnly, compatible]);
   assert.equal(
     result.considered.find((candidate) => candidate.model.id === toolsOnly.model.id)?.rejected,
-    "tool_choice unsupported",
+    undefined,
   );
-  assert.deepEqual(result.selectedPlan?.models, [compatible.model.id]);
+  assert.deepEqual(result.selectedPlan?.models, [cheap.model.id, strong.model.id]);
 });
 
-test("recent observed DIRECT protocol incompatibility excludes the model until a later success", () => {
+test("legacy tool protocol failures do not establish Aider format incompatibility", () => {
   const task = scenario(
     "Fix the isolated dashboard calculation",
     ["src/Dashboard.tsx"],
@@ -1610,9 +1677,9 @@ test("recent observed DIRECT protocol incompatibility excludes the model until a
   assert.equal(
     rejected.considered.find((candidate) =>
       candidate.model.id === compatibleCheap.model.id)?.rejected,
-    "observed tool protocol incompatibility",
+    undefined,
   );
-  assert.deepEqual(rejected.selectedPlan?.models, [compatibleStrong.model.id]);
+  assert.deepEqual(rejected.selectedPlan?.models, [compatibleCheap.model.id, compatibleStrong.model.id]);
 
   const recovered = route(
     task.fingerprint,
@@ -1622,14 +1689,14 @@ test("recent observed DIRECT protocol incompatibility excludes the model until a
     [failed, { ...failed, outcome: "response", modelServed: compatibleCheap.model.id,
       costUsd: 0.001, failureKind: undefined }],
   );
-  assert.notEqual(
+  assert.equal(
     recovered.considered.find((candidate) =>
       candidate.model.id === compatibleCheap.model.id)?.rejected,
-    "observed tool protocol incompatibility",
+    undefined,
   );
 });
 
-test("Stable rejects a model-level tool union when no endpoint supports the full protocol", () => {
+test("Aider does not require an endpoint with a tool protocol", () => {
   const task = scenario(
     "Add a focused test",
     ["tests/api.test.ts"],
@@ -1662,7 +1729,7 @@ test("Stable rejects a model-level tool union when no endpoint supports the full
     result.considered.find(
       (candidate) => candidate.model.id === splitEndpoints.model.id,
     )?.rejected,
-    "tool_choice unsupported",
+    undefined,
   );
-  assert.deepEqual(result.selectedPlan?.models, [compatible.model.id]);
+  assert.deepEqual(result.selectedPlan?.models, [cheap.model.id, strong.model.id]);
 });

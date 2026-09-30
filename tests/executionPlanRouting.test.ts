@@ -180,6 +180,57 @@ test("verified rescue makes an economical first attempt competitive with referen
   assert.ok(cascade.reason.length > 0);
 });
 
+test("bounded discovery starts with the cheapest viable interactive model", () => {
+  const bounded = {
+    ...fingerprint(),
+    boundedDiscovery: true,
+    localizationConfidence: "low" as const,
+    targetedExecutableVerification: false,
+    verifierFalseAcceptRisk: "high" as const,
+    recoveryDetectability: "low" as const,
+    difficulty: {
+      ...fingerprint().difficulty,
+      repoReasoningComplexity: "high" as const,
+      contextUncertainty: "high" as const,
+    },
+  };
+  const economical = model("economical-discovery", 0.63, 0.001);
+  const strong = model("strong-recovery", 0.93, 1);
+  const result = route([economical, strong], bounded);
+
+  assert.equal(result.selectedPlan?.models[0], "economical-discovery");
+  assert.ok(result.allowedRegret >= 0.2);
+});
+
+test("interactive routing rejects batch-only model identifiers", () => {
+  const batch = model("strong:batch", 0.99, 0.001);
+  const result = route([batch, efficient()]);
+
+  assert.equal(
+    result.considered.find((candidate) => candidate.model.id === "strong:batch")
+      ?.rejected,
+    "batch endpoint unsupported for interactive worker",
+  );
+  assert.notEqual(result.selectedPlan?.models[0], "strong:batch");
+});
+
+test("interactive routing skips free models and chooses the cheapest paid candidate", () => {
+  const free = model("vendor/free-coder:free", 0.99, 0);
+  const cheapPaid = model("vendor/cheap-paid", 0.63, 0.001);
+  const strongPaid = model("vendor/strong-paid", 0.93, 1);
+  const result = route(
+    [free, cheapPaid, strongPaid],
+    { ...fingerprint(), boundedDiscovery: true },
+  );
+
+  assert.equal(
+    result.considered.find((candidate) => candidate.model.id === free.model.id)
+      ?.rejected,
+    "free models temporarily disabled",
+  );
+  assert.equal(result.selectedPlan?.models[0], cheapPaid.model.id);
+});
+
 test("detectable bounded consequence risk uses verified trajectory economics instead of forcing frontier-first", () => {
   const fp = fingerprint();
   fp.concurrencyRisk = true;
@@ -220,13 +271,13 @@ test("model and execution strategy compete as one quality-safe economic plan", (
   assert.equal(
     stable.considered.find((candidate) => candidate.model.id === cheap.model.id)
       ?.hardRejection,
-    "tool_choice unsupported",
+    undefined,
   );
   const selected = chooseJointExecutionRoute([
     { executionStrategy: "stable", route: stable },
     { executionStrategy: "planned", route: planned },
   ]);
-  assert.equal(selected?.executionStrategy, "planned");
+  assert.equal(selected?.executionStrategy, "stable");
   assert.equal(selected?.plan.models[0], cheap.model.id);
   assert.ok(selected!.plan.qualityGap <= selected!.route.allowedRegret);
 });
@@ -474,7 +525,7 @@ test("technical incompatibility remains a hard rejection for every execution pla
   );
   assert.equal(result.considered.length, 6);
   for (const [id, reason] of [
-    ["no-tools", "tools unsupported"],
+    ["no-tools", "vision unsupported"],
     ["short-context", "context limit"],
     ["no-vision", "vision unsupported"],
     ["unavailable", "unavailable"],
@@ -750,7 +801,7 @@ test("one observed model by engine timeout recalibrates the whole trajectory lat
   const timedOut = observation("efficient", fingerprint(), {
     verification: "NOT_FULLY_VERIFIED",
     wallClockMs: 49_000,
-    executionEngine: "direct-edit",
+    executionEngine: "aider",
     reason: "provider timeout",
     operationalFailure: "timeout",
   });

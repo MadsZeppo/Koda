@@ -133,7 +133,14 @@ export function rankCandidates(
       !["structured_outputs", "response_format"].some((parameter) =>
         supportsParameters(md, [parameter]),
       );
-    const rejected = plannerUnsupported
+    const freeModel = model.id.endsWith(":free") ||
+      model.id === "openrouter/free" ||
+      (md.inputPrice === 0 && md.outputPrice === 0);
+    const rejected = freeModel
+      ? "free models temporarily disabled"
+      : model.id.endsWith(":batch")
+      ? "batch endpoint unsupported for interactive worker"
+      : plannerUnsupported
       ? "structured planning unsupported"
       : !model.enabled
         ? "disabled"
@@ -498,7 +505,7 @@ export class PoolRouter {
       [candidate.model.id, candidate] as const));
     const safeModelIds = new Set(qualitySafePlans.flatMap((candidate) =>
       candidate.models));
-    const qualityCandidates = [...new Map([
+    const qualityCandidatePool = [...new Map([
       ...cascade.map((candidate) => [candidate.model.id, candidate] as const),
       ...result.considered
         .filter((candidate) => safeModelIds.has(candidate.model.id) &&
@@ -508,6 +515,11 @@ export class PoolRouter {
           a.expectedAttemptCost - b.expectedAttemptCost)
         .map((candidate) => [candidate.model.id, candidate] as const),
     ]).values()];
+    // Freeze a genuinely bounded worker shortlist. The optimizer owns the
+    // initial worker and one quality rescue; a separate peer may be reserved
+    // for provider/protocol failure. This prevents recovery from turning the
+    // full catalog into a sequential model loop.
+    const qualityCandidates = qualityCandidatePool.slice(0, 2);
     const orderedRecoveryModelIds = [...new Set(qualitySafePlans
       .filter((candidate) => candidate !== selectedOptimizerPlan)
       .map((candidate) => candidate.models[0])
@@ -517,7 +529,7 @@ export class PoolRouter {
       .filter((candidate): candidate is SpecialistEstimate =>
         !!candidate && !candidate.hardRejection && !candidate.rejected &&
         candidate.deadlineFeasible)
-      .slice(0, Math.max(0, Math.min(2, this.config.maxIterations - 1)));
+      .slice(0, Math.max(0, Math.min(1, this.config.maxIterations - 1)));
     const approvedCandidateSet = [...new Map([
       ...qualityCandidates,
       ...operationalRecovery,
@@ -1072,6 +1084,7 @@ export class PoolRouter {
         (event) =>
           event.subtaskId === subtaskId &&
           (event.type === "verification" ||
+            event.type === "aider_attempt_verification" ||
             event.type === "mini_swe_attempt_verification"),
       )
       .map((event) =>
@@ -1147,7 +1160,8 @@ export class PoolRouter {
         .reverse()
         .find(
           (event) =>
-            event.type === "mini_swe_attempt_verification" &&
+            (event.type === "aider_attempt_verification" ||
+              event.type === "mini_swe_attempt_verification") &&
             event.subtaskId === subtaskId &&
             event.model === model.id,
         )?.outcome,
@@ -1162,6 +1176,8 @@ export class PoolRouter {
         ).length,
       executionEngine: worker?.worker_engine === "direct-edit"
         ? ("direct-edit" as const)
+        : worker?.worker_engine === "aider"
+          ? ("aider" as const)
         : worker?.worker_engine === "mini-swe-agent"
           ? ("mini-swe-agent" as const)
           : undefined,

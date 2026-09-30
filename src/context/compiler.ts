@@ -1,4 +1,4 @@
-import { compactEcosystem, projectFor } from "../repo/ecosystem.js";
+import { compactEcosystem, generatedPath, projectFor } from "../repo/ecosystem.js";
 import type { Subtask, Plan } from "../planner/schemas.js";
 import { open, stat } from "node:fs/promises";
 import { posix } from "node:path";
@@ -312,12 +312,17 @@ export async function compileContext(
 ): Promise<WorkerContext> {
   const files = profile.files;
 
+  const broadRootScope = paths.includes(".");
+  const manifest = /(?:^|\/)(?:package\.json|tsconfig\.json|pyproject\.toml|go\.mod|Cargo\.toml)$/;
+  const passiveInitialNoise = (file: string) =>
+    generatedPath(file) ||
+    /(?:^|\/)tests?\/fixtures(?:\/|$)/i.test(file);
+
   const assigned = (file: string) =>
     paths.some(
       (p) =>
-        p === "." ||
-        file === p ||
-        file.startsWith(p.replace(/\/$/, "") + "/"),
+        p !== "." &&
+        (file === p || file.startsWith(p.replace(/\/$/, "") + "/")),
     );
 
   const known = new Set(files);
@@ -341,21 +346,22 @@ export async function compileContext(
   for (const file of files) {
     const pathAssigned = paths.some(
         (p) =>
-          p === "." ||
-          file === p ||
-          file.startsWith(p.replace(/\/$/, "") + "/"),
+          p !== "." && (file === p ||
+          file.startsWith(p.replace(/\/$/, "") + "/")),
       );
     if (pathAssigned && (!localizedTestTask || namedTests.has(file))) {
       add(file, namedTests.has(file) ? 140 : isTestPath(file) ? 90 : 110);
     }
 
-    if (!focused && explicitlyNamed.has(file)) {
+    if (explicitlyNamed.has(file)) {
       add(file, isTestPath(file) ? 140 : 120);
-    } else if (!focused && !localizedTestTask && task.includes(posix.basename(file))) {
+    } else if (!broadRootScope && !focused && !localizedTestTask &&
+      task.includes(posix.basename(file))) {
       add(file, 100);
     }
 
-    if (!focused && !localizedTestTask && terms.some((t) => file.toLowerCase().includes(t))) {
+    if (!broadRootScope && !focused && !localizedTestTask &&
+      terms.some((t) => file.toLowerCase().includes(t))) {
       add(file, isTestPath(file) ? 85 : 70);
     }
   }
@@ -368,15 +374,14 @@ export async function compileContext(
   for (const file of ordered
     .filter(
       (f) =>
-        !focused ||
+        (!broadRootScope && !focused && !passiveInitialNoise(f)) ||
         assigned(f) ||
-        isTestPath(f) ||
-        /(?:package\.json|tsconfig\.json|pyproject\.toml|go\.mod|Cargo\.toml)$/.test(
-          f,
-        ),
+        explicitlyNamed.has(f) ||
+        manifest.test(f) ||
+        (focused && !broadRootScope && isTestPath(f)),
     )
     .filter((f) => !localizedTestTask || explicitlyNamed.has(f) ||
-      /(?:package\.json|tsconfig\.json|pyproject\.toml|go\.mod|Cargo\.toml)$/.test(f))
+      manifest.test(f))
     .slice(0, limits.scanFiles)) {
     if (
       !/\.(?:[cm]?[jt]sx?|py|go|rs|java|[ch](?:pp)?|rb|json|toml|yaml|yml)$/.test(
@@ -519,7 +524,9 @@ export async function compileContext(
   }
 
   for (const file of ordered
-    .filter((f) => !focused || scores.has(f))
+    .filter((f) =>
+      scores.has(f) &&
+      (!passiveInitialNoise(f) || explicitlyNamed.has(f) || assigned(f)))
     .slice(0, 40)) {
     result.repoMap.push(file);
 

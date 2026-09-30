@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { extname } from "node:path";
 import {
+  allowedJointExecutionStrategies,
   chooseExecutionStrategy,
   directWritePaths,
 } from "../src/router/executionStrategy.js";
@@ -184,6 +185,40 @@ test("execution strategy: exact same-directory source paths use dependency-aware
     "src/accounts.js",
     "src/payments.js",
   ]);
+});
+test("a source change and its companion test stay one direct workstream", () => {
+  const repository = profile([
+    "src/value.ts",
+    "tests/value.test.ts",
+    "src/unrelated.ts",
+    "package.json",
+  ]);
+  const result = chooseExecutionStrategy(
+    "Correct the result in src/value.ts and update tests/value.test.ts.",
+    repository,
+  );
+  assert.equal(result.execution_strategy, "direct");
+  assert.equal(result.execution_effort, "normal");
+  assert.deepEqual(result.likelyFiles, ["src/value.ts"]);
+  assert.deepEqual(directWritePaths(
+    [...result.likelyFiles, "tests/value.test.ts"],
+    repository,
+    "Correct the result in src/value.ts and update tests/value.test.ts.",
+  ), ["src/value.ts", "tests/value.test.ts"]);
+});
+test("bounded Direct remains the authoritative engine during joint model routing", () => {
+  assert.deepEqual(
+    allowedJointExecutionStrategies("direct", true, true),
+    ["direct"],
+  );
+  assert.deepEqual(
+    allowedJointExecutionStrategies("stable", true, true),
+    ["stable", "planned", "direct"],
+  );
+  assert.deepEqual(
+    allowedJointExecutionStrategies("planned", true, false),
+    ["planned", "stable"],
+  );
 });
 test("execution strategy: bounded inspect, fix and regression test uses stable mode", () => {
   const repository = profile([

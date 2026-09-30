@@ -104,7 +104,13 @@ for (const scenario of [
       }
       let message: any;
       const planner = body.messages[0].content.startsWith("Compile");
-      if (planner)
+      if (body.messages[0].content.startsWith("Localize")) {
+        const inventory = JSON.parse(body.messages[1].content);
+        message = { role: "assistant", content: null, tool_calls: [{ id: "scout", type: "function",
+          function: { name: "submit_routing_scout", arguments: JSON.stringify({
+            paths: inventory.repositoryFiles.filter((path: string) => path.startsWith("src/")),
+            symbols: inventory.symbols, evidence: ["Repository inventory identifies independent exports"] }) } }] };
+      } else if (planner)
         message = {
           role: "assistant",
           content: JSON.stringify({
@@ -198,7 +204,9 @@ for (const scenario of [
         repo,
         task: parallel
           ? "Fix math, slug and display-name; preserve existing behavior."
-          : "Fix the add function so all tests pass.",
+          : scenario === "already-satisfied"
+            ? "Fix the add function in src/calculator.js so test/calculator.test.js passes."
+            : "Fix the add function so all tests pass.",
         config: c,
         quiet: true,
         output: join(root, "report"),
@@ -274,7 +282,7 @@ for (const scenario of [
       }
       if (parallel) {
         for (const r of requests.filter(
-          (r) => !r.messages[0].content.startsWith("Compile"),
+          (r) => r.messages[0].content.startsWith("Deterministic test CodingWorker"),
         )) {
           const input = JSON.parse(r.messages[1].content);
           assert.match(input.task, new RegExp(input.subtask.objective.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));

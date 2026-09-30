@@ -19,6 +19,7 @@ import { summarize } from "./telemetry/summary.js";
 import { Budget } from "./openrouter/usage.js";
 import { Gateway } from "./openrouter/client.js";
 import {
+  allowedJointExecutionStrategies,
   chooseExecutionStrategy,
   directWritePaths,
   requestsTestMutation,
@@ -34,7 +35,7 @@ import { compileTask } from "./planner/taskCompiler.js";
 import { planningPolicy } from "./planner/policy.js";
 import { bestExecutablePlanner } from "./planner/routing.js";
 import { schedule } from "./orchestrator/scheduler.js";
-import { implement } from "./agent/miniSweExecutor.js";
+import { implement } from "./agent/codingExecutor.js";
 import { currentDiff, safePath } from "./agent/tools.js";
 import { truncateBytes } from "./context/bounds.js";
 import { AttemptCheckpoint } from "./agent/attemptCheckpoint.js";
@@ -264,41 +265,8 @@ export async function run(options: RunOptions) {
       initialTaskProfile.likelyPaths,
       () => Math.min(options.config.commandTimeoutMs, budget.remainingMs()),
       (check) => logger.log("verification", { subtaskId: "routing-preflight", ...check }),
+      options.task,
     );
-
-    // Routing must observe one real, bounded repository signal before model/engine
-    // selection. Prefer build because it is normally much cheaper than a full suite.
-    const observedRepoCheck = canonicalVerification.checks.some((check) =>
-      /(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:build|test)\b/.test(check.command ?? ""),
-    );
-
-    if (!observedRepoCheck) {
-      const boundedRepoCommand =
-        profile.verificationCommands.find((command) =>
-          /(?:npm|pnpm|yarn)\s+(?:run\s+)?build\b/.test(command),
-        ) ??
-        profile.verificationCommands.find((command) =>
-          /(?:npm|pnpm|yarn)\s+(?:run\s+)?test\b/.test(command),
-        );
-
-      if (boundedRepoCommand) {
-        const boundedRepoVerification = await verify(
-          integration.path,
-          [boundedRepoCommand],
-          () => Math.min(options.config.commandTimeoutMs, budget.remainingMs()),
-          (check) =>
-            logger.log("verification", {
-              subtaskId: "routing-preflight",
-              ...check,
-            }),
-        );
-
-        canonicalVerification = verificationResult([
-          ...canonicalVerification.checks,
-          ...boundedRepoVerification.checks,
-        ]);
-      }
-    }
 
     const observedRoutingChecks = canonicalVerification.checks.filter((check) =>
       check.outcome === "CHECK_PASS" || check.outcome === "CHECK_FAIL");
@@ -339,6 +307,7 @@ export async function run(options: RunOptions) {
         fraction: options.config.routing.researchBudgetFraction,
       },
       async (taskProfile: DeterministicTaskProfile, capUsd: number) => {
+        if (strategy.execution_strategy !== "planned") return undefined;
         if (!gateway.modelRouter) return undefined;
         const context = {
           task: options.task,
@@ -515,7 +484,12 @@ export async function run(options: RunOptions) {
       ),
     });
     const sharedRoutingEvidence: EvidencePacket = {
-      relevantFiles: routingResume.relevantPaths,
+      relevantFiles: [
+        ...new Set([
+          ...routingResume.profile.likelyPaths,
+          ...(routingResume.scout?.paths ?? []),
+        ]),
+      ].slice(0, 16),
       symbols: routingResume.scout?.symbols ?? [],
       reproduction: routingResume.scout?.reproduction ?? "",
       failingTests: [
@@ -543,7 +517,10 @@ export async function run(options: RunOptions) {
       !options.config.forceModel
     ) {
       const boundedWritePaths = directWritePaths(
-        routingResume.relevantPaths,
+        [
+          ...routingResume.profile.likelyPaths,
+          ...(routingResume.scout?.paths ?? []),
+        ],
         profile,
         options.task,
       );
@@ -581,42 +558,30 @@ export async function run(options: RunOptions) {
             budget.remainingTokens(),
           );
       const plannedExecutable = !!plannedPreview.candidate || !!plannerEstimate;
-      const strategies: ExecutionStrategy[] = [
-        ...(strategy.execution_strategy !== "planned" || plannedExecutable
-          ? [strategy]
-          : []),
-        ...(strategy.execution_strategy !== "stable"
-          ? [{
-              ...strategy,
-              execution_strategy: "stable" as const,
-              execution_effort: "normal" as const,
-              strategy_reason: "Joint router alternative",
-              preciseTarget: undefined,
-            }]
-          : []),
-        ...(strategy.execution_strategy !== "planned" && plannedExecutable
-          ? [{
-              ...strategy,
-              execution_strategy: "planned" as const,
-              execution_effort: "normal" as const,
-              strategy_reason: "Joint router alternative",
-            }]
-          : []),
-        ...(strategy.execution_strategy !== "direct" &&
-            routingResume.profile.scopeConfidence === "high" &&
-            boundedWritePaths.length >= 1 && boundedWritePaths.length <= 4
-          ? [{
-              ...strategy,
-              execution_strategy: "direct" as const,
-              execution_effort: "normal" as const,
-              strategy_reason: "Joint router alternative",
-              preciseTarget: boundedWritePaths.length === 1
-                ? boundedWritePaths[0]
-                : undefined,
-            }]
-          : []),
-      ].filter((candidate, index, all) => all.findIndex((item) =>
-        item.execution_strategy === candidate.execution_strategy) === index);
+      const boundedDirectAlternative =
+        !routingResume.profile.crossComponent &&
+        routingResume.profile.semanticAssessment?.expectedChangeSize !==
+          "multi-component" &&
+        !["hard", "frontier"].includes(
+          routingResume.profile.semanticAssessment?.semanticDifficulty ??
+            "easy",
+        ) &&
+        boundedWritePaths.length >= 1 && boundedWritePaths.length <= 4;
+      const strategies: ExecutionStrategy[] = allowedJointExecutionStrategies(
+        strategy.execution_strategy,
+        plannedExecutable,
+        boundedDirectAlternative,
+      ).map((executionStrategy) => executionStrategy === strategy.execution_strategy
+        ? strategy
+        : {
+            ...strategy,
+            execution_strategy: executionStrategy,
+            execution_effort: "normal" as const,
+            strategy_reason: "Joint router alternative",
+            preciseTarget: executionStrategy === "direct" && boundedWritePaths.length === 1
+              ? boundedWritePaths[0]
+              : undefined,
+          });
       const variants = strategies.map((candidate) => {
         const routeSubtask: Subtask = {
           id: `route-${candidate.execution_strategy}`,
@@ -626,7 +591,9 @@ export async function run(options: RunOptions) {
           likelyReadPaths: routingResume.relevantPaths,
           likelyWritePaths: candidate.execution_strategy === "stable"
             ? ["."]
-            : boundedWritePaths,
+            : boundedWritePaths.length
+              ? boundedWritePaths
+              : ["."],
           integrationContract: "Preserve the task acceptance contract",
           verificationCommands: profile.verificationCommands,
           estimatedDifficulty: "normal",
@@ -941,35 +908,38 @@ export async function run(options: RunOptions) {
           ? "VERIFIED_SUCCESS"
           : "AWAITING_FINAL_VERIFICATION",
       });
-    } else if (strategy.execution_strategy === "direct") {
-      const context =
-        strategy.execution_effort === "tiny" && strategy.preciseTarget
-          ? await compileTargetContext(
-              integration.path,
-              strategy.preciseTarget,
+  } else if (strategy.execution_strategy === "direct") {
+    const directEvidencePaths = directWritePaths(
+      routingResume.profile.likelyPaths,
+      profile,
+      options.task,
+    );
+    const context =
+      strategy.execution_effort === "tiny" && strategy.preciseTarget
+        ? await compileTargetContext(
+            integration.path,
+            strategy.preciseTarget,
               options.task,
               options.config.context,
             )
-          : await compileContext(
-              integration.path,
-              options.task,
-              strategy.likelyFiles,
-              profile,
-              options.config.context,
-            );
+        : await compileContext(
+            integration.path,
+            options.task,
+            directEvidencePaths.length ? directEvidencePaths : ["."],
+            profile,
+            options.config.context,
+          );
       const subtask: Subtask = {
         id: "direct",
         title: options.task,
         objective: options.task,
         dependsOn: [],
         likelyReadPaths: strategy.likelyFiles,
-        likelyWritePaths: strategy.preciseTarget
-          ? [strategy.preciseTarget]
-          : directWritePaths(
-              [...strategy.likelyFiles, ...context.localDependencies],
-              profile,
-              options.task,
-            ),
+      likelyWritePaths: strategy.preciseTarget
+        ? [strategy.preciseTarget]
+        : directEvidencePaths.length
+          ? directEvidencePaths
+          : ["."],
         integrationContract:
           "Satisfy the original task while preserving existing public interfaces",
         verificationCommands: [],

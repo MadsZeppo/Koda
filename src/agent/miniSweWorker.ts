@@ -25,6 +25,27 @@ export function sanitizeOpenRouterApiKey(value: string | undefined) {
 export const redactOpenRouterSecret = (value: string | undefined, secret: string) =>
   value?.replaceAll(secret, "[REDACTED]");
 
+const trajectoryDiscoveryEvidence = (raw: string | undefined) => {
+  if (!raw) return undefined;
+  try {
+    const messages = JSON.parse(raw)?.messages;
+    if (!Array.isArray(messages)) return undefined;
+    const rows = messages.flatMap((message: any) => {
+      if (message?.role === "tool" && typeof message.content === "string")
+        return [message.content];
+      if (message?.role !== "assistant" || !Array.isArray(message.tool_calls)) return [];
+      return message.tool_calls.flatMap((call: any) =>
+        typeof call?.function?.arguments === "string"
+          ? [`$ ${call.function.arguments}`]
+          : []);
+    });
+    const evidence = rows.join("\n");
+    return evidence.length > 6_000
+      ? `${evidence.slice(0, 4_000)}\n...\n${evidence.slice(-1_900)}`
+      : evidence || undefined;
+  } catch { return undefined; }
+};
+
 export type MiniSweBridgeRunner = (input: CodingWorkerInput & { trajectoryPath: string }) =>
   Promise<Omit<CodingWorkerResult, "changedPaths">>;
 
@@ -58,15 +79,28 @@ export class MiniSweWorker implements CodingWorker {
       { OPENROUTER_API_KEY: apiKey, PYTHONUNBUFFERED: "1" }, [exchange],
       [runtimeRoot, interpreterRoot]);
     let parsed: Omit<CodingWorkerResult, "changedPaths">;
+    const trajectory = await readFile(localTrajectory, "utf8").catch(() => undefined);
+    if (trajectory !== undefined)
+      await writeFile(input.trajectoryPath, redactOpenRouterSecret(trajectory, apiKey)!);
     try {
       parsed = JSON.parse(redactOpenRouterSecret(await readFile(responsePath, "utf8"), apiKey)!);
-      const trajectory = await readFile(localTrajectory, "utf8").catch(() => undefined);
-      if (trajectory !== undefined)
-        await writeFile(input.trajectoryPath, redactOpenRouterSecret(trajectory, apiKey)!);
     }
     catch {
-      if (execution.timedOut)
-        throw Error("TIMEOUT: mini-SWE bridge exceeded the attempt wall-clock limit");
+      if (execution.timedOut) {
+        const evidence = trajectoryDiscoveryEvidence(
+          redactOpenRouterSecret(trajectory, apiKey),
+        );
+        const timeoutResult: Omit<CodingWorkerResult, "changedPaths"> = {
+          exitStatus: "infra_failure", model: input.model,
+          engine: "mini-swe-agent", engineVersion: MINI_SWE_VERSION,
+          trajectoryPath: input.trajectoryPath, wallClockMs: execution.wallClockMs,
+          terminationReason: "infrastructure_failure", limitKind: "timeout",
+          discoveryEvidence: evidence,
+          discoveryProgress: evidence ? 1 : 0,
+          fatalError: "TIMEOUT: mini-SWE bridge exceeded the attempt wall-clock limit",
+        };
+        return timeoutResult;
+      }
       throw Error(`INFRA_FAILURE: invalid mini-SWE bridge response: ${redactOpenRouterSecret(execution.stderr.slice(-2000), apiKey)}`);
     }
     finally { await rm(exchange, { recursive: true, force: true }); }
@@ -113,12 +147,13 @@ export class MiniSweWorker implements CodingWorker {
       let bridge: Omit<CodingWorkerResult, "changedPaths"> | undefined;
       const execute = async (copy: string, remainingMs: number) => {
         attemptBegan = true;
-        bridge = await this.invoke({ ...input, repoPath: copy,
+        const result = await this.invoke({ ...input, repoPath: copy,
           timeoutMs: Math.min(input.timeoutMs, remainingMs), trajectoryPath });
+        bridge = result;
         return { command: "mini-swe-agent bridge", cwd: ".",
-          exitCode: bridge.exitStatus === "infra_failure" ? 2 : 0,
-          stdout: JSON.stringify(bridge), stderr: bridge.stderr ?? "",
-          wallClockMs: bridge.wallClockMs, timedOut: bridge.terminationReason === "TimeExceeded" };
+          exitCode: result.exitStatus === "infra_failure" ? 2 : 0,
+          stdout: JSON.stringify(result), stderr: result.stderr ?? "",
+          wallClockMs: result.wallClockMs, timedOut: result.terminationReason === "TimeExceeded" };
       };
       const commandResult = input.directFullScope && scope.paths.length === 1 && scope.paths[0] === "."
         ? await execute(input.repoPath, input.timeoutMs)

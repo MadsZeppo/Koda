@@ -236,3 +236,38 @@ test("focused worker context excludes independent siblings but retains tests and
     await rm(f.root, { recursive: true, force: true });
   }
 });
+test("root discovery scope starts with bounded evidence instead of repository contents", async () => {
+  const f = await fixture();
+  try {
+    await mkdir(join(f.repo, ".koda-routing-backup"), { recursive: true });
+    await mkdir(join(f.repo, "tests/fixtures/math"), { recursive: true });
+    await mkdir(join(f.repo, "tests"), { recursive: true });
+    await writeFile(join(f.repo, ".koda-routing-backup/run.ts"), "backup");
+    await writeFile(join(f.repo, "tests/fixtures/math/noise.test.ts"), "noise");
+    await writeFile(join(f.repo, "tests/unrelated.test.ts"), "unrelated");
+    await writeFile(join(f.repo, "tests/routingKnowledge.test.ts"), "routing");
+    await writeFile(join(f.repo, "package.json"), "{}");
+    await git(f.repo, "add", ".");
+    await git(f.repo, "commit", "-m", "root context");
+    const context = await compileContext(
+      f.repo,
+      "Find and fix the localized routing knowledge defect",
+      ["."],
+      await profileRepo(f.repo),
+      (await config(undefined, { models: {} })).context,
+      true,
+    );
+    const profiled = await profileRepo(f.repo);
+    const initial = [...context.files.map((file) => file.path), ...context.repoMap];
+    assert.ok(!profiled.files.some((file) => file.startsWith(".koda-")));
+    assert.ok(initial.includes("package.json"));
+    assert.ok(!initial.some((file) => file.startsWith(".koda-")));
+    assert.ok(!initial.some((file) => file.startsWith("tests/fixtures/")));
+    assert.ok(!initial.includes("tests/unrelated.test.ts"));
+    assert.ok(!initial.includes("tests/routingKnowledge.test.ts"));
+    assert.ok(!initial.includes("src/a.ts"));
+    assert.ok(!initial.includes("src/b.ts"));
+  } finally {
+    await rm(f.root, { recursive: true, force: true });
+  }
+});

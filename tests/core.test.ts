@@ -700,6 +700,23 @@ test("command timeout terminates execution", async () => {
   }
 });
 
+test("command timeout kills descendants that keep inherited pipes open", async () => {
+  const repo = await fixture();
+  try {
+    const script =
+      "const {spawn}=require('node:child_process');" +
+      "spawn(process.execPath,['-e','setTimeout(()=>{},30000)'],{stdio:'inherit'});" +
+      "setTimeout(()=>{},30000)";
+    const started = Date.now();
+    const result = await command(repo, `node -e ${JSON.stringify(script)}`, 100);
+
+    assert.equal(result.timedOut, true);
+    assert.ok(Date.now() - started < 3_000);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
 test("agent shell tool uses dynamic deadlines and removes its scratch directory", async () => {
   const { AgentTools } = await import("../src/agent/tools.js");
   const { Logger } = await import("../src/telemetry/logger.js");

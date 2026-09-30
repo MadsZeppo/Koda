@@ -256,7 +256,7 @@ test("joint routing reports the complete discovered model by engine candidate fi
         fingerprint: taskFingerprint(subtask, repository, features, "normal", verification) };
     });
     const selected = await pool.selectJointExecutionPlan(variants, "joint", 1);
-    assert.equal(selected.executionStrategy, "planned");
+    assert.equal(selected.executionStrategy, "stable");
     assert.equal(selected.plan.initialModel, economical.id);
     const event = logger.events.findLast((item) => item.type === "joint_execution_route")!;
     assert.equal(event.total_discovered_models, 2);
@@ -264,7 +264,7 @@ test("joint routing reports the complete discovered model by engine candidate fi
     assert.ok(Number(event.total_generated_model_engine_plans) >= 4);
     const plans = event.plans as any[];
     assert.ok(plans.some((plan) => plan.execution_engine === "stable" &&
-      plan.model === economical.id && /tool_choice/.test(plan.rejection_reason)));
+      plan.model === economical.id && plan.quality_safe));
     assert.ok(plans.some((plan) => plan.execution_engine === "planned" &&
       plan.model === economical.id && plan.quality_safe));
     assert.ok(plans.every((plan) => "uncertainty" in plan));

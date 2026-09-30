@@ -228,6 +228,10 @@ export interface TaskFingerprint {
   toolExplorationNeed?: Difficulty;
   executionEngineComplexity?: Difficulty;
   operationalRisk?: Difficulty;
+  /** The first worker pass is only localizing an unresolved bounded task. */
+  boundedDiscovery?: boolean;
+  /** Whether the inspected task contains genuinely independent workstreams. */
+  parallelizability?: Difficulty;
   difficulty: TaskDifficulty;
   confidence: "high" | "medium";
   reasons: string[];
@@ -347,6 +351,19 @@ export function taskFingerprint(
   const executionEngineComplexity: Difficulty = features.executionStrategy === "stable" ? "high"
     : scope === "cross-component" || toolExplorationNeed !== "low" ? "medium" : "low";
   const operationalRisk: Difficulty = executionEngineComplexity === "high" ? "medium" : "low";
+  const parallelizability: Difficulty =
+    features.executionStrategy === "planned" &&
+    subtask.parallelSafe &&
+    subtask.dependsOn.length === 0 &&
+    (scope === "cross-component" || features.estimatedFiles > 1)
+      ? "high"
+      : features.executionStrategy === "planned" && scope !== "single"
+        ? "medium"
+        : "low";
+  const boundedDiscovery =
+    features.executionStrategy === "direct" &&
+    subtask.likelyWritePaths.length === 1 &&
+    subtask.likelyWritePaths[0] === ".";
   const difficulty: TaskDifficulty = {
     technicalComplexity: technical,
     visualComplexity: visualRelevant ? high(/\b(?:redesign|design.system|complex.layout|pixel.perfect)\b/) ? "high" : "medium" : "low",
@@ -409,6 +426,8 @@ export function taskFingerprint(
     toolExplorationNeed,
     executionEngineComplexity,
     operationalRisk,
+    parallelizability,
+    boundedDiscovery,
     confidence: features.localizationConfidence === "high" ? "high" : "medium",
     // Once concrete paths are known, keep task-neighborhood lookup stable
     // across prompt paraphrases by leading with repository facts. Prompt terms

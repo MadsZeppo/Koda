@@ -53,12 +53,16 @@ export async function routingBaselinePreflight(
   paths: string[],
   timeoutMs: () => number,
   onCheck?: Parameters<typeof verify>[3],
+  task?: string,
 ): Promise<VerificationResult> {
   const candidates = verificationPlan(profile, paths).filter(
     (candidate) => candidate.available && !optionalUnavailableCheck(candidate),
   );
   const selected = focusedRoutingTest(profile, paths, candidates) ??
-    candidates.find((candidate) => candidate.kind === "test") ?? candidates[0];
+    candidates.find((candidate) => candidate.kind !== "test") ??
+    (task && isExplicitTestOnlyTask(task)
+      ? candidates.find((candidate) => candidate.kind === "test")
+      : undefined);
   if (!selected) return verificationResult([]);
   return verify(root, [selected.command], timeoutMs, onCheck, undefined, [selected]);
 }

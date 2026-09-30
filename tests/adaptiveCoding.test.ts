@@ -438,7 +438,7 @@ for (const cheapFails of [false, true])
       await new Gateway(settings, new Logger(join(root, "refresh-log"), "refresh", true),
         new Budget(1, 10000, 30000)).modelRouter!.capabilities.refresh();
       const result = await run({ repo: join(root, "direct"),
-        task: "Find why the test is failing, fix the implementation, and verify that all tests pass.",
+        task: "Fix src/calculator.js for the failure in test/calculator.test.js, and verify that all tests pass.",
         config: settings, quiet: true, output: join(root, "report") });
       assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
       assert.equal(result.frontierCalls, 0);

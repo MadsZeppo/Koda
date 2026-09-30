@@ -5,7 +5,8 @@ export type QualityClass = "LOW" | "MEDIUM" | "HIGH";
 export type EvidenceStrength = "PROVEN" | "SUPPORTED" | "PROMISING" | "UNKNOWN" | "REJECTED";
 export type ModelLifecycle = "REFERENCE" | "ACTIVE" | "CHALLENGER" | "QUARANTINED" | "UNKNOWN";
 export type RecoveryFailureMode = "operational" | "no_mutation" | "verification_failure" |
-  "compiler_failure" | "test_failure" | "context_limit" | "token_limit" | "other";
+  "compiler_failure" | "test_failure" | "context_limit" | "token_limit" |
+  "discovery_limit" | "other";
 
 export interface ControlCandidate {
   model: { id: string; tier: keyof typeof tierRank };
@@ -36,6 +37,8 @@ export interface RecoveryObservation {
   outputTokens?: number;
   wallClockMs?: number;
   terminationReason?: string;
+  /** Semantic coding attempts used; operational retries are tracked separately. */
+  codingAttempts?: number;
 }
 
 export interface FrozenExecutionPolicy<T extends ControlCandidate = ControlCandidate> {
@@ -149,7 +152,7 @@ export function effectiveRecoveryFailureMode(
   const reason = observation.terminationReason ?? "";
   if (
     /direct_edit_protocol_error/i.test(reason) ||
-    /(?:tool[_ -]?choice|response[_ -]?format|json[_ -]?schema|no endpoints?(?:\s+found)?|unsupported|not support|requested parameters?|protocol|HTTP\s*4(?:00|04))/i.test(reason)
+    /(?:tool[_ -]?choice|response[_ -]?format|json[_ -]?schema|no endpoints?(?:\s+found)?|unsupported|not support|requested parameters?|protocol|RepeatedFormatError|format error|HTTP\s*4(?:00|04))/i.test(reason)
   )
     return "operational";
 
@@ -226,32 +229,54 @@ export function chooseAdaptiveRecovery<T extends ControlCandidate>(
   observation: RecoveryObservation,
   attempted: ReadonlySet<string>,
 ): T | undefined {
-  if (attempted.size >= policy.maxCodingAttempts) return undefined;
-
   const failureMode = effectiveRecoveryFailureMode(observation);
+  if (
+    failureMode !== "operational" &&
+    (observation.codingAttempts ?? attempted.size) >= policy.maxCodingAttempts
+  ) return undefined;
   const previous = policy.approvedCandidateSet.find(
     (candidate) => candidate.model.id === observation.previousModel,
   );
-
-  let candidates = policy.approvedCandidateSet.filter(
-    (candidate) =>
-      !attempted.has(candidate.model.id) &&
-      !candidate.hardRejection &&
-      candidate.conservativeQuality + 1e-9 >= policy.requiredQuality &&
-      recoveryEvidenceSufficient(
-        candidate,
-        policy.taskFingerprint,
-      ),
-  );
-
-  if (!candidates.length) return undefined;
-
   const qualityCascade = policy.qualityCascadeModelIds
     ? new Set(policy.qualityCascadeModelIds)
     : undefined;
   const operationalRecovery = new Set(
     policy.operationalRecoveryModelIds ?? [],
   );
+
+  let candidates = policy.approvedCandidateSet.filter(
+    (candidate) => {
+      const optimizerApprovedQualityLeg =
+        qualityCascade?.has(candidate.model.id) === true;
+      const explicitSidewaysPeer =
+        failureMode === "operational" &&
+        operationalRecovery.has(candidate.model.id) &&
+        !!qualityCascade &&
+        !qualityCascade.has(candidate.model.id);
+      return !attempted.has(candidate.model.id) &&
+        !candidate.hardRejection &&
+        (explicitSidewaysPeer ||
+          candidate.conservativeQuality + 1e-9 >= policy.requiredQuality &&
+          (optimizerApprovedQualityLeg ||
+            recoveryEvidenceSufficient(candidate, policy.taskFingerprint)));
+    },
+  );
+
+  if (!candidates.length) return undefined;
+
+  if (failureMode === "discovery_limit") {
+    const priceCap = Math.min(
+      0.01,
+      Math.max(0.0025, (previous?.conservativeAttemptCost ?? 0.0025) * 4),
+    );
+    return candidates
+      .filter((candidate) => candidate.conservativeAttemptCost <= priceCap)
+      .sort((a, b) =>
+        a.conservativeAttemptCost - b.conservativeAttemptCost ||
+        a.expectedAttemptCost - b.expectedAttemptCost ||
+        a.tokenEfficiency.p90TotalTokens - b.tokenEfficiency.p90TotalTokens ||
+        b.conservativeQuality - a.conservativeQuality)[0];
+  }
 
   if (failureMode !== "operational" && qualityCascade) {
     const qualityCandidates = candidates.filter((candidate) =>
@@ -275,13 +300,18 @@ export function chooseAdaptiveRecovery<T extends ControlCandidate>(
       : Infinity;
 
   if (failureMode === "operational") {
+    const orderedRecovery = new Map(
+      (policy.orderedRecoveryModelIds ?? []).map((id, index) => [id, index]),
+    );
     return candidates.sort(
       (a, b) =>
         Number(!operationalRecovery.has(a.model.id)) -
           Number(!operationalRecovery.has(b.model.id)) ||
-        a.operationalErrorRate - b.operationalErrorRate ||
+        (orderedRecovery.get(a.model.id) ?? Number.MAX_SAFE_INTEGER) -
+          (orderedRecovery.get(b.model.id) ?? Number.MAX_SAFE_INTEGER) ||
         a.conservativeAttemptCost - b.conservativeAttemptCost ||
         economics(a) - economics(b) ||
+        a.operationalErrorRate - b.operationalErrorRate ||
         a.expectedAttemptLatencyMs - b.expectedAttemptLatencyMs ||
         b.conservativeQuality - a.conservativeQuality ||
         a.model.id.localeCompare(b.model.id),

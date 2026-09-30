@@ -348,7 +348,7 @@ test("a verified no-change result never enters final coding repair", async () =>
   let verificationCalls = 0;
   const verificationServer = createServer((_request, response) => {
     verificationCalls++;
-    response.end(verificationCalls === 3 ? "fail" : "pass");
+    response.end(verificationCalls === 2 ? "fail" : "pass");
   });
   try {
     await new Promise<void>((resolve) =>
@@ -412,7 +412,7 @@ test("a verified no-change result never enters final coding repair", async () =>
   }
 });
 
-test("Stable test task filters incompatible endpoints and recovers a formatting-stale edit locally", async () => {
+test("Stable test task accepts text-capable endpoints and recovers a formatting-stale edit locally", async () => {
   const root = await mkdtemp(join(tmpdir(), "koda-stable-test-e2e-"));
   const repo = join(root, "repo"), output = join(root, "output");
   const requests: any[] = [];
@@ -436,7 +436,7 @@ test("Stable test task filters incompatible endpoints and recovers a formatting-
     }
     let raw = ""; for await (const chunk of request) raw += chunk;
     const body = JSON.parse(raw); requests.push(body);
-    assert.notEqual(body.model, "incompatible-cheap");
+    assert.equal(body.model, "incompatible-cheap", "Aider eligibility does not require tool_choice");
     assert.equal(body.tool_choice, "required", JSON.stringify({ url: request.url,
       tools: body.tools?.map((entry: any) => entry.function?.name) }));
     const input = JSON.parse(body.messages[1].content);
@@ -492,7 +492,7 @@ test("Stable test task filters incompatible endpoints and recovers a formatting-
     const result = await run({ repo, task, output, quiet: true, config: settings });
     assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
     assert.equal(requests.length, 1, "recoverable stale formatting needs one cheap model call");
-    assert.equal(requests.some((request) => request.model === "incompatible-cheap"), false);
+    assert.equal(requests.some((request) => request.model === "incompatible-cheap"), true);
     assert.equal(requests.some((request) => request.model === "expensive-fallback"), false);
     const events = (await readFile(join(output, "events.jsonl"), "utf8"))
       .trim().split("\n").map((line) => JSON.parse(line));

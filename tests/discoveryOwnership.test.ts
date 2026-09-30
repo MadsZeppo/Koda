@@ -24,7 +24,7 @@ test("Stable production delegates localization and coding to mini-SWE", async ()
     "utf8",
   );
 
-  assert.match(run, /from "\.\/agent\/miniSweExecutor\.js"/);
+  assert.match(run, /from "\.\/agent\/codingExecutor\.js"/);
   assert.doesNotMatch(run, /prepareStableWorker\(/);
   assert.doesNotMatch(run, /buildRepairPacket\(/);
 

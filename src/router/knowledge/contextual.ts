@@ -1,5 +1,4 @@
 import type { TaskFingerprint } from "../taskFingerprint.js";
-import { usesDirectEditEngine } from "../../agent/attemptPolicy.js";
 import { normalizeRoutingTaskFamily } from "./identity.js";
 import { modelFamilyKey } from "./identity.js";
 import type { ModelRoutingKnowledge, RoutingTaskCase } from "./schema.js";
@@ -43,7 +42,7 @@ const similarity = (row: RoutingTaskCase, fp: TaskFingerprint) => {
   const language = !row.languages?.length || !fp.languages.length ? 0.5 :
     row.languages.some((item) => fp.languages.includes(item)) ? 1 : 0;
   if (!family && lexical === 0) return 0;
-  const expectedEngine = usesDirectEditEngine(fp) ? "direct-edit" : "mini-swe-agent";
+  const expectedEngine = "aider";
   const engine = !row.engine || row.engine === "unknown" ? 0.65
     : row.engine === expectedEngine ? 1 : 0.25;
   const sourceQuality = Math.max(0.25, Math.min(1, row.evidenceQuality ?? 0.8));

@@ -708,7 +708,17 @@ export async function command(
       killSignal: "SIGKILL",
     });
     childPid = child.pid;
-    const r = await child;
+    const hardKill = childPid
+      ? setTimeout(() => {
+          try {
+            process.kill(-childPid!, "SIGKILL");
+          } catch {}
+        }, timeoutMs)
+      : undefined;
+    hardKill?.unref();
+    const r = await child.finally(() => {
+      if (hardKill) clearTimeout(hardKill);
+    });
     return {
       command: cmd,
       exitCode: r.exitCode ?? 1,

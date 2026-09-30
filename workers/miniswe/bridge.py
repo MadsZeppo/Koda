@@ -84,12 +84,52 @@ def _token_limit_state(configured: int, consumed: int, next_prompt: int) -> dict
     }
 
 
+def _trajectory_token_charge(previous_prompt: int, prompt: int, completion: int) -> int:
+    """Charge only new trajectory context plus generated tokens.
+
+    Mini-SWE resends its full conversation on every turn. Counting every
+    repeated prefix against the attempt's progress budget exhausts the worker
+    during discovery even though the trajectory itself remains bounded.
+    Provider cost is enforced separately from the full billed usage.
+    """
+    return max(0, int(prompt) - int(previous_prompt)) + max(0, int(completion))
+
+
+def _koda_call_cost(reported, prompt: int, completion: int,
+                    prompt_price, completion_price) -> float:
+    """Price one provider call without relying on Mini-SWE's model registry."""
+    reported_cost = float(reported or 0.0)
+    if prompt_price is None or completion_price is None:
+        return max(0.0, reported_cost)
+    configured_cost = (
+        int(prompt) * float(prompt_price) +
+        int(completion) * float(completion_price)
+    ) / 1_000_000
+    return max(0.0, reported_cost, configured_cost)
+
+
+def _normalize_repo_command(command: str) -> str:
+    """Keep model commands anchored to LocalEnvironment's repository cwd."""
+    # The macOS sandbox may expose its mount as `worktree` in tool output even
+    # though every LocalEnvironment action already starts at the repository
+    # root. Models that follow that display path otherwise attempt to enter a
+    # non-existent nested worktree on the next action.
+    return re.sub(r"^\s*cd\s+(?:\./)?worktree\s*(?:;|&&)\s*", "", command, count=1)
+
+
 _MUTATION = re.compile(r"(?:apply_patch|cat\s+[^|;&]*>|(?:sed|perl)\s+-i|"
                        r"(?:write|append)_file|python\w*\s+-c.*(?:write|open\())", re.I | re.S)
 _VERIFICATION = re.compile(r"(?:^|\s)(?:pytest|unittest|pnpm\s+(?:test|typecheck|build)|"
                            r"npm\s+(?:test|run\s+(?:test|typecheck|build))|"
                            r"yarn\s+(?:test|typecheck|build)|cargo\s+test|go\s+test|"
                            r"node\s+--test|tsc(?:\s|$))", re.I)
+_SOURCE_PATH = re.compile(
+    r"(?<![\w.-])((?!(?:tests?|fixtures?|node_modules|\.koda)[/\\])"
+    r"(?:src|lib|app|packages|scripts|workers)[/\\][\w./-]+\."
+    r"(?:[cm]?[jt]sx?|py|go|rs|java|rb|php))(?![\w.-])",
+    re.I,
+)
+_READ_COMMAND = re.compile(r"(?:^|[;&|]\s*)(?:sed|cat|head|tail|awk|grep)\b", re.I)
 
 
 def _workspace_signature(cwd: str) -> str:
@@ -142,6 +182,20 @@ def _truncate_output(value: str, limit: int) -> str:
     return (raw[:head] + marker + raw[-(available - head):]).decode("utf-8", "replace")
 
 
+def _discovery_evidence(serialized: dict, limit: int = 6000) -> str:
+    """Keep a bounded, replayable summary of commands and observations."""
+    rows = []
+    for message in serialized.get("messages", []):
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls") or []:
+                fn = call.get("function") or {}
+                if fn.get("name") == "bash":
+                    rows.append("$ " + str(fn.get("arguments") or ""))
+        elif message.get("role") == "tool":
+            rows.append(str(message.get("content") or ""))
+    return _truncate_output("\n".join(rows), limit)
+
+
 class ProgressWatchdog:
     """Small deterministic phase tracker and repeated-call loop guard."""
     def __init__(self, cwd: str, stall_limit: int = 3):
@@ -150,6 +204,8 @@ class ProgressWatchdog:
         self.stall_limit = stall_limit
         self.seen_commands: set[str] = set()
         self.stalled_turns = 0
+        self.localized_paths: set[str] = set()
+        self.localization_nudged = False
 
     def observe(self, commands: list[str], before: str, after: str):
         normalized = [" ".join(command.split()) for command in commands if command.strip()]
@@ -168,6 +224,9 @@ class ProgressWatchdog:
         changed = before != after
         self.stalled_turns = 0 if novel or changed else self.stalled_turns + 1
         self.seen_commands.update(normalized)
+        for command in normalized:
+            if _READ_COMMAND.search(command):
+                self.localized_paths.update(_SOURCE_PATH.findall(command))
 
     @property
     def stalled(self) -> bool:
@@ -235,6 +294,7 @@ def main() -> int:
                     self.koda_prompt_price = prompt_price
                     self.koda_completion_price = completion_price
                     self.koda_tokens = 0
+                    self.koda_prompt_tokens = 0
                     self.koda_cost = 0.0
 
                 def _prompt_bound(self, messages):
@@ -253,8 +313,9 @@ def main() -> int:
 
                 def query(self, messages, **kwargs):
                     prompt_bound = self._prompt_bound(messages)
+                    prompt_growth = max(0, prompt_bound - self.koda_prompt_tokens)
                     token_state = _token_limit_state(
-                        self.koda_token_limit, self.koda_tokens, prompt_bound
+                        self.koda_token_limit, self.koda_tokens, prompt_growth
                     )
                     remaining_tokens = token_state["remaining_tokens"]
                     if token_state["limit_kind"]:
@@ -266,7 +327,7 @@ def main() -> int:
                     output_limit = min(
                         int(kwargs.get("max_tokens") or
                             self.config.model_kwargs.get("max_tokens") or 4096),
-                        remaining_tokens - prompt_bound,
+                        remaining_tokens - prompt_growth,
                     )
                     if self.koda_context_limit is not None:
                         output_limit = min(output_limit, self.koda_context_limit - prompt_bound)
@@ -286,11 +347,23 @@ def main() -> int:
                         raise _limit("KodaAttemptLimitExceeded", kind)
                     message = super().query(messages, **(kwargs | {"max_tokens": output_limit}))
                     usage = message.get("extra", {}).get("response", {}).get("usage", {}) or {}
-                    self.koda_tokens += int(usage.get("prompt_tokens") or prompt_bound)
-                    self.koda_tokens += int(usage.get("completion_tokens") or 0)
-                    self.koda_cost += float(message.get("extra", {}).get("cost") or 0.0)
+                    actual_prompt = int(usage.get("prompt_tokens") or prompt_bound)
+                    completion = int(usage.get("completion_tokens") or 0)
+                    self.koda_tokens += _trajectory_token_charge(
+                        self.koda_prompt_tokens, actual_prompt, completion
+                    )
+                    self.koda_prompt_tokens = max(self.koda_prompt_tokens, actual_prompt)
+                    call_cost = _koda_call_cost(
+                        message.get("extra", {}).get("cost"), actual_prompt, completion,
+                        self.koda_prompt_price, self.koda_completion_price,
+                    )
+                    self.koda_cost += call_cost
+                    # DefaultAgent may display/serialize this value, but Koda's
+                    # wrapper remains the source of truth and enforces the cap.
+                    message.setdefault("extra", {})["cost"] = call_cost
                     return message
 
+            watchdog = ProgressWatchdog(request["repoPath"])
             model_client = BoundedLitellmModel(
                 model_name=provider_model,
                 model_kwargs=model_kwargs,
@@ -299,9 +372,14 @@ def main() -> int:
                 prompt_price=request.get("promptPricePerMillion"),
                 completion_price=request.get("completionPricePerMillion"),
                 context_limit=request.get("contextWindowTokens"),
+                cost_tracking="ignore_errors",
             )
             class BoundedLocalEnvironment(LocalEnvironment):
                 def execute(self, action, cwd="", *, timeout=None):
+                    if isinstance(action, dict) and isinstance(action.get("command"), str):
+                        action = action | {
+                            "command": _normalize_repo_command(action["command"])
+                        }
                     output = super().execute(action, cwd, timeout=timeout)
                     output["output"] = _truncate_output(
                         output.get("output", ""), int(request.get("maxToolOutputBytes", 4000))
@@ -316,7 +394,6 @@ def main() -> int:
             scope = ", ".join(request.get("writeScope") or [])
             context = request.get("context") or {}
             context_text = json.dumps(context, ensure_ascii=False)
-            watchdog = ProgressWatchdog(request["repoPath"])
             first_mutation_ms = None
 
             class KodaProgressAgent(DefaultAgent):
@@ -325,8 +402,6 @@ def main() -> int:
                         raise _limit("KodaProgressStalled", "other")
                     if 0 < self.config.step_limit <= self.n_calls:
                         raise _limit("KodaStepLimitExceeded", "step_limit")
-                    if 0 < self.config.cost_limit <= self.cost:
-                        raise _limit("KodaCostLimitExceeded", "cost_limit")
                     if 0 < self.config.wall_time_limit_seconds <= int(time.time() - self._start_time):
                         raise _limit("KodaTimeLimitExceeded", "timeout")
                     return super().query()
@@ -342,6 +417,18 @@ def main() -> int:
                     after = _workspace_signature(watchdog.cwd)
                     after_paths = _paths_signature(watchdog.cwd, watched)
                     watchdog.observe(commands, before + before_paths, after + after_paths)
+                    if (watchdog.phase == "DISCOVERY" and watchdog.localized_paths and
+                            not watchdog.localization_nudged):
+                        watchdog.localization_nudged = True
+                        self.add_messages({
+                            "role": "user",
+                            "content": (
+                                "Localization is complete. Likely implementation path(s): " +
+                                ", ".join(sorted(watchdog.localized_paths)) +
+                                ". Stop broad exploration. Your next action must edit the most "
+                                "likely implementation path, then run the narrowest relevant test."
+                            ),
+                        })
                     if first_mutation_ms is None and before_paths != after_paths:
                         first_mutation_ms = int((time.monotonic() - started) * 1000)
                     if request.get("returnOnMutation") and before_paths != after_paths:
@@ -358,7 +445,11 @@ def main() -> int:
                     "You are the sole coding worker for one Koda attempt. Explore the assigned "
                     "repository, implement the task, and use shell commands to inspect and edit. "
                     "Do not route to or invoke another language model. Work only in the current "
-                    "repository. Authorized write paths: " + scope + ". Koda independently checks "
+                    "repository. Every shell action already starts in the repository root: use "
+                    "paths such as src/... directly, never `cd worktree`, and do not enumerate "
+                    "the whole repository. Ignore .koda*, backup, generated, dependency, and fixture "
+                    "trees unless the task explicitly names one. Prefer exact paths named in the task "
+                    "before any search. Authorized write paths: " + scope + ". Koda independently checks "
                     "the final diff and verification. Finish with exactly: "
                     "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
                 ),
@@ -371,7 +462,9 @@ def main() -> int:
                     "directly from this context, then run the focused check."
                 ),
                 step_limit=request["maxSteps"],
-                cost_limit=request["budgetUsd"],
+                # Mini-SWE's registry does not know every OpenRouter model.
+                # BoundedLitellmModel above owns the authoritative USD limit.
+                cost_limit=0,
                 wall_time_limit_seconds=max(1, int(request["timeoutMs"] / 1000)),
                 output_path=trajectory,
             )
@@ -402,6 +495,8 @@ def main() -> int:
                              outcome_extra.get("exact_limit_fired") or limit_kind),
             progressPhase=watchdog.phase,
             steps=agent.n_calls,
+            discoveryEvidence=_discovery_evidence(serialized),
+            discoveryProgress=len(watchdog.seen_commands),
             timeToFirstMutationMs=first_mutation_ms,
         )
     except Exception as error:

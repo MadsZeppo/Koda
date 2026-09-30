@@ -11,6 +11,26 @@ export interface ExecutionStrategy {
   preciseTarget?: string;
 }
 
+/**
+ * Keep the deterministic task assessment authoritative. Joint routing may
+ * compare models inside a bounded DIRECT workstream, but must not manufacture
+ * a broader agent loop merely because that loop has different economics.
+ */
+export function allowedJointExecutionStrategies(
+  initial: ExecutionStrategy["execution_strategy"],
+  plannedExecutable: boolean,
+  boundedDirectAlternative: boolean,
+): ExecutionStrategy["execution_strategy"][] {
+  if (initial === "direct") return ["direct"];
+
+  const candidates: ExecutionStrategy["execution_strategy"][] = [initial];
+  if (initial === "planned" && !plannedExecutable) candidates.splice(0, 1, "stable");
+  if (!candidates.includes("stable")) candidates.push("stable");
+  if (plannedExecutable && !candidates.includes("planned")) candidates.push("planned");
+  if (boundedDirectAlternative && !candidates.includes("direct")) candidates.push("direct");
+  return candidates;
+}
+
 const mentionedPath = (task: string, path: string) => {
   const escaped = path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -35,7 +55,7 @@ export function chooseExecutionStrategy(
   // Tests and compatibility are acceptance criteria for the implementation,
   // not independent workstreams just because they are separate clauses.
   const implementationWork = requestedWork
-    .replace(/(?:\b(?:and|then|also)\s+|[.;\n]\s*|\+\s*)(?:add|write|include|create)\s+(?:a\s+)?(?:focused\s+|regression\s+|unit\s+|integration\s+)*tests?\b[^.;\n]*/gi, "")
+    .replace(/(?:\b(?:and|then|also)\s+|[.;\n]\s*|\+\s*)(?:add|write|include|create|update|change|modify|fix|repair)\s+(?:a\s+)?(?:focused\s+|regression\s+|unit\s+|integration\s+)*tests?\b[^.;\n]*/gi, "")
     .replace(/(?:\b(?:and|then|also)\s+|[.;\n]\s*|\+\s*)preserve\s+(?:existing\s+)?(?:behavior|compatibility|tests?)\b[^.;\n]*/gi, "");
 
   const sources = profile.files.filter(isSourcePath);
@@ -59,7 +79,9 @@ export function chooseExecutionStrategy(
   // stays narrow for direct execution, while `concreteMentions` lets us tell
   // a genuinely multi-component request from broad lexical matches.
   const concreteMentions = exactPaths.length ? exactPaths : basenameMatches;
-  const exactSourceMentions = exactPaths.filter(isSourcePath);
+  const implementationSource = (file: string) =>
+    isSourcePath(file) && !isTestPath(file);
+  const exactSourceMentions = exactPaths.filter(implementationSource);
 
   // Repository profiles contain files, not directory entries. Build the
   // directory set so an explicitly named bounded directory can still act as
@@ -132,7 +154,9 @@ export function chooseExecutionStrategy(
           clause,
         ) &&
         (
-          concreteMentions.filter((file) => mentionedPath(clause, file)).length >= 2 ||
+          concreteMentions.filter((file) =>
+            implementationSource(file) && mentionedPath(clause, file),
+          ).length >= 2 ||
           /\band\s+(?:independently\s+|separately\s+)?(?:fix|repair|add|implement|update|change|modify|refactor|build|create|remove|delete|rename|correct)\b/i.test(
             clause,
           ) ||
@@ -207,7 +231,7 @@ export function chooseExecutionStrategy(
   // mutation targets. Decompose only when the task establishes separable work.
   if (
     /\b(?:independent|separate|parallel)\b/i.test(implementationWork) &&
-    concreteMentions.filter(isSourcePath).length > 1
+    concreteMentions.filter(implementationSource).length > 1
   ) return planned("Multiple independent implementation targets");
 
   if (
@@ -249,8 +273,8 @@ export function chooseExecutionStrategy(
   // as "verification", "routing", or "planner") are localization hints, not
   // independent workstreams and must not summon the planner by themselves.
   if (
-    concreteMentions.filter(isSourcePath).length >= 2 &&
-    new Set(concreteMentions.filter(isSourcePath).map(component)).size > 1 &&
+    concreteMentions.filter(implementationSource).length >= 2 &&
+    new Set(concreteMentions.filter(implementationSource).map(component)).size > 1 &&
     /\b(?:independent|separate|parallel|and)\b/i.test(implementationWork)
   ) {
     return planned("Explicit distinct requested components");
@@ -266,10 +290,10 @@ export function chooseExecutionStrategy(
 
   if (matched.length > 1) {
     return {
-      execution_strategy: "stable",
+      execution_strategy: "direct",
       execution_effort: "normal",
       strategy_reason:
-        "Multiple inferred files belong to one bounded workstream; localize with Stable",
+        "Multiple inferred files remain one bounded workstream; joint routing decides discovery cost",
       likelyFiles: matched,
     };
   }

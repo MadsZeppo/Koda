@@ -26,6 +26,8 @@ export interface DeterministicTaskProfile {
   languages: string[];
   frameworks: string[];
   repoScale: "small" | "medium" | "large";
+  /** Read/search hints only; these do not imply mutation ownership. */
+  discoveryCandidates: string[];
   likelyPaths: string[];
   likelyTests: string[];
   likelyComponents: string[];
@@ -78,20 +80,35 @@ export function profileTask(task: string, repo: RepoProfile, strategy: Execution
     score + (path.toLowerCase().includes(term) ? 2 : 0), 0) + (testPath(path) && /\btest\b/.test(lower) ? 2 : 0) }))
     .filter((item) => item.score > 0).sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
     .slice(0, 12).map((item) => item.path);
-  // An explicit repository path plus the deterministic strategy graph is
-  // stronger localization evidence than loose task-word matches. Adding all
-  // textual matches here inflated local tasks into cross-component work.
-  const grounded = strategy.likelyFiles.filter((path) => repo.files.includes(path));
+  // Only an exact strategy target is mutation evidence. `likelyFiles` may be
+  // populated by lexical discovery and must remain read/search context.
+  const explicitTestStems = explicit.filter(testPath).map((path) =>
+    path.split("/").at(-1)!
+      .replace(/\.[^.]+$/, "")
+      .replace(/\.(?:test|spec)$/, "")
+      .toLowerCase());
+  const companionSources = strategy.likelyFiles.filter((path) =>
+    repo.files.includes(path) &&
+    !testPath(path) &&
+    explicitTestStems.includes(
+      path.split("/").at(-1)!.replace(/\.[^.]+$/, "").toLowerCase(),
+    ));
+  const grounded = [
+    ...(strategy.preciseTarget && repo.files.includes(strategy.preciseTarget)
+      ? [strategy.preciseTarget]
+      : []),
+    ...companionSources,
+  ];
   const likelyPaths = [...new Set([
     ...explicit,
     ...grounded,
-    ...(explicit.length || grounded.length ? [] : ranked),
   ])].slice(0, 12);
+  const discoveryCandidates = likelyPaths.length ? [] : ranked;
   const likelyTests = likelyPaths.filter(testPath);
   const source = likelyPaths.filter((path) => !testPath(path));
   const components = [...new Set(source.map((path) => path.includes("/") ? path.split("/").slice(0, -1).join("/") : "."))];
   const crossComponent = components.length > 1 || /\b(?:across|cross[- ]component|frontend.+backend|backend.+frontend)\b/.test(lower);
-  const hasConcreteEvidence = explicit.length > 0 || strategy.likelyFiles.some((path) => repo.files.includes(path));
+  const hasConcreteEvidence = explicit.length > 0 || grounded.length > 0;
   const scopeConfidence: ProfileConfidence = hasConcreteEvidence && likelyPaths.length <= 6 ? "high"
     : likelyPaths.length ? "medium" : "low";
   const taskFamily = /\b(?:test|spec|coverage)\b/.test(lower) ? "test_change"
@@ -154,14 +171,14 @@ export function profileTask(task: string, repo: RepoProfile, strategy: Execution
     profileVersion: 1, profileKey,
     taskFamily, languages, frameworks: repo.ecosystem?.frameworks ?? [],
     repoScale: repo.files.length < 40 ? "small" : repo.files.length < 500 ? "medium" : "large",
-    likelyPaths, likelyTests, likelyComponents: components, crossComponent,
+    discoveryCandidates, likelyPaths, likelyTests, likelyComponents: components, crossComponent,
     publicApiRisk, schemaRisk, concurrencyRisk, architectureRisk,
     securitySensitive, localizationEntropy, expectedBlastRadius, projectRoots,
     verificationStrength, scopeConfidence,
     decompositionConfidence: crossComponent && components.length < 2 ? "low" : scopeConfidence,
     evidence: [
       ...explicit.map((path) => `explicit repository path: ${path}`),
-      ...strategy.likelyFiles.filter((path) => repo.files.includes(path)).map((path) => `strategy repository path: ${path}`),
+      ...grounded.map((path) => `grounded repository path: ${path}`),
       ...likelyTests.map((path) => `repository test: ${path}`),
     ],
   };
@@ -195,7 +212,11 @@ export async function buildTaskResume(
   const used = !!validScout?.result.paths.length;
   return {
     profile, scout: used ? validScout!.result : undefined,
-    relevantPaths: [...new Set([...profile.likelyPaths, ...(used ? validScout!.result.paths : [])])].slice(0, 16),
+    relevantPaths: [...new Set([
+      ...profile.likelyPaths,
+      ...profile.discoveryCandidates,
+      ...(used ? validScout!.result.paths : []),
+    ])].slice(0, 16),
     evidence: [...profile.evidence, ...(used ? validScout!.result.evidence : [])].slice(0, 32),
     microScoutUsed: used, researchCalls: attempted ? 1 : 0,
     researchCostUsd: inspected?.costUsd ?? 0, researchTokens: inspected?.tokens ?? 0,

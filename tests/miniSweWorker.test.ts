@@ -346,8 +346,9 @@ test("mini-SWE infrastructure failure falls back without poisoning model quality
     assert.equal(output.verification.status, "VERIFIED_SUCCESS");
     assert.deepEqual(attempts, ["cheap", "strong"]);
     assert.deepEqual(quality.map((entry) => entry[4]), ["VERIFIED_SUCCESS"]);
-    assert.equal(operations.length, 1);
+    assert.equal(operations.length, 2);
     assert.equal(operations[0].classification, "OPERATIONAL_FAILURE");
+    assert.equal(operations[1].outcome, "response");
     assert.equal(logger.events.find((event) => event.type === "model_attempt")?.escalated, true);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
@@ -431,6 +432,114 @@ test("specialist execution plan is monotonic, bounded, and stops without catalog
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("bounded discovery switches worker once without consuming coding attempts", async () => {
+  const root = await executionFixture();
+  const firstModel = modelSchema.parse({ id: "discovery-a", tier: "cheap", qualityPrior: .94 });
+  const secondModel = modelSchema.parse({ id: "discovery-b", tier: "strong", qualityPrior: .97 });
+  const first = routed(firstModel), second = routed(secondModel);
+  const requests: string[] = [], observations: any[] = [];
+  try {
+    const cfg = await config(undefined, { specialistRouting: true, maxIterations: 12,
+      modelPool: { provider: "fixture", models: [firstModel, secondModel] } });
+    const logger = new Logger(join(root, ".koda"), "bounded-discovery", true);
+    const gateway: any = { config: cfg, logger,
+      budget: new Budget(.3, 200_000, 300_000), modelRouter: {
+        selectExecutionPlan: async () => ({ id: "discovery-plan", type: "cascade",
+          executionEngine: "planned", initialModel: firstModel.id,
+          initialCandidate: first, approvedCandidateSet: [first, second],
+          qualityCascadeModelIds: [firstModel.id, secondModel.id],
+          operationalRecoveryModelIds: [], maxCodingAttempts: 2,
+          maxScoutCalls: 0, requiredQuality: .9, qualityClass: "MEDIUM",
+          evidenceClass: "SUPPORTED", conservativeQuality: .94,
+          expectedCostPerVerifiedSolve: .01, expectedLatencyMs: 1_000,
+          whySelected: "fixture", totalBudgetUsd: .3, latencyBudgetMs: 60_000,
+          activeBoard: [], referenceModel: secondModel.id,
+          providerConstraints: {}, writeScopes: ["src/value.cjs"],
+          verificationContract: {}, verificationStrength: "strong",
+          stopConditions: ["verified", "plan exhausted"] }),
+        selectRecoveryCandidate: (_plan: any, observation: any, attempted: Set<string>) => {
+          observations.push({ ...observation, attempted: [...attempted] });
+          return attempted.has(secondModel.id) ? undefined : second;
+        },
+        record: () => undefined,
+        history: { recordOperation: () => undefined },
+      } };
+    const output = await implement(gateway, root, boundedSubtask.objective, boundedSubtask,
+      { acceptanceCriteria: ["tests pass"] },
+      { files: boundedSubtask.likelyReadPaths,
+        verificationCommands: boundedSubtask.verificationCommands } as any,
+      { codingWorker: { run: async (request: any) => {
+          requests.push(request.model);
+          return { ...result(request.model), changedPaths: [],
+            terminationReason: "LimitsExceeded", limitKind: "discovery_limit" as const,
+            progressPhase: "DISCOVERY" as const, inputTokens: 4_500, outputTokens: 500 };
+        } }, compiledContext: { files: [], localDependencies: [],
+          completePaths: [], repoMap: [] } });
+    assert.equal(output.verification.status, "NOT_FULLY_VERIFIED");
+    assert.deepEqual(requests, [firstModel.id, secondModel.id]);
+    assert.equal(observations.length, 2);
+    assert.ok(observations.every((observation) => observation.codingAttempts === 0));
+    assert.equal(logger.events.find((event) => event.type === "execution_plan_exhausted")
+      ?.reason, "execution_limit:discovery_limit");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("productive discovery resumes on the same model with preserved evidence", async () => {
+  const root = await executionFixture();
+  const model = modelSchema.parse({ id: "discovery-resume", tier: "cheap", qualityPrior: .95 });
+  const selected = routed(model);
+  const requests: any[] = [];
+  try {
+    const cfg = await config(undefined, { specialistRouting: true, maxIterations: 1,
+      modelPool: { provider: "fixture", models: [model] } });
+    const logger = new Logger(join(root, ".koda"), "discovery-resume", true);
+    const gateway: any = { config: cfg, logger,
+      budget: new Budget(.3, 200_000, 300_000), modelRouter: {
+        selectExecutionPlan: async () => ({ id: "resume-plan", type: "single",
+          executionEngine: "planned", initialModel: model.id,
+          initialCandidate: selected, approvedCandidateSet: [selected],
+          qualityCascadeModelIds: [model.id], operationalRecoveryModelIds: [],
+          maxCodingAttempts: 1, maxScoutCalls: 0, requiredQuality: .9,
+          qualityClass: "MEDIUM", evidenceClass: "SUPPORTED",
+          conservativeQuality: .94, expectedCostPerVerifiedSolve: .01,
+          expectedLatencyMs: 1_000, whySelected: "fixture", totalBudgetUsd: .3,
+          latencyBudgetMs: 60_000, activeBoard: [], referenceModel: model.id,
+          providerConstraints: {}, writeScopes: ["src/value.cjs"],
+          verificationContract: {}, verificationStrength: "strong",
+          stopConditions: ["verified", "plan exhausted"] }),
+        selectRecoveryCandidate: () => undefined,
+        record: () => undefined, history: { recordOperation: () => undefined },
+      } };
+    const output = await implement(gateway, root, boundedSubtask.objective, boundedSubtask,
+      { acceptanceCriteria: ["tests pass"] },
+      { files: boundedSubtask.likelyReadPaths,
+        verificationCommands: boundedSubtask.verificationCommands } as any,
+      { codingWorker: { run: async (request: any) => {
+          requests.push(request);
+          if (requests.length === 1)
+            return { ...result(request.model), changedPaths: [],
+              terminationReason: "LimitsExceeded", limitKind: "discovery_limit" as const,
+              progressPhase: "DISCOVERY" as const, discoveryProgress: 2,
+              discoveryEvidence: "$ grep value src/value.cjs\nsrc/value.cjs:1:module.exports = 1" };
+          assert.match(request.context.diagnostics, /src\/value\.cjs:1/);
+          await writeFile(join(request.repoPath, "src/value.cjs"), "module.exports = 2;\n");
+          return { ...result(request.model), changedPaths: ["src/value.cjs"],
+            timeToFirstMutationMs: 17 };
+        } }, compiledContext: { files: [], localDependencies: [],
+          completePaths: [], repoMap: [] } });
+    assert.equal(output.verification.status, "VERIFIED_SUCCESS");
+    assert.deepEqual(requests.map((request) => request.model), [model.id, model.id]);
+    assert.equal(logger.events.filter((event) =>
+      event.type === "discovery_continuation").length, 1);
+    const stop = logger.events.find((event) => event.type === "coding_worker_stop" &&
+      Array.isArray(event.actual_changed_paths) && event.actual_changed_paths.length > 0);
+    assert.deepEqual(stop?.actual_changed_paths, ["src/value.cjs"]);
+    assert.equal(stop?.time_to_first_mutation_ms, 17);
+    assert.equal(logger.events.some((event) => event.type === "mini_swe_attempt_verification" &&
+      event.outcome === "VERIFIED_SUCCESS"), true);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("frozen plan treats a no-diff timeout as operational and moves to a distinct approved peer", async () => {
   const root = await executionFixture();
   const firstModel = modelSchema.parse({ id: "initial-slow", tier: "strong", qualityPrior: .96 });
@@ -441,7 +550,7 @@ test("frozen plan treats a no-diff timeout as operational and moves to a distinc
   const peer = { ...routed(peerModel), conservativeQuality: .93,
     evidenceLevel: "SUPPORTED", observationCount: 3,
     expectedAttemptLatencyMs: 800, operationalErrorRate: 0 };
-  const requests: string[] = [], observations: any[] = [];
+  const requests: string[] = [], observations: any[] = [], contexts: any[] = [];
   try {
     const cfg = await config(undefined, { specialistRouting: true, maxIterations: 4,
       modelPool: { provider: "fixture", models: [firstModel, peerModel] } });
@@ -475,11 +584,15 @@ test("frozen plan treats a no-diff timeout as operational and moves to a distinc
         verificationCommands: boundedSubtask.verificationCommands } as any,
       { codingWorker: { run: async (request: any) => {
           requests.push(request.model);
+          contexts.push(request.context);
           if (request.model === firstModel.id)
-            return { ...result(request.model), exitStatus: "failed" as const,
-              terminationReason: "LimitsExceeded", limitKind: "timeout" as const,
-              progressPhase: "MUTATION_ATTEMPTED" as const,
-              inputTokens: 14_000, outputTokens: 3_000, wallClockMs: 45_000 };
+            return { ...result(request.model), exitStatus: "infra_failure" as const,
+              terminationReason: "infrastructure_failure", limitKind: "timeout" as const,
+              fatalError: "provider timeout", progressPhase: "DISCOVERY" as const,
+              discoveryProgress: 3,
+              discoveryEvidence: "$ sed -n src/value.cjs\nmodule.exports = 1",
+              inputTokens: 4_000, outputTokens: 300, wallClockMs: 45_000 };
+          assert.match(request.context.diagnostics, /module\.exports = 1/);
           await writeFile(join(request.repoPath, "src/value.cjs"), "module.exports = 2;\n");
           return { ...result(request.model), changedPaths: ["src/value.cjs"] };
         } }, compiledContext: { files: [], localDependencies: [],
@@ -488,6 +601,7 @@ test("frozen plan treats a no-diff timeout as operational and moves to a distinc
     assert.deepEqual(requests, [firstModel.id, peerModel.id]);
     assert.equal(observations[0]?.failureMode, "operational");
     assert.deepEqual(observations[0]?.attempted, [firstModel.id]);
+    assert.equal(contexts[0]?.diagnostics, undefined);
     assert.equal(await readFile(join(root, "src/value.cjs"), "utf8"), "module.exports = 2;\n");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
@@ -573,7 +687,8 @@ test("exhausted specialist plan permits one explicit same-tier operational fallb
     assert.equal(output.verification.status, "VERIFIED_SUCCESS");
     assert.deepEqual(requests, ["frontier-a", "frontier-b"]);
     assert.equal(genericSelections, 1);
-    assert.equal(operations.length, 1);
+    assert.equal(operations.length, 2);
+    assert.equal(operations.filter((entry) => entry.outcome === "error").length, 1);
     assert.deepEqual(quality.map((entry) => entry[4]), ["VERIFIED_SUCCESS"],
       "provider failure creates no negative coding-quality evidence");
     assert.equal(logger.events.find((event) => event.type === "model_attempt")?.escalated, true);
@@ -617,8 +732,10 @@ test("localized coding policy is viable beyond the old six-step ceiling while ha
   const policy = localizedPolicy();
   assert.equal(policy.viable, true);
   assert.equal(policy.maxSteps, 10);
-  assert.ok(policy.minimumViableTokens > 18_517,
-    "the policy accounts for cumulative conversational prompt usage");
+  assert.ok(policy.forecastProviderInputTokens > 18_517,
+    "provider-cost forecast accounts for cumulative conversational prompt usage");
+  assert.ok(policy.minimumViableTokens < policy.forecastProviderInputTokens,
+    "trajectory token budget does not recount resent provider input");
   assert.ok(policy.maxTokens <= 30_000, "stage token safety remains hard");
   assert.ok(policy.timeoutMs <= 45_000, "attempt timeout remains hard");
 });
@@ -675,6 +792,52 @@ print(json.dumps({
   assert.equal(states.available.limit_kind, "");
 });
 
+test("mini-SWE attempt tokens do not recount the resent conversation prefix", async () => {
+  const bridge = join(process.cwd(), "workers/miniswe/bridge.py");
+  const source = `import importlib.util, json
+spec=importlib.util.spec_from_file_location("bridge", ${JSON.stringify(bridge)})
+m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+charges=[m._trajectory_token_charge(0, 2000, 200),
+         m._trajectory_token_charge(2000, 2600, 150),
+         m._trajectory_token_charge(2600, 3100, 100)]
+print(json.dumps(charges))`;
+  const execution = await execa("python3", ["-c", source]);
+  assert.deepEqual(JSON.parse(execution.stdout), [2200, 750, 600]);
+  assert.equal(JSON.parse(execution.stdout).reduce((a: number, b: number) => a + b, 0),
+    3550, "the 2k and 2.6k resent prefixes are not charged again");
+});
+
+test("Koda prices unknown Mini-SWE models and disables Mini-SWE cost authority", async () => {
+  const bridgePath = join(process.cwd(), "workers/miniswe/bridge.py");
+  const source = `import importlib.util, json
+spec=importlib.util.spec_from_file_location("bridge", ${JSON.stringify(bridgePath)})
+m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print(json.dumps(m._koda_call_cost(0, 17500, 900, 1.5, 6.0)))`;
+  const execution = await execa("python3", ["-c", source]);
+  assert.equal(JSON.parse(execution.stdout), 0.03165);
+
+  const bridge = await readFile(bridgePath, "utf8");
+  assert.match(bridge, /cost_tracking="ignore_errors"/);
+  assert.match(bridge, /cost_limit=0,/);
+  assert.match(bridge, /self\.koda_cost \+= call_cost/);
+});
+
+test("mini-SWE keeps sandbox display paths anchored to the repository root", async () => {
+  const output = await execa("python3", ["-c", `
+import importlib.util, json
+spec=importlib.util.spec_from_file_location("bridge", ${JSON.stringify(join(process.cwd(), "workers/miniswe/bridge.py"))})
+m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print(json.dumps([
+  m._normalize_repo_command("cd worktree; ls src"),
+  m._normalize_repo_command("cd ./worktree && pnpm test"),
+  m._normalize_repo_command("cd packages/app; pnpm test"),
+]))
+`]);
+  assert.deepEqual(JSON.parse(output.stdout), [
+    "ls src", "pnpm test", "cd packages/app; pnpm test",
+  ]);
+});
+
 test("progress watchdog permits novel exploration through mutation and verification but stops repeats", async () => {
   const bridge = join(process.cwd(), "workers/miniswe/bridge.py");
   const source = `import importlib.util, json
@@ -682,14 +845,17 @@ spec=importlib.util.spec_from_file_location("bridge", ${JSON.stringify(bridge)})
 m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 useful=m.ProgressWatchdog(".")
 for i in range(7): useful.observe([f"sed -n '{i+1}p' target.py"], "a", "a")
+useful.observe(["sed -n '1,80p' src/router.ts"], "a", "a")
 useful.observe(["cat > target.py <<'EOF'\\nchanged\\nEOF"], "a", "b")
 useful.observe(["pytest -q"], "b", "b")
 loop=m.ProgressWatchdog(".")
 for i in range(4): loop.observe(["cat target.py"], "a", "a")
-print(json.dumps({"useful_stalled":useful.stalled,"phase":useful.phase,"loop_stalled":loop.stalled}))`;
+print(json.dumps({"useful_stalled":useful.stalled,"phase":useful.phase,
+"localized":sorted(useful.localized_paths),"loop_stalled":loop.stalled}))`;
   const execution = await execa("python3", ["-c", source]);
   assert.deepEqual(JSON.parse(execution.stdout), {
-    useful_stalled: false, phase: "VERIFICATION_ATTEMPTED", loop_stalled: true,
+    useful_stalled: false, phase: "VERIFICATION_ATTEMPTED",
+    localized: ["src/router.ts"], loop_stalled: true,
   });
 });
 
@@ -809,16 +975,18 @@ console.log(JSON.stringify({first, second, version: MINI_SWE_VERSION}));`;
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("production run imports only the MiniSwe executor and bootstrap pin is exact", async () => {
+test("production uses the generic coding executor; legacy MiniSwe bootstrap stays pinned", async () => {
   const runSource = await readFile(join(process.cwd(), "src/run.ts"), "utf8");
   const requirements = await readFile(join(process.cwd(), "workers/miniswe/requirements.txt"), "utf8");
   const bridge = await readFile(join(process.cwd(), "workers/miniswe/bridge.py"), "utf8");
-  assert.match(runSource, /from "\.\/agent\/miniSweExecutor\.js"/);
+  assert.match(runSource, /from "\.\/agent\/codingExecutor\.js"/);
   assert.doesNotMatch(runSource, /from "\.\/agent\/loop\.js"/);
   assert.equal(requirements.trim(), `mini-swe-agent==${MINI_SWE_VERSION}`);
   assert.match(bridge, /from minisweagent\.agents\.default import DefaultAgent/);
   assert.match(bridge, /from minisweagent\.models\.litellm_model import LitellmModel/);
   assert.match(bridge, /class BoundedLitellmModel/);
+  assert.match(bridge, /cost_tracking="ignore_errors"/);
+  assert.match(bridge, /cost_limit=0,/);
   assert.match(bridge, /token_limit=request\["maxTokens"\]/);
   assert.match(bridge, /"api_key": api_key/);
   assert.match(bridge, /"timeout": max\(1, request\.get\("requestTimeoutMs", 30000\)/);

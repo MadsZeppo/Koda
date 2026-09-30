@@ -301,9 +301,9 @@ test("DIRECT one-call latency does not inherit whole-agent benchmark completion 
   assert.equal(estimate.p90, 5_400);
 });
 
-test("task evidence is discounted across a different execution engine", () => {
+test("Aider evidence outweighs legacy engines across execution strategies", () => {
   const taskCases = Array.from({ length: 40 }, (_, index) => [
-    { sourceId: "direct-harness", harness: "direct-v1", engine: "direct-edit" as const,
+    { sourceId: "direct-harness", harness: "direct-v1", engine: "aider" as const,
       taskKey: `direct-${index}`, taskFamily: "localized_bugfix", languages: ["typescript"],
       routingTerms: ["discount", "round", "money"], evidenceQuality: 1,
       contaminationConfidence: 1, outcomes: [{ modelId: "vendor/model", success: true,
@@ -320,7 +320,8 @@ test("task evidence is discounted across a different execution engine", () => {
     ...lowRiskDirectFingerprint(), executionStrategy: "stable",
   }, knowledge);
   assert.ok(direct && agentic);
-  assert.ok(direct.mean > agentic.mean);
+  assert.ok(direct.mean > .5, "Aider successes outweigh legacy Mini-SWE failures");
+  assert.equal(direct.mean, agentic.mean, "both strategies execute through Aider");
   assert.equal(direct.sourceDiversity, 2);
 });
 

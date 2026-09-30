@@ -256,6 +256,24 @@ test("operational recovery ignores prior tier and selects the cheapest quality-s
   assert.equal(selected?.model.id, cheapSafe.model.id);
 });
 
+test("discovery recovery cannot jump to an expensive model on a low-cost task", () => {
+  const initial = candidate("openai/gpt-5.1-codex-mini", "cheap", .91, .002);
+  const cheapRecovery = candidate("deepseek/deepseek-v3.2", "cheap", .92, .006);
+  const expensive = candidate("openai/gpt-5.5", "frontier", .98, .08);
+  const frozen = freezeExecutionPolicy({
+    ...policy([initial, expensive, cheapRecovery]),
+    qualityCascadeModelIds: [initial.model.id, expensive.model.id, cheapRecovery.model.id],
+  });
+  const selected = chooseAdaptiveRecovery(frozen, {
+    failureMode: "discovery_limit",
+    failurePhase: "DISCOVERY",
+    previousModel: initial.model.id,
+    mutationObserved: false,
+    codingAttempts: 0,
+  }, new Set([initial.model.id]));
+  assert.equal(selected?.model.id, cheapRecovery.model.id);
+});
+
 test("operational recovery follows the frozen economic order before semantic escalation", () => {
   const initial = candidate("initial", "cheap", 0.91, 0.002);
   const economicalPeer = candidate("economical-peer", "fast", 0.91, 0.003);
@@ -336,6 +354,51 @@ test("direct edit protocol errors are operational even when the executor reports
       terminationReason: "direct_edit_protocol_error",
     }),
     "operational",
+  );
+  assert.equal(
+    effectiveRecoveryFailureMode({
+      failureMode: "no_mutation",
+      failurePhase: "DISCOVERY",
+      previousModel: "any-model",
+      mutationObserved: false,
+      terminationReason: "RepeatedFormatError",
+    }),
+    "operational",
+  );
+});
+
+test("operational retries do not consume the coding-failure attempt budget", () => {
+  const first = candidate("first", "cheap", 0.94, 0.01);
+  const fallback = candidate("fallback", "strong", 0.96, 0.02);
+  const frozen = policy([first, fallback], 1);
+  assert.equal(
+    chooseAdaptiveRecovery(
+      frozen,
+      {
+        failureMode: "operational",
+        failurePhase: "PROVIDER",
+        previousModel: first.model.id,
+        mutationObserved: false,
+        codingAttempts: 0,
+        terminationReason: "provider timeout",
+      },
+      new Set([first.model.id]),
+    )?.model.id,
+    fallback.model.id,
+  );
+  assert.equal(
+    chooseAdaptiveRecovery(
+      frozen,
+      {
+        failureMode: "no_mutation",
+        failurePhase: "DISCOVERY",
+        previousModel: first.model.id,
+        mutationObserved: false,
+        codingAttempts: 1,
+      },
+      new Set([first.model.id]),
+    ),
+    undefined,
   );
 });
 

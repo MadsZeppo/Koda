@@ -37,12 +37,14 @@ export interface CodingWorkerInput {
   /** Localized attempts hand the first real mutation back to Koda for verification. */
   returnOnMutation?: boolean;
   context?: CodingWorkerContext;
+  aiderEditFormat?: "diff" | "whole";
+  modelMetadata?: import("../router/pool.js").Metadata;
 }
 
 export interface CodingWorkerResult {
   exitStatus: "completed" | "failed" | "infra_failure";
   model: string;
-  engine: "mini-swe-agent" | "direct-edit";
+  engine: "aider" | "mini-swe-agent" | "direct-edit";
   engineVersion: string;
   trajectoryPath?: string;
   changedPaths: string[];
@@ -64,7 +66,19 @@ export interface CodingWorkerResult {
   exactLimitFired?: string;
   progressPhase?: import("./attemptPolicy.js").AttemptProgressPhase;
   steps?: number;
+  /** Bounded tool-derived state used to resume productive discovery. */
+  discoveryEvidence?: string;
+  discoveryProgress?: number;
   fatalError?: string;
+  editFormat?: string;
+  formatAttempts?: {
+    format: string;
+    exitCode: number;
+    mutation: boolean;
+    wallClockMs: number;
+    changedPaths: string[];
+    failureKind?: string;
+  }[];
 }
 
 export interface CodingWorker {

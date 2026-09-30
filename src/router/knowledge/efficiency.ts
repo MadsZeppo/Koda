@@ -13,7 +13,7 @@ const relevant = (rows: RoutingKnowledgeObservation[], fp: TaskFingerprint) => {
     (row.taskFamilies ?? []).map(normalizeRoutingTaskFamily).includes(family));
   const familyRows = exact.length ? exact : rows.filter((row) => !row.taskFamilies?.length);
   const candidates = familyRows.length ? familyRows : rows;
-  const engine = usesDirectEditEngine(fp) ? "direct-edit" : "mini-swe-agent";
+  const engine = "aider";
   const exactEngine = candidates.filter((row) => row.engine === engine);
   if (exactEngine.length) return exactEngine;
   const generic = candidates.filter((row) => !row.engine || row.engine === "unknown");
@@ -64,8 +64,9 @@ export function estimateEfficiency(fp: TaskFingerprint, contextTokens: number, m
   knowledge: ModelRoutingKnowledge | undefined, attempts: Attempt[]): TokenEfficiencyProfile {
   const rows = relevant((knowledge?.observations ?? []).filter((row) => row.category === "efficiency"), fp);
   const direct = usesDirectEditEngine(fp);
-  const engine = direct ? "direct-edit" : "mini-swe-agent";
-  const exactAttempts = attempts.filter((row) => observedExecutionEngine(row) === engine);
+  const engine = "aider";
+  const exactAttempts = attempts.filter((row) => observedExecutionEngine(row) === engine &&
+    (!row.fingerprint || usesDirectEditEngine(row.fingerprint) === direct));
   const legacyAttempts = attempts.filter((row) => observedExecutionEngine(row) === undefined);
   const comparableAttempts = exactAttempts.length ? exactAttempts : legacyAttempts;
   const localInputs = comparableAttempts.map((row) => row.inputTokens).filter((n) => n > 0);
@@ -82,8 +83,10 @@ export function estimateEfficiency(fp: TaskFingerprint, contextTokens: number, m
   // Agentic conversations resend the grounded source and accumulated tool
   // transcript. Sparse evidence must price that complete trajectory, not one
   // completion. Real same-engine observations replace this prior immediately.
+  const toolObservationTokens = direct ? 0 : 900;
   const defaultInput = direct ? contextTokens + 256
-    : (contextTokens + 256) * turns + perTurnOutput * turns * (turns - 1) * 0.22;
+    : (contextTokens + 256) * turns +
+      (perTurnOutput + toolObservationTokens) * turns * (turns - 1) / 2;
   const input = quantile(localInputs, 0.5) ?? metric(rows, "input_tokens") ??
     (recordedTotal ? Math.max(contextTokens, recordedTotal * 0.82) : defaultInput);
   const output = quantile(localOutputs, 0.5) ?? metric(rows, "output_tokens") ??
@@ -114,7 +117,7 @@ export function estimateLatency(priorMs: number, knowledge: ModelRoutingKnowledg
   fp: TaskFingerprint, operations: OperationalCall[], attempts: Attempt[] = []) {
   const rows = relevant((knowledge?.observations ?? []).filter((row) => row.category === "efficiency"), fp);
   const samples = operations.map((row) => row.wallClockMs).filter((n) => n >= 0);
-  const engine = usesDirectEditEngine(fp) ? "direct-edit" : "mini-swe-agent";
+  const engine = "aider";
   const exactAttempts = attempts.filter((row) =>
     observedExecutionEngine(row) === engine && Number.isFinite(row.wallClockMs) &&
     row.wallClockMs >= 0);

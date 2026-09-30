@@ -108,6 +108,28 @@ test("multi-file DIRECT never receives the one-call direct-edit budget contract"
   assert.ok(policy.viableCalls > 1);
 });
 
+test("broad DIRECT scope budgets the actual multi-turn Mini-SWE provider trajectory", () => {
+  const policy = attemptLimitPolicy({
+    ...base,
+    fingerprint: fingerprint(),
+    directEditEligible: false,
+    plannedBudgetUsd: 0.004,
+    remainingUsd: 0.30,
+    stageMaxUsd: 0.30,
+  });
+  const initialPrompt = Math.max(256, Math.ceil(base.promptBytes / 4));
+  const simulatedProviderInput = initialPrompt * policy.viableCalls +
+    (512 + 900) * policy.viableCalls * (policy.viableCalls - 1) / 2;
+  const simulatedCost = (simulatedProviderInput * base.promptPricePerMillion +
+    512 * policy.viableCalls * base.completionPricePerMillion) / 1e6;
+
+  assert.equal(policy.directEdit, false);
+  assert.equal(policy.viableCalls, 4);
+  assert.ok((policy.minimumViableCostUsd ?? 0) >= simulatedCost);
+  assert.ok(policy.budgetUsd >= simulatedCost,
+    "healthy discover/read/mutate/verify loop is funded before dispatch");
+});
+
 test("DIRECT uses routed p90 to bound a stalled provider without changing the hard cap", () => {
   const measured = attemptLimitPolicy({
     ...base,
@@ -122,4 +144,48 @@ test("DIRECT uses routed p90 to bound a stalled provider without changing the ha
   assert.equal(measured.timeoutMs, 10_000);
   assert.equal(unknown.timeoutMs, 45_000);
   assert.equal(measured.viable, true);
+});
+
+test("unknown localization can start from a bounded discovery packet", () => {
+  const policy = attemptLimitPolicy({
+    ...base,
+    promptBytes: 4_000,
+    learnedP90Tokens: 50_259,
+    remainingUsd: 0.20,
+    stageMaxUsd: 0.20,
+    fingerprint: fingerprint({
+      scope: "multi-file",
+      executionStrategy: "stable",
+      localizationConfidence: "low",
+      expectedFiles: 4,
+    }),
+  });
+
+  assert.equal(policy.directEdit, false);
+  assert.equal(policy.viable, true);
+  assert.ok(policy.minimumViableTokens < base.remainingTokens);
+  assert.ok(policy.forecastProviderInputTokens > 15_000);
+});
+
+test("bounded discovery starts even when the unresolved task fingerprint is broad", () => {
+  const policy = attemptLimitPolicy({
+    ...base,
+    promptBytes: 16_000,
+    learnedP90Tokens: 50_000,
+    boundedDiscovery: true,
+    fingerprint: fingerprint({
+      scope: "cross-component",
+      executionStrategy: "direct",
+      localizationConfidence: "low",
+      expectedFiles: 10,
+      crossComponent: true,
+    }),
+  });
+
+  assert.equal(policy.viableCalls, 1);
+  assert.equal(policy.viable, true);
+  assert.ok(policy.minimumViableTokens < 10_000);
+  assert.ok(policy.maxTokens >= 16_000);
+  assert.equal(policy.timeoutMs, 45_000);
+  assert.ok(policy.budgetUsd > base.plannedBudgetUsd);
 });

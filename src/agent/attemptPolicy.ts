@@ -1,7 +1,7 @@
 import type { TaskFingerprint } from "../router/taskFingerprint.js";
 
 export type AttemptLimitKind = "step_limit" | "token_limit" | "cost_limit" |
-  "token_preflight" | "timeout" | "context_limit" | "run_budget" |
+  "token_preflight" | "discovery_limit" | "timeout" | "context_limit" | "run_budget" |
   "provider_limit" | "other";
 export type AttemptProgressPhase = "DISCOVERY" | "MUTATION_ATTEMPTED" |
   "MUTATION_OBSERVED" | "VERIFICATION_ATTEMPTED" | "REPAIR";
@@ -23,6 +23,9 @@ export interface AttemptLimitPolicyInput {
   remainingMs: number;
   configuredTimeoutMs: number;
   plannedLatencyP90Ms?: number;
+  boundedDiscovery?: boolean;
+  /** Whether the concrete write scope can use the one-call direct editor. */
+  directEditEligible?: boolean;
 }
 
 /** True when Koda will execute this fingerprint through the one-call editor. */
@@ -47,7 +50,8 @@ export function attemptLimitPolicy(input: AttemptLimitPolicyInput) {
   // DirectEditWorker. That engine makes one structured model call and then
   // hands the mutation back to Koda for verification. Do not price its
   // viability as a four-turn mini-SWE inspect/edit/verify loop.
-  const directEdit = usesDirectEditEngine(input.fingerprint);
+  const directEdit = usesDirectEditEngine(input.fingerprint) &&
+    input.directEditEligible !== false;
 
   const complex = !localized && (input.effort === "complex" ||
     input.fingerprint.architectureHeavy || input.fingerprint.repoReasoningHeavy ||
@@ -57,7 +61,15 @@ export function attemptLimitPolicy(input: AttemptLimitPolicyInput) {
   // returns after one call, while the larger allowance keeps the existing
   // mini-SWE fallback bounded if direct editing is unsupported for the target.
   const desiredSteps = localized ? 10 : complex ? 16 : 12;
-  const viableCalls = directEdit ? 1 : localized ? 4 : complex ? 6 : 5;
+  const viableCalls = input.boundedDiscovery
+    ? 1
+    : directEdit
+      ? 1
+      : localized
+        ? 4
+        : complex
+          ? 6
+          : 5;
 
   // maxIterations bounds Koda's outer candidate/cascade attempts. It is not a
   // mini-SWE turn limit; coupling the two made two-attempt runs incapable of
@@ -68,17 +80,35 @@ export function attemptLimitPolicy(input: AttemptLimitPolicyInput) {
   // Each mini-SWE tool round resends the conversation. DirectEditWorker has no
   // tool loop, so its viability bound contains one prompt plus one full bounded
   // completion instead of four repeated prompts and four 512-token turns.
-  const viablePromptTokens = Math.ceil(
-    promptTokens * viableCalls * (localized ? 1.4 : 1.5),
-  );
-  const viableOutputTokens = directEdit
+  const perTurnOutput = input.boundedDiscovery
+    ? Math.min(input.maxOutputTokens, 1024)
+    : directEdit ? Math.min(input.maxOutputTokens, 4096)
+    : Math.min(input.maxOutputTokens, 512);
+  const toolObservationTokens = directEdit || input.boundedDiscovery ? 0 : 900;
+  const viablePromptTokens = directEdit || input.boundedDiscovery
+    ? Math.ceil(promptTokens * (input.boundedDiscovery ? 1.2 : 1))
+    : Math.ceil(
+        promptTokens * viableCalls +
+        (perTurnOutput + toolObservationTokens) *
+          viableCalls * (viableCalls - 1) / 2,
+      );
+  const viableOutputTokens = input.boundedDiscovery
+    ? Math.min(input.maxOutputTokens, 1024)
+    : directEdit
     ? Math.min(input.maxOutputTokens, 4096)
-    : Math.min(input.maxOutputTokens, 512) * viableCalls;
-  const minimumViableTokens = viablePromptTokens + viableOutputTokens;
+    : perTurnOutput * viableCalls;
+  // The attempt-token ledger counts trajectory growth, while provider cost
+  // must price every resent prompt in the multi-turn conversation.
+  const minimumViableTokens = directEdit || input.boundedDiscovery
+    ? viablePromptTokens + viableOutputTokens
+    : promptTokens + viableOutputTokens +
+      toolObservationTokens * Math.max(0, viableCalls - 1);
 
   const tokenCapacity = Math.min(input.remainingTokens, input.stageMaxTokens);
+  const boundedDiscoveryTokens = input.boundedDiscovery ? 16_000 : 0;
   const maxTokens = Math.min(tokenCapacity, Math.max(minimumViableTokens,
-    input.maxOutputTokens * 2, input.learnedP90Tokens ?? 0));
+    input.maxOutputTokens * 2, boundedDiscoveryTokens,
+    input.learnedP90Tokens ?? 0));
 
   const minimumViableCostUsd = input.promptPricePerMillion === undefined ||
       input.completionPricePerMillion === undefined ? undefined :
@@ -86,10 +116,22 @@ export function attemptLimitPolicy(input: AttemptLimitPolicyInput) {
       viableOutputTokens * input.completionPricePerMillion) / 1e6;
 
   const costCapacity = Math.min(input.remainingUsd, input.stageMaxUsd);
+  const plannedBudgetUsd = input.boundedDiscovery
+    ? Math.max(
+        input.plannedBudgetUsd * 1.5,
+        (minimumViableCostUsd ?? 0) * 1.5,
+      )
+    : input.plannedBudgetUsd;
   const budgetUsd = Math.min(costCapacity, Math.max(Number.EPSILON,
-    input.plannedBudgetUsd, minimumViableCostUsd ?? 0));
+    plannedBudgetUsd, minimumViableCostUsd ?? 0));
 
-  const minimumViableMs = localized ? 10_000 : complex ? 30_000 : 20_000;
+  const minimumViableMs = input.boundedDiscovery
+    ? 20_000
+    : localized
+      ? 10_000
+      : complex
+        ? 30_000
+        : 20_000;
   // DIRECT is a single structured request. Once routing has a usable p90,
   // waiting many multiples of it only delays operational recovery. Keep a
   // 10s viability floor and 1.5 p90s of headroom; unknown latency retains
@@ -102,7 +144,7 @@ export function attemptLimitPolicy(input: AttemptLimitPolicyInput) {
   const timeoutMs = Math.min(
     input.configuredTimeoutMs,
     input.remainingMs,
-    45_000,
+    input.boundedDiscovery ? 45_000 : 45_000,
     predictedDirectDeadline,
   );
   const nonViableLimitKind: AttemptLimitKind | undefined =
@@ -121,6 +163,8 @@ export function attemptLimitPolicy(input: AttemptLimitPolicyInput) {
     budgetUsd,
     timeoutMs,
     minimumViableTokens,
+    forecastProviderInputTokens: viablePromptTokens,
+    forecastProviderOutputTokens: viableOutputTokens,
     minimumViableCostUsd,
     viable: !nonViableLimitKind,
     nonViableLimitKind,

@@ -1,5 +1,4 @@
 import type { Config } from "../config.js";
-import { supportsParameters } from "./pool.js";
 import {
   attributableCodingFailure,
   type Attempt,
@@ -22,7 +21,6 @@ import {
   type TokenEfficiencyProfile,
 } from "./knowledge/efficiency.js";
 import type { EvidenceStrength } from "./controlPolicy.js";
-import { usesDirectEditEngine } from "../agent/attemptPolicy.js";
 
 export interface SpecialistEstimate extends Candidate {
   confidence: "high" | "medium" | "low";
@@ -301,8 +299,7 @@ function historyWeight(
   current: TaskFingerprint,
   features: Features,
 ): number {
-  const expectedEngine = usesDirectEditEngine(current)
-    ? "direct-edit" : "mini-swe-agent";
+  const expectedEngine = "aider";
   // Legacy rows remain useful as weak priors. Outcomes from another scaffold
   // never count as equivalent evidence for the current model × engine plan.
   // Preserve enough weight for pre-schema Koda outcomes to cross the existing
@@ -403,16 +400,17 @@ export function optimizeSpecialists(
   const boundedBlastRadius = (fp.blastRadius ??
     (fp.scope === "cross-component" ? "cross-component" :
       fp.scope === "single" ? "single-file" : "package")) !== "cross-component";
-  const economicalTrial =
-    fp.verificationStrength === "strong" &&
+  const economicalTrial = fp.boundedDiscovery === true ||
+    (fp.verificationStrength === "strong" &&
     lowFalseAccept && detectableRecovery && boundedBlastRadius &&
     fp.localizationConfidence !== "low" &&
     !fp.architectureHeavy && !fp.publicApiRisk && !fp.schemaRisk &&
-    !fp.configRisk;
+    !fp.configRisk);
   const firstAttemptQualityFloor = economicalTrial
     ? Math.max(
         0.05,
-        config.routing.minimumQuality - POLICY.strongVerificationRegret,
+        config.routing.minimumQuality -
+          (fp.boundedDiscovery ? 0.2 : POLICY.strongVerificationRegret),
       )
     : config.routing.minimumQuality;
   const considered: SpecialistEstimate[] = curateSpecialists(
@@ -422,18 +420,20 @@ export function optimizeSpecialists(
     budgetUsd,
   ).map((item) => {
     const { model, metadata: md } = item;
-    const protocolObservation = operations
+    const recentAiderOperations = operations
       .filter((row) =>
         row.stage === "implement" &&
-        row.modelRequested === model.id &&
-        Date.now() - new Date(row.timestamp).getTime() <= config.routing.cacheTtlMs &&
-        (row.outcome === "response" || row.failureKind === "tool_protocol_incompatible"))
-      .at(-1);
-    const observedProtocolIncompatible =
-      protocolObservation?.failureKind === "tool_protocol_incompatible";
-    const protocolKnown =
-      md.routableParameterSets !== undefined ||
-      md.supportedParameters !== undefined;
+        (row.modelServed ?? row.modelRequested) === model.id &&
+        row.provider === "aider" &&
+        Date.now() - new Date(row.timestamp).getTime() <= config.routing.cacheTtlMs)
+      .slice(-12);
+    // Provider/runtime failures are operational evidence, never model-edit
+    // incompatibility. Reject only after both generic formats failed.
+    const failedFormats = new Set(recentAiderOperations.filter((row) =>
+      row.failureKind === "edit_format").map((row) => row.editFormat));
+    const recovered = recentAiderOperations.some((row) => row.verification === "VERIFIED_SUCCESS");
+    const aiderReliabilityRejection = !recovered && failedFormats.has("diff") && failedFormats.has("whole")
+      ? "observed Aider edit-format incompatibility" : undefined;
     const forecastCost =
       md.inputPrice === undefined || md.outputPrice === undefined
         ? Infinity
@@ -443,8 +443,17 @@ export function optimizeSpecialists(
       md.inputPrice === undefined || md.outputPrice === undefined
         ? Infinity
         : (reservationInput * md.inputPrice + output * md.outputPrice) / 1e6;
-    const rejected = !model.enabled
+    const freeModel = model.id.endsWith(":free") ||
+      model.id === "openrouter/free" ||
+      (md.inputPrice === 0 && md.outputPrice === 0);
+    const rejected = freeModel
+      ? "free models temporarily disabled"
+      : model.id.endsWith(":batch")
+      ? "batch endpoint unsupported for interactive worker"
+      : !model.enabled
       ? "disabled"
+      : aiderReliabilityRejection
+        ? aiderReliabilityRejection
       : md.available === false
         ? "unavailable"
         : !Number.isFinite(forecastCost)
@@ -452,16 +461,6 @@ export function optimizeSpecialists(
           : md.contextLength !== undefined &&
               reservationInput + output > md.contextLength
             ? "context limit"
-            : (fp.toolsRequired || fp.executionStrategy === "stable") &&
-                protocolKnown && !supportsParameters(md, ["tools"])
-              ? "tools unsupported"
-            : (fp.executionStrategy === "stable" || usesDirectEditEngine(fp)) &&
-                  protocolKnown &&
-                  !supportsParameters(md, ["tools", "tool_choice"])
-                ? "tool_choice unsupported"
-                : (fp.executionStrategy === "stable" || usesDirectEditEngine(fp)) &&
-                    observedProtocolIncompatible
-                  ? "observed tool protocol incompatibility"
                 : fp.visionRequired && !item.vision
                   ? "vision unsupported"
                   : reservationCost > budgetUsd
@@ -559,8 +558,7 @@ export function optimizeSpecialists(
     );
     let ewma = model.latencyPriorMs;
     for (const call of recent) ewma = 0.25 * call.wallClockMs + 0.75 * ewma;
-    const expectedEngine = usesDirectEditEngine(fp)
-      ? "direct-edit" as const : "mini-swe-agent" as const;
+    const expectedEngine = "aider" as const;
     const attemptLatencyRows = efficiencyHistory.filter((row) =>
       (row.modelServed ?? row.modelRequested) === model.id &&
       observedExecutionEngine(row) === expectedEngine &&
@@ -600,7 +598,7 @@ export function optimizeSpecialists(
       expectedFiniteLatency(latency, p50, p90) <= requestDeadlineMs;
     // Attempts may contain multiple model calls. Learn their token/time totals
     // at current prices; provider errors never enter the quality posterior.
-    const engine = usesDirectEditEngine(fp) ? "direct-edit" : "mini-swe-agent";
+    const engine = "aider";
     const engineRows = efficiencyHistory.filter((row) => {
       if ((row.modelServed ?? row.modelRequested) !== model.id) return false;
       const observedEngine = observedExecutionEngine(row);
@@ -765,11 +763,12 @@ export function optimizeSpecialists(
     fp.architectureHeavy || fp.crossComponent || fp.publicApiRisk ||
     fp.schemaRisk || fp.configRisk ||
     fp.difficulty.architecturalComplexity === "high" ||
-    fp.verifierFalseAcceptRisk === "high" ||
+    (!fp.boundedDiscovery && fp.verifierFalseAcceptRisk === "high") ||
     ((fp.consequenceRisk ?? fp.difficulty.changeRisk) === "high" &&
       !detectableRecovery);
-  const allowedRegret =
-    Math.min(
+  const allowedRegret = fp.boundedDiscovery
+    ? Math.max(config.routing.maxQualityRegret, 0.2)
+    : Math.min(
       config.routing.maxQualityRegret,
       fp.verificationStrength === "weak" ? 0.012 : 0.025,
     ) * (highRisk ? 0.5 : 1);
@@ -808,11 +807,6 @@ export function optimizeSpecialists(
     .filter(
       (candidate) =>
         !excludedInitial.has(candidate.model.id) &&
-        hasSufficientQualityEvidence(
-          candidate,
-          fp,
-          config.routing.conditionalRecoveryMinSamples,
-        ) &&
         (fp.frontierJustified !== false ||
           candidate.model.tier !== "frontier"),
     )
@@ -826,8 +820,9 @@ export function optimizeSpecialists(
   // This is a policy gate, not a fabricated probability. Only a targeted
   // executable oracle permits a cheap-first quality cascade. Every accepted
   // candidate still runs the complete final verification contract.
-  const recoveryCoverage =
-    fp.verificationStrength === "strong" &&
+  const recoveryCoverage = fp.boundedDiscovery
+    ? ("targeted" as const)
+    : fp.verificationStrength === "strong" &&
     fp.targetedExecutableVerification !== false
       ? ("targeted" as const)
       : ("none" as const);
@@ -1057,14 +1052,7 @@ export function optimizeSpecialists(
         : fp.frontierJustified === false &&
             initial.model.tier === "frontier"
           ? "frontier first attempt requires semantic justification"
-          : rescue &&
-              !hasSufficientQualityEvidence(
-                rescue,
-                fp,
-                config.routing.conditionalRecoveryMinSamples,
-              )
-            ? "recovery model lacks sufficient quality evidence"
-            : initial.callCount >=
+        : initial.callCount >=
                   config.routing.conditionalRecoveryMinSamples &&
                 initial.operationalErrorRate > 0.5
               ? "observed operational error rate too high"
@@ -1111,9 +1099,7 @@ export function optimizeSpecialists(
       config.routing.conditionalRecoveryMinSamples,
     );
     const qualityRejection =
-      !evidenceSufficient
-        ? "insufficient quality evidence for production first attempt"
-        : highRisk && initialGap > allowedRegret
+      highRisk && initialGap > allowedRegret
           ? "high-risk first-attempt quality"
           : qualityGap > allowedRegret
             ? "quality parity"

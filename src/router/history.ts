@@ -47,7 +47,7 @@ export interface Attempt {
   toolFailures?: number;
   operationalFailure?: string;
   /** Actual execution scaffold; absent legacy rows transfer only weakly. */
-  executionEngine?: "direct-edit" | "mini-swe-agent";
+  executionEngine?: "aider" | "direct-edit" | "mini-swe-agent";
   contextStrategy?: "localized" | "agentic";
   routePolicyVersion?: string;
   selectionPropensity?: number;
@@ -86,7 +86,12 @@ export interface OperationalCall {
   costUsd: number | null;
   costSource?: "provider_reported" | "estimated_from_tokens";
   classification?: "OPERATIONAL_FAILURE";
-  failureKind?: "tool_protocol_incompatible" | "timeout" | "provider";
+  failureKind?: "tool_protocol_incompatible" | "timeout" | "provider" | "edit_format";
+  editFormat?: string;
+  exitCode?: number;
+  mutation?: boolean;
+  changedPaths?: string[];
+  verification?: string;
 }
 /** One append syscall per record (O_APPEND); no read/modify/write race between workers. */
 export class History {

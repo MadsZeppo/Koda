@@ -98,6 +98,105 @@ test("unlocalized task is uncertain even with a large context packet and a short
   assert.equal(fp.contextRequirementTokens, 16000);
 });
 
+test("localization uncertainty stays separate from semantic and parallel complexity", () => {
+  const subtask = {
+    id: "unknown-localization",
+    title: "Fix the incorrect local calculation",
+    objective: "Fix the incorrect local calculation",
+    likelyReadPaths: [],
+    likelyWritePaths: [],
+    dependsOn: [],
+    integrationContract: "focused checks pass",
+    verificationCommands: ["pnpm test"],
+    estimatedDifficulty: "normal" as const,
+    parallelSafe: false,
+  };
+  const repository = profile(["src/a.ts", "src/b.ts", "tests/a.test.ts"]);
+  const features = extractFeatures(subtask, repository, 256, undefined, "direct");
+  const fp = taskFingerprint(subtask, repository, features, "normal");
+  assert.equal(fp.localizationUncertainty, "high");
+  assert.notEqual(fp.semanticComplexity, "high");
+  assert.equal(fp.parallelizability, "low");
+});
+
+test("lexical discovery matches remain read candidates rather than mutation scope", () => {
+  const repository = profile([
+    "src/router/one.ts",
+    "src/router/two.ts",
+    "src/context/router.ts",
+    "tests/router.test.ts",
+  ]);
+  const routed = profileTask(
+    "Find and fix the router defect",
+    repository,
+    {
+      execution_strategy: "direct",
+      execution_effort: "normal",
+      strategy_reason: "bounded discovery",
+      likelyFiles: [],
+    },
+  );
+  assert.equal(routed.likelyPaths.length, 0);
+  assert.ok(routed.discoveryCandidates.length > 1);
+  assert.equal(routed.crossComponent, false);
+  assert.equal(routed.expectedBlastRadius, "single-file");
+});
+
+test("strategy discovery hints do not become Direct write evidence", () => {
+  const repository = profile([
+    "scripts/create-routing-fixtures.mjs",
+    "src/agent/prompts.ts",
+    "src/openrouter/client.ts",
+    "src/planner/routing.ts",
+    "tests/adaptiveCoding.test.ts",
+  ]);
+  const routed = profileTask(
+    "Fix the deterministic bug in bounded source and focused companion test handling",
+    repository,
+    {
+      execution_strategy: "direct",
+      execution_effort: "normal",
+      strategy_reason: "one bounded workstream",
+      likelyFiles: [
+        "scripts/create-routing-fixtures.mjs",
+        "src/agent/prompts.ts",
+        "src/openrouter/client.ts",
+        "src/planner/routing.ts",
+      ],
+    },
+  );
+
+  assert.deepEqual(routed.likelyPaths, []);
+  assert.ok(routed.discoveryCandidates.length > 0);
+  assert.equal(routed.scopeConfidence, "low");
+  assert.equal(routed.evidence.some((item) => item.includes("strategy repository path")), false);
+  assert.equal(routed.evidence.some((item) => item.includes("src/planner/routing.ts")), false);
+});
+
+test("parallelizability requires an explicit independent planned workstream", () => {
+  const independent = {
+    id: "independent",
+    title: "Implement two independent components",
+    objective: "Implement two independent components",
+    likelyReadPaths: ["src/a.ts", "src/b.ts"],
+    likelyWritePaths: ["src/a.ts", "src/b.ts"],
+    dependsOn: [],
+    integrationContract: "both focused checks pass",
+    verificationCommands: ["pnpm test"],
+    estimatedDifficulty: "normal" as const,
+    parallelSafe: true,
+  };
+  const repository = profile(["src/a.ts", "src/b.ts", "tests/a.test.ts", "tests/b.test.ts"]);
+  const features = extractFeatures(independent, repository, 512, undefined, "planned");
+  const fp = taskFingerprint(independent, repository, features, "normal");
+  assert.equal(fp.parallelizability, "high");
+
+  const dependent = { ...independent, dependsOn: ["foundation"], parallelSafe: false };
+  const dependentFeatures = extractFeatures(dependent, repository, 512, undefined, "planned");
+  const dependentFp = taskFingerprint(dependent, repository, dependentFeatures, "normal");
+  assert.notEqual(dependentFp.parallelizability, "high");
+});
+
 test("genuine coupled architecture stays difficult and infrastructure does not count as coding evidence", () => {
   const paths = ["services/auth/session.go", "services/store/access.go"];
   const task = work("Migrate authorization state across services", paths);

@@ -55,7 +55,7 @@ export interface EcosystemProfile {
   ambiguities: string[];
 }
 export const generatedPath = (p: string) =>
-  /(?:^|\/)(?:node_modules|\.venv|venv|vendor|dist|build|\.next|coverage|\.git|\.pytest_cache|\.mypy_cache|\.ruff_cache|__pycache__|\.turbo)(?:\/|$)/.test(
+  /(?:^|\/)(?:\.koda(?:[-/][^/]*)?|node_modules|\.venv|venv|vendor|dist|build|\.next|coverage|\.git|\.pytest_cache|\.mypy_cache|\.ruff_cache|__pycache__|\.turbo)(?:\/|$)/.test(
     p,
   );
 export const quote = (s: string) => "'" + s.replaceAll("'", "'\\''") + "'";

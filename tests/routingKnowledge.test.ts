@@ -133,7 +133,7 @@ test("long-tail p90 latency can demote an otherwise equivalent economical plan",
   assert.ok(result.considered.find((entry) => entry.model.id === "long-tail")!.latencyP90Ms! > 80_000);
 });
 
-test("sparse trajectory economics distinguish DirectEdit from mini-SWE and learn limit overruns", () => {
+test("Aider trajectory economics distinguish localized and broad tasks and learn limit overruns", () => {
   const direct = fp("strong");
   const agentic = { ...direct, executionStrategy: "stable", scope: "multi-file" as const,
     expectedFiles: 3, localizationConfidence: "high" as const };
@@ -145,7 +145,7 @@ test("sparse trajectory economics distinguish DirectEdit from mini-SWE and learn
     modelRequested: "agentic", modelServed: "agentic", features,
     fingerprint: agentic, verification: "NOT_FULLY_VERIFIED", wallClockMs: 43_100,
     inputTokens: 20_000, outputTokens: 3_689, costUsd: .174645, escalated: false,
-    terminationReason: "cost_limit", executionEngine: "mini-swe-agent",
+    terminationReason: "cost_limit", executionEngine: "aider",
     contextStrategy: "agentic" };
   const learned = estimateEfficiency(agentic, 4_000, 8_192, undefined, [overrun]);
   const wrongEngine = estimateEfficiency(direct, 4_000, 8_192, undefined, [overrun]);
@@ -153,7 +153,7 @@ test("sparse trajectory economics distinguish DirectEdit from mini-SWE and learn
   assert.ok(learned.p90TotalTokens >= learned.expectedTotalTokens);
   assert.ok(learned.p99TotalTokens >= learned.p90TotalTokens);
   assert.equal(wrongEngine.expectedTotalTokens, directEstimate.expectedTotalTokens,
-    "agentic overruns cannot inflate DirectEdit economics");
+    "broad Aider overruns cannot inflate localized Aider economics");
 });
 
 test("legacy DirectEdit usage cannot collapse a multi-turn agent token forecast", () => {
@@ -190,9 +190,9 @@ test("stale public token quantiles cannot undercut a newer trajectory estimate",
     scope: "multi-file" as const, expectedFiles: 3,
     localizationConfidence: "high" as const };
   const observations = [
-    { ...row("agentic", "total_tokens", 20_000), engine: "mini-swe-agent" as const },
-    { ...row("agentic", "total_tokens_p90", 1_529), engine: "mini-swe-agent" as const },
-    { ...row("agentic", "total_tokens_p99", 1_000), engine: "mini-swe-agent" as const },
+    { ...row("agentic", "total_tokens", 20_000), engine: "aider" as const },
+    { ...row("agentic", "total_tokens_p90", 1_529), engine: "aider" as const },
+    { ...row("agentic", "total_tokens_p99", 1_000), engine: "aider" as const },
   ];
   const estimate = estimateEfficiency(agentic, 4_000, 8_192,
     knowledge("agentic", observations), []);
@@ -214,7 +214,7 @@ test("agentic overruns transfer by engine and task region without becoming quali
     verification: "NOT_FULLY_VERIFIED", wallClockMs: 43_100,
     inputTokens: 20_000, outputTokens: 3_689, costUsd: .174645,
     escalated: false, terminationReason: "cost_limit",
-    executionEngine: "mini-swe-agent", contextStrategy: "agentic" };
+    executionEngine: "aider", contextStrategy: "agentic" };
   const result = optimizeSpecialists([model("agentic", 1)], agentic,
     agenticFeatures, [], { maxOutputTokens: 8192,
       routing: routingSchema.parse({}) } as Config, 10, [], new Set(), [overrun]);

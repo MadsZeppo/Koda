@@ -2,14 +2,15 @@
 
 A local TypeScript CLI for measuring whether explicit model routing and isolated parallel execution can reduce coding-agent cost and latency while preserving executable task success. No server, dashboard, accounts, database, or billing system.
 
-Production coding attempts use the official `mini-swe-agent==2.4.6` package.
-Koda provisions it in a reusable isolated runtime cache; target repositories do
-not receive Koda's Python dependencies. Koda still owns routing, budgets,
-worktrees, write-scope validation, verification, rollback, and integration.
+Production coding attempts use Aider through `AiderExecutor`. Koda owns routing,
+model selection, per-call budgets, isolated write scopes, verification, and apply
+policy. Mini-SWE is retained only for legacy tests and compatibility imports.
+See [Aider execution](docs/aider.md) for installation, exact invocation, format
+fallback, and telemetry.
 
 ## Run
 
-Requires Node.js 22+, pnpm, ripgrep, and **macOS `sandbox-exec` or Linux `bubblewrap` (`bwrap`)**. Git is optional for non-Git and dirty-workspace runs. The macOS execution path is tested; Linux support requires a host that permits unprivileged namespaces.
+Requires Node.js 22+, pnpm, ripgrep, and **macOS `sandbox-exec` or Linux `bubblewrap` (`bwrap`)**. Git is required by Aider; non-Git and dirty-workspace inputs remain supported through disposable Git snapshots. The macOS execution path is tested; Linux support requires a host that permits unprivileged namespaces.
 
 ```sh
 pnpm install
