@@ -24,8 +24,9 @@ export interface CalibrationOptions {
   config: Config;
   output?: string;
   taskId?: string;
-  /** Deterministic test seam; production calibration uses MiniSweWorker. */
+  /** Deterministic test seam; production calibration uses AiderExecutor. */
   codingWorkerFactory?: RunOptions["codingWorkerFactory"];
+  repositoryExplorerFactory?: RunOptions["repositoryExplorerFactory"];
 }
 
 export async function calibrateModels(options: CalibrationOptions) {
@@ -91,6 +92,7 @@ export async function calibrateModels(options: CalibrationOptions) {
         quiet: true,
         apply: false,
         codingWorkerFactory: options.codingWorkerFactory,
+        repositoryExplorerFactory: options.repositoryExplorerFactory,
       });
       if (changesBetween(baseline, await snapshotTree(frozen)).length)
         throw Error("Calibration run mutated the frozen baseline");

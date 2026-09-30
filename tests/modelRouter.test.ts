@@ -210,7 +210,7 @@ test("limit observations calibrate efficiency without entering semantic quality 
       verification: "NOT_FULLY_VERIFIED", wallClockMs: 43_100,
       inputTokens: 20_000, outputTokens: 3_689, costUsd: .174645,
       escalated: false, terminationReason: "cost_limit",
-      executionEngine: "mini-swe-agent", contextStrategy: "agentic" });
+      executionEngine: "aider", contextStrategy: "agentic" });
     assert.equal(rank([cheap], ledger.read())!.quality, rank([cheap], [])!.quality,
       "a limit is not negative coding-quality evidence");
     assert.equal(ledger.readEfficiency().length, 1);

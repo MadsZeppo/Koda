@@ -645,8 +645,8 @@ export async function command(
     const localOutbound = `(require-any (prefix ${q(scratch + "/")}) (remote ip "localhost:*"))`;
     const networkPolicy = dependencyBootstrap ? "" :
       `(deny network-outbound (require-not ${localOutbound}))(deny network-inbound (require-not ${localNetwork}))(deny network-bind (require-not ${localNetwork}))`;
-    const profile = `(version 1)(allow default)(deny file-read-data (require-not ${readable}))(deny file-write* (require-not ${writable}))${dependencyWriteDenials}(deny file-write* (subpath ${q(join(cwd, ".git"))}))${networkPolicy}`;
-    bin = "/usr/bin/sandbox-exec";
+      const profile = `(version 1)(allow default)(deny file-read-data (require-not ${readable}))(deny file-write* (require-not ${writable}))${dependencyWriteDenials}${networkPolicy}`;
+      bin = "/usr/bin/sandbox-exec";
     args = ["-p", profile, "/bin/sh", "-c", resolvedCommand];
   } else if (process.platform === "linux") {
     bin = "bwrap";

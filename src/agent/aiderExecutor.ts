@@ -1,5 +1,5 @@
 import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
@@ -49,6 +49,84 @@ const bridgePath = fileURLToPath(
   new URL("../../workers/aider/bridge.py", import.meta.url),
 );
 
+const MAX_AIDER_EDITABLE_FILES = 8;
+const MAX_AIDER_READ_ONLY_FILES = 8;
+
+function normalizeAiderPath(value: string): string | undefined {
+  const path = value.trim().replaceAll("\\", "/");
+  if (!path || path === "." || path.includes("\0") || path.startsWith("/") || /^[A-Za-z]:\//.test(path)) return undefined;
+  const parts = path.split("/").filter((part) => part && part !== ".");
+  if (!parts.length || parts.some((part) => part === "..") || parts[0] === ".git") return undefined;
+  return parts.join("/");
+}
+
+function isTestPath(path: string) {
+  return /(?:^|\/)(?:tests?|__tests__)(?:\/|$)/i.test(path) || /\.(?:test|spec)\.[^/]+$/i.test(path);
+}
+
+function explicitlyScoped(path: string, writeScope: readonly string[]) {
+  return writeScope.some((rawScope) => {
+    const scope = normalizeAiderPath(rawScope);
+    return !!scope && (path === scope || path.startsWith(`${scope}/`));
+  });
+}
+
+function insideWriteScope(path: string, writeScope: readonly string[]) {
+  return writeScope.some((scope) => scope.trim() === ".") || explicitlyScoped(path, writeScope);
+}
+
+function evidenceRelevantFiles(evidence: unknown): string[] {
+  if (!evidence || typeof evidence !== "object") return [];
+  const relevantFiles = (evidence as { relevantFiles?: unknown }).relevantFiles;
+  if (!Array.isArray(relevantFiles)) return [];
+  return relevantFiles.filter((value): value is string => typeof value === "string");
+}
+
+function broadTaskExplicitlyCreatesTests(task: string) {
+  return /\b(?:add|create|write|introduce)\b[^\n]{0,80}\b(?:tests?|specs?)\b/i.test(task);
+}
+
+export function selectAiderFiles(input: CodingWorkerInput): { editable: string[]; readOnly: string[] } {
+  const context = input.context;
+  if (!context) return { editable: [], readOnly: [] };
+  const normalizeList = (values: readonly string[]) => values.map(normalizeAiderPath).filter((value): value is string => !!value);
+  const evidence = normalizeList(evidenceRelevantFiles(context.evidence));
+  const complete = normalizeList(context.completePaths ?? []);
+  const source = normalizeList((context.sourceFiles ?? []).map((file) => file.path));
+  const relevant = normalizeList(context.relevantFiles ?? []);
+  const all = [...new Set([...evidence, ...complete, ...source, ...relevant])];
+  const preferredEditable = new Set([...evidence, ...complete]);
+  const allowBroadTestEdits = broadTaskExplicitlyCreatesTests(input.task);
+  const editable = all
+    .filter((path) => insideWriteScope(path, input.writeScope))
+    .filter((path) => isTestPath(path)
+      ? explicitlyScoped(path, input.writeScope) || allowBroadTestEdits
+      : preferredEditable.has(path) || explicitlyScoped(path, input.writeScope))
+    .slice(0, MAX_AIDER_EDITABLE_FILES);
+  const editableSet = new Set(editable);
+  const readOnly = all.filter((path) => !editableSet.has(path)).slice(0, MAX_AIDER_READ_ONLY_FILES);
+  return { editable, readOnly };
+}
+
+async function existingAiderFiles(root: string, selected: ReturnType<typeof selectAiderFiles>) {
+  const rootReal = await realpath(root);
+  const keep = async (path: string) => {
+    try {
+      const candidateReal = await realpath(join(root, path));
+      const rel = relative(rootReal, candidateReal);
+      return !(rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel));
+    } catch {
+      return false;
+    }
+  };
+  const editable = (await Promise.all(selected.editable.map(async (path) => [path, await keep(path)] as const)))
+    .filter(([, exists]) => exists).map(([path]) => path);
+  const editableSet = new Set(editable);
+  const readOnly = (await Promise.all(selected.readOnly.map(async (path) => [path, await keep(path)] as const)))
+    .filter(([, exists]) => exists).map(([path]) => path).filter((path) => !editableSet.has(path));
+  return { editable, readOnly };
+}
+
 export function aiderOpenRouterModel(model: string) {
   if (!/^[^\s/]+\/[^\s]+$/.test(model)) {
     throw Error("AIDER_MODEL_INVALID");
@@ -76,6 +154,8 @@ export function buildAiderArgs(
 ) {
   const model = aiderOpenRouterModel(input.model);
 
+  const mapTokens = 0;
+
   const args = [
     "--model",
     model,
@@ -97,17 +177,7 @@ export function buildAiderArgs(
     files.config,
 
     "--map-tokens",
-    String(
-      Math.max(
-        1024,
-        Math.min(
-          4096,
-          Math.floor(
-            (input.contextWindowTokens ?? input.maxTokens) / 4,
-          ),
-        ),
-      ),
-    ),
+    String(mapTokens),
 
     "--max-chat-history-tokens",
     String(
@@ -364,9 +434,8 @@ export class AiderExecutor implements CodingWorker {
       join(tmpdir(), "koda-aider-"),
     );
 
-    // Kept on the invocation shape for compatibility with existing
-    // tests/telemetry. Production execution no longer depends on a
-    // Python bridge writing these files.
+    // The production Python bridge writes these files; injected test runners
+    // may omit them and are classified from their direct command result.
     const reportPath = join(
       scratch,
       "report.json",
@@ -517,6 +586,14 @@ export class AiderExecutor implements CodingWorker {
               fatalError: reason,
             }
           : {}),
+
+        ...(reason === "attempt_budget_exhausted"
+          ? {
+              limitKind: "token_preflight" as const,
+              exactLimitFired: reason,
+              progressPhase: "DISCOVERY" as const,
+            }
+          : {}),
       };
     };
 
@@ -612,17 +689,26 @@ export class AiderExecutor implements CodingWorker {
         "{}\n",
       );
 
+      const aiderFiles = await existingAiderFiles(
+        input.repoPath,
+        selectAiderFiles(input),
+      );
+      if (!aiderFiles.editable.length)
+        return finish(
+          "infra_failure",
+          "missing_editable_scope: repository exploration must establish an editable file before Aider starts",
+          [],
+        );
+
       await writeFile(
         files.prompt,
         [
           input.task,
 
           [
-            "Inspect the repository using the repo map.",
-            "Discover the relevant files yourself.",
-            "Implement the complete task.",
-            "Make the smallest correct change.",
-            "Do not stop after merely explaining what should change.",
+            "Use the attached files as the primary implementation context.",
+            "Implement the complete task with the smallest correct change.",
+            "Do not ask the user to add a file and do not merely explain the change.",
           ].join(" "),
 
           `Authorized write paths: ${JSON.stringify(
@@ -652,6 +738,13 @@ export class AiderExecutor implements CodingWorker {
         scratch,
         "request.json",
       );
+
+      this.logger.log("aider_file_handoff", {
+        subtaskId: input.attemptId,
+        editable_files: aiderFiles.editable,
+        readonly_files: aiderFiles.readOnly,
+        discovery_mode: false,
+      });
 
       let format:
         AiderEditFormat =
@@ -713,6 +806,11 @@ export class AiderExecutor implements CodingWorker {
                 input.requestTimeoutMs,
               modelMetadata:
                 input.modelMetadata,
+              editableFiles:
+                aiderFiles.editable,
+              readOnlyFiles:
+                aiderFiles.readOnly,
+              discoveryMode: false,
             },
             null,
             2,
@@ -727,6 +825,11 @@ export class AiderExecutor implements CodingWorker {
               "-I",
               bridgePath,
               requestPath,
+              ...aiderFiles.editable,
+              ...aiderFiles.readOnly.flatMap((path) => [
+                "--read",
+                path,
+              ]),
               ...buildAiderArgs(
                 input,
                 files,

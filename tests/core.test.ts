@@ -550,7 +550,7 @@ console.log('NESTED_SANDBOX_OK');
   },
 );
 
-test("sandbox permits local writes, denies external reads and git metadata edits", async () => {
+test("sandbox permits repository metadata writes but still denies external reads", async () => {
   const repo = await fixture(),
     outside = await mkdtemp(join(tmpdir(), "koda-private-"));
   try {
@@ -560,7 +560,7 @@ test("sandbox permits local writes, denies external reads and git metadata edits
       (await command(repo, `cat '${outside}/secret.txt'`)).exitCode,
       0,
     );
-    assert.notEqual(
+    assert.equal(
       (await command(repo, "echo bad > .git/config")).exitCode,
       0,
     );

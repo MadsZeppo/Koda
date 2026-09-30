@@ -5,10 +5,12 @@ import type { CodingWorker, CodingWorkerInput } from "../../src/agent/codingWork
 import { AgentTools, toolDefinitions } from "../../src/agent/tools.js";
 import { WriteScope } from "../../src/repo/writeScope.js";
 import { changesBetween, snapshotTree } from "../../src/workspace/files.js";
-import { MINI_SWE_VERSION } from "../../src/agent/miniSweRuntime.js";
+import { chooseExecutionStrategy, requestsTestMutation } from "../../src/router/executionStrategy.js";
+import { isSourcePath, isTestPath } from "../../src/context/compiler.js";
+import type { RepositoryExplorer } from "../../src/agent/openHandsExplorer.js";
 
-/** Adapts historical mocked OpenRouter responses to the new worker test seam.
- * It is test-only; production always constructs MiniSweWorker. */
+/** Adapts historical mocked OpenRouter responses to the coding-worker seam.
+ * It is test-only; production always constructs AiderExecutor. */
 class MockCodingWorker implements CodingWorker {
   constructor(private readonly gateway: Gateway) {}
   async run(input: CodingWorkerInput) {
@@ -69,7 +71,7 @@ class MockCodingWorker implements CodingWorker {
       const calls = this.gateway.logger.events.slice(start).filter((event) =>
         event.type === "model_call" && event.modelRequested === input.model);
       return { exitStatus: "completed" as const, model: input.model,
-        engine: "mini-swe-agent" as const, engineVersion: MINI_SWE_VERSION,
+        engine: "aider" as const, engineVersion: "test-adapter",
         changedPaths, wallClockMs: calls.reduce((sum, call) => sum + call.wallClockMs, 0),
         inputTokens: calls.reduce((sum, call) => sum + call.promptTokens, 0),
         outputTokens: calls.reduce((sum, call) => sum + call.completionTokens, 0),
@@ -78,7 +80,7 @@ class MockCodingWorker implements CodingWorker {
         terminationReason: changedPaths.length ? "Submitted" : "NoMutation" };
     } catch (error) {
       return { exitStatus: "infra_failure" as const, model: input.model,
-        engine: "mini-swe-agent" as const, engineVersion: MINI_SWE_VERSION,
+        engine: "aider" as const, engineVersion: "test-adapter",
         changedPaths: [], wallClockMs: 0, terminationReason: "mock_provider_failure",
         fatalError: String(error) };
     }
@@ -86,6 +88,36 @@ class MockCodingWorker implements CodingWorker {
 }
 
 export const codingWorkerFactory = (gateway: Gateway) => new MockCodingWorker(gateway);
+export const repositoryExplorerFactory = (): RepositoryExplorer => ({
+  async explore({ task, profile }) {
+    const strategy = chooseExecutionStrategy(task, profile);
+    const allowTests = requestsTestMutation(task);
+    const candidates = strategy.likelyFiles
+      .filter((path) => profile.files.includes(path) &&
+        (isSourcePath(path) || (allowTests && isTestPath(path))));
+    const editable = (candidates.length ? candidates : profile.files.filter(
+      (path) => isSourcePath(path) && (!isTestPath(path) || allowTests),
+    )).slice(0, 3);
+    const tests = profile.files.filter(isTestPath).filter((path) => {
+      const lower = path.toLowerCase();
+      return editable.some((source) => {
+        const stem = source.split("/").at(-1)?.split(".")[0];
+        return !!stem && lower.includes(stem.toLowerCase());
+      });
+    }).slice(0, 4);
+    return {
+      confidence: editable.length ? "high" as const : "low" as const,
+      editableCandidates: editable.map((path) => ({ path, reason: "deterministic test repository evidence" })),
+      readonlyFiles: [],
+      relatedTests: tests,
+      dependencies: [],
+      evidence: editable.map((path) => ({ path, detail: "deterministic test evidence" })),
+      unresolvedQuestions: [],
+    };
+  },
+});
 export const run = (options: RunOptions) => productionRun({ ...options,
-  codingWorkerFactory });
+  codingWorkerFactory,
+  repositoryExplorerFactory: options.repositoryExplorerFactory ?? repositoryExplorerFactory,
+});
 export type { RunOptions };

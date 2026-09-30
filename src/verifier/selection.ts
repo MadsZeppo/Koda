@@ -71,7 +71,7 @@ export function impactAwareVerificationSelection(options: {
     !!fp &&
     (fp.publicApiRisk ||
       fp.schemaRisk ||
-      fp.configRisk ||
+      (fp.configRisk && fp.difficulty.changeRisk !== "low") ||
       fp.concurrencyRisk ||
       fp.architectureHeavy ||
       fp.crossComponent ||

@@ -52,11 +52,11 @@ export interface TokenEfficiencyProfile {
 export function observedExecutionEngine(row: Attempt) {
   if (row.executionEngine) return row.executionEngine;
   if (row.contextStrategy === "localized") return "direct-edit" as const;
-  if (row.contextStrategy === "agentic") return "mini-swe-agent" as const;
+  if (row.contextStrategy === "agentic") return "aider" as const;
   if (row.fingerprint)
     return usesDirectEditEngine(row.fingerprint)
       ? "direct-edit" as const
-      : "mini-swe-agent" as const;
+      : "aider" as const;
   return undefined;
 }
 

@@ -13,6 +13,7 @@ import { planSchema, type Plan } from "./schemas.js";
 import { validateDag } from "../orchestrator/dag.js";
 import { normalizePlan } from "../orchestrator/coalesce.js";
 import { unambiguousRepoPath } from "../repo/navigation.js";
+import type { RepositoryExploration } from "../agent/openHandsExplorer.js";
 export type PlannerComplexity = "trivial" | "standard" | "complex";
 export interface PlanningFile {
   path: string;
@@ -247,6 +248,7 @@ export async function planningPolicy(
   task: string,
   profile: RepoProfile,
   settings: Config["planner"],
+  exploration?: RepositoryExploration,
 ) {
   const sources = profile.files.filter(
     (f) => isSourcePath(f) && /\.[cm]?[jt]sx?$/.test(f),
@@ -312,7 +314,9 @@ export async function planningPolicy(
     /\b(?:also|add|change|update|implement|create|remove|delete|refactor)\b/i.test(
       actionableRemaining,
     );
-  const targetPaths = [...matched].sort();
+  const exploredPaths = exploration?.editableCandidates
+    .map((entry) => entry.path).filter((path) => sources.includes(path)) ?? [];
+  const targetPaths = [...new Set(exploration ? exploredPaths : matched)].sort();
   const tests = profile.files.filter(isTestPath);
   const texts = new Map<string, { text: string; complete: boolean }>();
   const candidates = [...targetPaths.slice(0, 8), ...tests.slice(0, 64)];

@@ -1165,7 +1165,8 @@ test("stable mode locks scope, preserves work across transient fallback, and ver
       .map((line) => JSON.parse(line));
     emitFixtureMetrics("stable-recovery-and-missing-test", result, events);
     const discoveryStart = events.find((event) => event.type === "stable_discovery_start");
-    assert.deepEqual(discoveryStart.initial_write_scope, ["."]);
+    assert.deepEqual(discoveryStart.initial_write_scope,
+      ["src/calculator.cjs", "tests/calculator.test.cjs"]);
     const discoveryLock = events.find((event) =>
       event.type === "stable_discovery_scope_locked");
     assert.deepEqual(discoveryLock.actual_changed_paths,
@@ -1175,12 +1176,12 @@ test("stable mode locks scope, preserves work across transient fallback, and ver
     const codingStarts = events.filter(
       (event) =>
         event.type === "coding_worker_start" &&
-        event.worker_engine === "mini-swe-agent",
+        event.worker_engine === "aider",
     );
     const codingStops = events.filter(
       (event) =>
         event.type === "coding_worker_stop" &&
-        event.worker_engine === "mini-swe-agent",
+        event.worker_engine === "aider",
     );
 
     const firstCodingStart = events.findIndex((event) => event.type === "coding_worker_start");
@@ -1198,33 +1199,34 @@ test("stable mode locks scope, preserves work across transient fallback, and ver
     );
 
     for (const event of codingStarts) {
-      assert.deepEqual(event.assigned_write_scope, ["."],
-        "initial and fallback mini-SWE attempts own the isolated Stable workspace");
+      assert.deepEqual(event.assigned_write_scope,
+        ["src/calculator.cjs", "tests/calculator.test.cjs"],
+        "initial and fallback Aider attempts retain the OpenHands scope");
     }
 
     assert.ok(
       events.some(
         (event) =>
-          event.type === "mini_swe_fallback" &&
+          event.type === "aider_fallback" &&
           event.from === "cheap" &&
           event.to === "strong",
       ),
-      "operational failure should fall back from cheap to strong through mini-SWE",
+      "operational failure should fall back from cheap to strong through Aider",
     );
 
     assert.ok(
       events.some(
         (event) =>
-          event.type === "mini_swe_attempt_verification" &&
+          event.type === "aider_attempt_verification" &&
           event.model === "strong" &&
           event.outcome === "VERIFIED_SUCCESS",
       ),
-      "strong mini-SWE attempt should pass Koda verification",
+      "strong Aider attempt should pass Koda verification",
     );
 
     assert.ok(events.some((event) =>
       event.type === "final_verification" && event.outcome === "CHECK_PASS"),
-    "Koda final verification remains authoritative after mini-SWE discovery");
+    "Koda final verification remains authoritative after Aider editing");
 
     assert.match(
       await readFile(

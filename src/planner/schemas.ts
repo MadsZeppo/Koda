@@ -10,6 +10,8 @@ export const subtaskSchema = z
     readOnly: z.boolean().optional(),
     integrationContract: z.string(),
     reusableArtifact: z.string().optional(),
+    provides: z.array(z.string()).optional(),
+    consumes: z.array(z.string()).optional(),
     verificationCommands: z.array(z.string()),
     estimatedDifficulty: z.enum(["low", "normal", "high"]),
     parallelSafe: z.boolean(),

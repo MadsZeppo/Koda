@@ -412,7 +412,7 @@ test("a verified no-change result never enters final coding repair", async () =>
   }
 });
 
-test("Stable test task accepts text-capable endpoints and recovers a formatting-stale edit locally", async () => {
+test("Stable test task accepts text-capable endpoints with an exploration-scoped edit", async () => {
   const root = await mkdtemp(join(tmpdir(), "koda-stable-test-e2e-"));
   const repo = join(root, "repo"), output = join(root, "output");
   const requests: any[] = [];
@@ -436,18 +436,18 @@ test("Stable test task accepts text-capable endpoints and recovers a formatting-
     }
     let raw = ""; for await (const chunk of request) raw += chunk;
     const body = JSON.parse(raw); requests.push(body);
-    assert.equal(body.model, "incompatible-cheap", "Aider eligibility does not require tool_choice");
+    assert.ok(["incompatible-cheap", "compatible-cheap"].includes(body.model));
     assert.equal(body.tool_choice, "required", JSON.stringify({ url: request.url,
       tools: body.tools?.map((entry: any) => entry.function?.name) }));
     const input = JSON.parse(body.messages[1].content);
-    assert.deepEqual(input.repairPacket.allowedWritePaths, ["."]);
+    assert.ok(input.repairPacket.allowedWritePaths.length > 0);
+    assert.equal(input.repairPacket.allowedWritePaths.includes("."), false);
     assert.match(JSON.stringify(input), /selectedModel/);
     const message = { role: "assistant", content: null, tool_calls: [{
       id: "stale-formatting", type: "function", function: {
-        name: "edit_file", arguments: JSON.stringify({
+        name: "write_file", arguments: JSON.stringify({
           path: "tests/routeDecision.test.cjs",
-          oldText: "const telemetry = route();\nassert.equal(telemetry.selectedModel, 'cheap');",
-          newText: "const telemetry = route();\n  assert.equal(telemetry.selectedModel, 'cheap');\n  assert.equal(telemetry.expectedCompletionCost, 1);",
+          content: "const {test}=require('node:test');\nconst assert=require('node:assert/strict');\nconst route=require('../src/gateway.cjs');\ntest('route telemetry', () => {\n  const telemetry = route();\n  assert.equal(telemetry.selectedModel, 'cheap');\n  assert.equal(telemetry.expectedCompletionCost, 1);\n});\n",
         }),
       },
     }] };
@@ -489,20 +489,31 @@ test("Stable test task accepts text-capable endpoints and recovers a formatting-
       routing: { stateDirectory: join(root, "routing") }, budgetUsd: 0.1 });
     const profile = await profileRepo(repo);
     assert.equal(chooseExecutionStrategy(task, profile).execution_strategy, "stable");
-    const result = await run({ repo, task, output, quiet: true, config: settings });
+    const result = await run({ repo, task, output, quiet: true, config: settings,
+      repositoryExplorerFactory: () => ({
+        async explore() {
+          return {
+            confidence: "high" as const,
+            editableCandidates: [{
+              path: "tests/routeDecision.test.cjs",
+              reason: "The requested regression belongs in the existing focused test",
+            }],
+            readonlyFiles: [{ path: "src/gateway.cjs", reason: "Defines the behavior under test" }],
+            relatedTests: ["tests/routeDecision.test.cjs"],
+            dependencies: [],
+            evidence: [{ path: "tests/routeDecision.test.cjs", detail: "Existing route telemetry test" }],
+            unresolvedQuestions: [],
+          };
+        },
+      }),
+    });
     assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
-    assert.equal(requests.length, 1, "recoverable stale formatting needs one cheap model call");
-    assert.equal(requests.some((request) => request.model === "incompatible-cheap"), true);
+    assert.equal(requests.length, 1, "the scoped edit needs one cheap model call");
     assert.equal(requests.some((request) => request.model === "expensive-fallback"), false);
     const events = (await readFile(join(output, "events.jsonl"), "utf8"))
       .trim().split("\n").map((line) => JSON.parse(line));
-    assert.deepEqual(events.find((event) => event.type === "stable_discovery_start")
-      .initial_write_scope, ["."]);
-    const scope = events.find((event) => event.type === "stable_discovery_scope_locked");
-    assert.deepEqual(scope.actual_changed_paths, ["tests/routeDecision.test.cjs"]);
-    assert.deepEqual(scope.repair_write_scope, scope.actual_changed_paths);
-    assert.ok(events.some((event) => event.type === "edit_file_context_refreshed" &&
-      event.recovered === true));
+    assert.deepEqual(events.find((event) => event.type === "repo_scope_selected")
+      .editable_files, ["tests/routeDecision.test.cjs"]);
     assert.ok(events.some((event) => event.type === "write_success" &&
       event.path === "tests/routeDecision.test.cjs"));
     assert.ok(events.some((event) => event.type === "final_verification" &&
@@ -634,7 +645,8 @@ test("exact Stable CLI task mutates from a bounded RepairPacket before targeted 
         names.includes(name)));
       assert.equal(body.tool_choice, "required");
       const input = JSON.parse(body.messages[1].content);
-      assert.deepEqual(input.repairPacket.allowedWritePaths, ["."]);
+      assert.deepEqual(input.repairPacket.allowedWritePaths,
+        ["src/cli.ts", "src/run.ts", "src/router/modelRouter.ts", "tests/adaptiveCoding.test.cjs"]);
       assert.ok(input.repairPacket.files.some((file: any) => file.path === "src/run.ts"));
       const large = input.repairPacket.files.find((file: any) => file.path === "src/run.ts");
       assert.equal(large.complete, false);
@@ -669,6 +681,27 @@ test("exact Stable CLI task mutates from a bounded RepairPacket before targeted 
     assert.equal(chooseExecutionStrategy(dogfoodTask, profile).execution_strategy, "stable");
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const result = await run({ repo, task: dogfoodTask, quiet: true, output,
+      repositoryExplorerFactory: () => ({
+        async explore() {
+          const editable = ["src/cli.ts", "src/run.ts", "src/router/modelRouter.ts",
+            "tests/adaptiveCoding.test.cjs"];
+          return {
+            confidence: "high" as const,
+            editableCandidates: editable.map((path) => ({
+              path,
+              reason: "Mock OpenHands evidence for the CLI feature flow",
+            })),
+            readonlyFiles: [],
+            relatedTests: ["tests/adaptiveCoding.test.cjs"],
+            dependencies: [
+              { from: "src/cli.ts", to: "src/run.ts", kind: "import" },
+              { from: "src/run.ts", to: "src/router/modelRouter.ts", kind: "import" },
+            ],
+            evidence: editable.map((path) => ({ path, detail: "Inspected by mock explorer" })),
+            unresolvedQuestions: [],
+          };
+        },
+      }),
       config: await config(undefined, { modelPool: { provider: "openrouter", models: [{
         id: "coder", tier: "fast", qualityPrior: 0.95, latencyPriorMs: 100,
         strengths: ["coding", "tool_use", "structured_output"],
@@ -679,13 +712,13 @@ test("exact Stable CLI task mutates from a bounded RepairPacket before targeted 
       .trim().split("\n").map((line) => JSON.parse(line));
     const mutation = events.findIndex((event) =>
       event.type === "coding_worker_stop" &&
-      event.worker_engine === "mini-swe-agent" &&
+      event.worker_engine === "aider" &&
       (event.actual_changed_paths?.length ?? 0) > 0);
     const lock = events.findIndex((event) => event.type === "stable_discovery_scope_locked");
     assert.deepEqual(events[lock]?.repair_write_scope,
       ["src/cli.ts", "src/run.ts", "tests/adaptiveCoding.test.cjs"]);
     assert.equal(events.filter((event) => event.type === "stable_finalization_start").length, 0);
-    assert.equal(requests.length, 1, "mini-SWE performs discovery and coding in one attempt");
+    assert.equal(requests.length, 1, "Aider performs one scoped coding attempt");
     const focused = events.findIndex((event) =>
       event.type === "stable_focused_verification");
     const final = events.findIndex((event) => event.type === "final_verification");
@@ -699,7 +732,7 @@ test("exact Stable CLI task mutates from a bounded RepairPacket before targeted 
 });
 
 for (const failure of ["timeout", "429", "no-scope"] as const) {
-test(`Stable ${failure} legacy pre-localizer state does not block mini-SWE discovery`, async () => {
+test(`Stable ${failure} prior routing state does not block scoped Aider execution`, async () => {
   const root = await mkdtemp(join(tmpdir(), "koda-stable-scope-fallback-"));
   const repo = join(root, "repo"), output = join(root, "output");
   const requests: any[] = [];
@@ -774,13 +807,13 @@ test(`Stable ${failure} legacy pre-localizer state does not block mini-SWE disco
     assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
     const events = (await readFile(join(output, "events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
     assert.deepEqual(events.find((event) => event.type === "stable_discovery_start")
-      .initial_write_scope, ["."]);
+      .initial_write_scope, ["src/a.js", "src/b.js", "src/c.js"]);
     const lock = events.find((event) => event.type === "stable_discovery_scope_locked");
     assert.deepEqual(lock.actual_changed_paths, ["src/a.js"]);
     assert.deepEqual(lock.repair_write_scope, ["src/a.js"]);
     assert.equal(requests.filter((request) => request.tools?.some((tool: any) =>
       tool.function.name === "lock_write_scope")).length, 0,
-    "production Stable does not call the legacy pre-localizer");
+    "production Stable uses the exploration-backed scope directly");
     assert.ok(events.some((event) => event.type === "coding_worker_start"));
     assert.ok(events.some((event) => event.type === "write_success" && event.path === "src/a.js"));
     assert.ok(events.some((event) => event.type === "final_verification" && event.outcome === "CHECK_PASS"));

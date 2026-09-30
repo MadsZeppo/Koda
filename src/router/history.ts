@@ -47,7 +47,7 @@ export interface Attempt {
   toolFailures?: number;
   operationalFailure?: string;
   /** Actual execution scaffold; absent legacy rows transfer only weakly. */
-  executionEngine?: "aider" | "direct-edit" | "mini-swe-agent";
+  executionEngine?: "aider" | "direct-edit";
   contextStrategy?: "localized" | "agentic";
   routePolicyVersion?: string;
   selectionPropensity?: number;

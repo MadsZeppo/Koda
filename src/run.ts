@@ -35,12 +35,12 @@ import { compileTask } from "./planner/taskCompiler.js";
 import { planningPolicy } from "./planner/policy.js";
 import { bestExecutablePlanner } from "./planner/routing.js";
 import { schedule } from "./orchestrator/scheduler.js";
+import { inferRepositoryDependencies } from "./orchestrator/dag.js";
 import { implement } from "./agent/codingExecutor.js";
 import { currentDiff, safePath } from "./agent/tools.js";
 import { truncateBytes } from "./context/bounds.js";
 import { AttemptCheckpoint } from "./agent/attemptCheckpoint.js";
 import { WriteScope } from "./repo/writeScope.js";
-import { discover } from "./agent/discovery.js";
 import {
   verify,
   verificationAgainstBaseline,
@@ -86,6 +86,13 @@ import {
   type DeterministicTaskProfile,
 } from "./router/taskProfiler.js";
 import { interpretTask } from "./router/taskInterpreter.js";
+import {
+  OpenHandsExplorer,
+  fastPathExploration,
+  strategyWithExploration,
+  type RepositoryExplorer,
+  type RepositoryExploration,
+} from "./agent/openHandsExplorer.js";
 export interface RunOptions {
   repo: string;
   /** Calibration may freeze source separately while reusing original installed dependencies. */
@@ -99,6 +106,8 @@ export interface RunOptions {
   apply?: boolean;
   /** Deterministic test seam. CLI/production never supplies a worker factory. */
   codingWorkerFactory?: (gateway: Gateway) => CodingWorker;
+  /** Deterministic test seam. Production always constructs OpenHandsExplorer. */
+  repositoryExplorerFactory?: (gateway: Gateway) => RepositoryExplorer;
 }
 
 export function finalVerificationScope(
@@ -155,6 +164,28 @@ function combineEvidence(packets: EvidencePacket[]) {
       packets.map((packet) => packet.suggestedApproach),
     ),
     evidence: unique(packets.flatMap((packet) => packet.evidence)),
+  };
+}
+
+function explorationPacket(exploration: RepositoryExploration): EvidencePacket {
+  return {
+    relevantFiles: [...new Set([
+      ...exploration.editableCandidates.map(({ path }) => path),
+      ...exploration.readonlyFiles.map(({ path }) => path),
+      ...exploration.relatedTests,
+    ])],
+    symbols: [],
+    reproduction: "",
+    failingTests: exploration.relatedTests,
+    likelyRootCause: exploration.editableCandidates
+      .map(({ path, reason }) => `${path}: ${reason}`).join("\n"),
+    dependencies: exploration.dependencies.map(
+      (edge) => `${edge.from} -> ${edge.to} (${edge.kind})`,
+    ),
+    uncertainty: exploration.confidence === "high" ? "low"
+      : exploration.confidence === "medium" ? "medium" : "high",
+    suggestedApproach: "Use the evidence-backed repository paths and preserve the declared write scope.",
+    evidence: exploration.evidence.map(({ path, detail }) => `${path}: ${detail}`),
   };
 }
 export async function run(options: RunOptions) {
@@ -251,7 +282,41 @@ export async function run(options: RunOptions) {
     const codingWorker = options.codingWorkerFactory?.(gateway);
     poolRouter = gateway.modelRouter;
     await poolRouter?.freezeRunSnapshot();
-    strategy = chooseExecutionStrategy(options.task, profile);
+    const initialStrategy = chooseExecutionStrategy(options.task, profile);
+    const repositoryExplorer = options.repositoryExplorerFactory?.(gateway) ??
+      new OpenHandsExplorer(gateway);
+    const fastEvidence = fastPathExploration(options.task, profile, initialStrategy);
+    let exploration: RepositoryExploration = fastEvidence ??
+      await repositoryExplorer.explore({
+        repoPath: integration.path,
+        task: options.task,
+        profile,
+      });
+    if (fastEvidence)
+      logger.log("repo_exploration_finish", {
+        model: null,
+        fast_path: true,
+        confidence: fastEvidence.confidence,
+        model_calls: 0,
+        tool_calls: 0,
+        files_inspected: [],
+        editable_files: fastEvidence.editableCandidates.map(({ path }) => path),
+        readonly_files: [],
+        related_tests: [],
+        input_tokens: 0,
+        output_tokens: 0,
+        cost_usd: 0,
+        wall_clock_ms: 0,
+      });
+    if (!exploration.editableCandidates.length)
+      throw Error("Repository exploration did not establish an editable implementation file");
+    strategy = strategyWithExploration(options.task, initialStrategy, exploration);
+    logger.log("repo_scope_selected", {
+      confidence: exploration.confidence,
+      editable_files: exploration.editableCandidates.map(({ path }) => path),
+      readonly_files: exploration.readonlyFiles.map(({ path }) => path),
+      related_tests: exploration.relatedTests,
+    });
     logger.log("execution_strategy", {
       execution_strategy: strategy.execution_strategy,
       execution_effort: strategy.execution_effort,
@@ -297,209 +362,64 @@ export async function run(options: RunOptions) {
       semanticAssessment
         ? { ...canonicalTaskProfile, semanticAssessment }
         : canonicalTaskProfile;
+    const exploredPaths = [...new Set([
+      ...exploration.editableCandidates.map(({ path }) => path),
+      ...exploration.readonlyFiles.map(({ path }) => path),
+      ...exploration.relatedTests,
+    ])];
+    const explorationEvidence = exploration.evidence.map(
+      ({ path, detail }) => `${path}: ${detail}`,
+    );
+    const preparedTaskProfile: DeterministicTaskProfile = {
+      ...interpretedTaskProfile,
+      likelyPaths: exploration.editableCandidates.map(({ path }) => path),
+      likelyTests: exploration.relatedTests,
+      discoveryCandidates: exploration.readonlyFiles.map(({ path }) => path),
+      scopeConfidence: exploration.confidence,
+      evidence: [...new Set([...interpretedTaskProfile.evidence, ...explorationEvidence])],
+    };
     const routingResume = await buildTaskResume(
       options.task,
       profile,
       strategy,
       {
         globalBudgetUsd: options.config.budgetUsd,
-        absoluteCapUsd: options.config.routing.researchAbsoluteCapUsd,
-        fraction: options.config.routing.researchBudgetFraction,
+        absoluteCapUsd: 0,
+        fraction: 0,
       },
-      async (taskProfile: DeterministicTaskProfile, capUsd: number) => {
-        if (strategy.execution_strategy !== "planned") return undefined;
-        if (!gateway.modelRouter) return undefined;
-        const context = {
-          task: options.task,
-          likelyPaths: taskProfile.likelyPaths,
-          repositoryFiles: profile.files.slice(0, 240),
-          symbols: profile.symbols.slice(0, 80),
-          verificationCommands: profile.verificationCommands,
-        };
-        const tools = [
-          {
-            type: "function" as const,
-            function: {
-              name: "submit_routing_scout",
-              description:
-                "Return read-only, repository-backed routing evidence.",
-              parameters: {
-                type: "object",
-                additionalProperties: false,
-                properties: {
-                  paths: {
-                    type: "array",
-                    items: { type: "string" },
-                    maxItems: 12,
-                  },
-                  symbols: {
-                    type: "array",
-                    items: { type: "string" },
-                    maxItems: 12,
-                  },
-                  evidence: {
-                    type: "array",
-                    items: { type: "string" },
-                    maxItems: 16,
-                  },
-                  reproduction: { type: "string" },
-                },
-                required: ["paths", "symbols", "evidence"],
-              },
-            },
-          },
-        ];
-        const messages = [
-          {
-            role: "system" as const,
-            content:
-              "Localize the task using only the supplied repository inventory. Read only. Cite concrete listed paths/symbols; never invent a path. Submit the structured tool once.",
-          },
-          { role: "user" as const, content: JSON.stringify(context) },
-        ];
-        const inputTokens =
-          Buffer.byteLength(JSON.stringify({ messages, tools })) + 256;
-        const scoutSubtask: Subtask = {
-          id: "routing-scout",
-          title: options.task,
-          objective: options.task,
-          dependsOn: [],
-          likelyReadPaths: taskProfile.likelyPaths,
-          likelyWritePaths: taskProfile.likelyPaths,
-          readOnly: true,
-          integrationContract: "Read-only routing evidence",
-          verificationCommands: [],
-          estimatedDifficulty: "low",
-          parallelSafe: false,
-        };
-        const features = extractFeatures(
-          scoutSubtask,
-          profile,
-          inputTokens,
-          undefined,
-          "planned",
-        );
-        features.taskKind = "planning";
-        let selected;
-        try {
-          selected = await gateway.modelRouter.select(
-            features,
-            "routing-scout",
-            [],
-            undefined,
-            false,
-            undefined,
-            {
-              budgetUsd: capUsd,
-              inputTokens,
-              outputTokens: options.config.routing.researchMaxOutputTokens,
-            },
-          );
-        } catch {
-          logger.log("routing_research_skipped", {
-            reason: "no compatible scout fits research budget",
-            cap_usd: capUsd,
-          });
-          return undefined;
-        }
-        const md = selected.metadata;
-        if (
-          md.inputPrice === undefined ||
-          md.outputPrice === undefined ||
-          (inputTokens * md.inputPrice +
-            options.config.routing.researchMaxOutputTokens * md.outputPrice) /
-            1e6 >
-            capUsd
-        )
-          return undefined;
-        const since = logger.events.length;
-        const response = await gateway.call(
-          selected.model.id,
-          messages,
-          "routing-scout",
-          "inspect",
-          0,
-          tools,
-          {
-            requireTool: true,
-            maxOutputTokens: options.config.routing.researchMaxOutputTokens,
-            timeoutMs: options.config.routing.researchTimeoutMs,
-          },
-        );
-        const call = logger.events
-          .slice(since)
-          .find((event) => event.type === "model_call");
-        const control = response.tool_calls?.find(
-          (item) =>
-            item.type === "function" &&
-            item.function.name === "submit_routing_scout",
-        );
-        if (!control || control.type !== "function") return undefined;
-        const parsed = JSON.parse(control.function.arguments);
-        return {
-          result: {
-            paths: Array.isArray(parsed.paths)
-              ? parsed.paths.filter(
-                  (path: unknown): path is string => typeof path === "string",
-                )
-              : [],
-            symbols: Array.isArray(parsed.symbols)
-              ? parsed.symbols.filter(
-                  (symbol: unknown): symbol is string =>
-                    typeof symbol === "string",
-                )
-              : [],
-            evidence: Array.isArray(parsed.evidence)
-              ? parsed.evidence.filter(
-                  (item: unknown): item is string => typeof item === "string",
-                )
-              : [],
-            reproduction:
-              typeof parsed.reproduction === "string"
-                ? parsed.reproduction
-                : undefined,
-          },
-          costUsd: call?.costUsd ?? capUsd,
-          tokens: call ? call.promptTokens + call.completionTokens : 0,
-        };
-      },
-      interpretedTaskProfile,
+      undefined,
+      preparedTaskProfile,
     );
-    const routingResearchCalls = logger.events.filter(
-      (event) =>
-        event.type === "model_call" && event.subtaskId === "routing-scout",
-    );
+    routingResume.scout = {
+      paths: exploredPaths,
+      symbols: [],
+      evidence: explorationEvidence,
+    };
+    routingResume.relevantPaths = exploredPaths;
+    routingResume.evidence = [...new Set([...routingResume.evidence, ...explorationEvidence])];
+    routingResume.microScoutUsed = false;
+    routingResume.researchCalls = 0;
+    routingResume.researchCostUsd = 0;
+    routingResume.researchTokens = 0;
     logger.log("task_profile", {
       profile: routingResume.profile,
-      micro_scout_used: routingResume.microScoutUsed,
-      routing_research_calls: routingResearchCalls.length,
-      routing_research_cost_usd: routingResearchCalls.some(
-        (call) => call.costUsd === null,
-      )
-        ? null
-        : routingResearchCalls.reduce((sum, call) => sum + call.costUsd, 0),
-      routing_research_tokens: routingResearchCalls.reduce(
-        (sum, call) => sum + call.promptTokens + call.completionTokens,
-        0,
-      ),
+      repository_exploration: true,
     });
     const sharedRoutingEvidence: EvidencePacket = {
-      relevantFiles: [
-        ...new Set([
-          ...routingResume.profile.likelyPaths,
-          ...(routingResume.scout?.paths ?? []),
-        ]),
-      ].slice(0, 16),
-      symbols: routingResume.scout?.symbols ?? [],
-      reproduction: routingResume.scout?.reproduction ?? "",
+      relevantFiles: exploredPaths.slice(0, 16),
+      symbols: [],
+      reproduction: "",
       failingTests: [
-        ...routingResume.profile.likelyTests,
+        ...exploration.relatedTests,
         ...canonicalVerification.checks
           .filter((check) => check.outcome === "CHECK_FAIL")
           .map((check) => check.command),
       ],
-      likelyRootCause: "",
-      dependencies: [],
+      likelyRootCause: exploration.editableCandidates
+        .map(({ path, reason }) => `${path}: ${reason}`).join("\n"),
+      dependencies: exploration.dependencies.map(
+        (edge) => `${edge.from} -> ${edge.to} (${edge.kind})`,
+      ),
       uncertainty:
         routingResume.profile.scopeConfidence === "high"
           ? "low"
@@ -508,7 +428,7 @@ export async function run(options: RunOptions) {
             : "high",
       suggestedApproach:
         "Use repository-backed paths and inspect current definitions before mutation.",
-      evidence: routingResume.evidence,
+      evidence: explorationEvidence,
     };
     let preselectedExecutionPlan: FrozenExecutionPlan | undefined;
     if (
@@ -517,10 +437,7 @@ export async function run(options: RunOptions) {
       !options.config.forceModel
     ) {
       const boundedWritePaths = directWritePaths(
-        [
-          ...routingResume.profile.likelyPaths,
-          ...(routingResume.scout?.paths ?? []),
-        ],
+        exploration.editableCandidates.map(({ path }) => path),
         profile,
         options.task,
       );
@@ -669,17 +586,18 @@ export async function run(options: RunOptions) {
         strategy.likelyFiles,
         profile,
         options.config.context,
+        true,
       );
       const subtask: Subtask = {
         id: "stable",
         title: options.task,
         objective: options.task,
         dependsOn: [],
-        likelyReadPaths: strategy.likelyFiles,
-        likelyWritePaths: ["."],
+        likelyReadPaths: exploredPaths,
+        likelyWritePaths: exploration.editableCandidates.map(({ path }) => path),
         readOnly: false,
         integrationContract:
-          "Discover the concrete implementation files in the isolated candidate workspace, implement the smallest correct change, and preserve existing public interfaces",
+          "Implement the smallest correct change in the evidence-backed files and preserve existing public interfaces",
         verificationCommands: [],
         estimatedDifficulty: "normal",
         parallelSafe: false,
@@ -688,7 +606,7 @@ export async function run(options: RunOptions) {
       logger.log("task_start", { subtaskId: subtask.id });
       logger.log("stable_discovery_start", {
         subtaskId: subtask.id,
-        initial_write_scope: ["."],
+        initial_write_scope: subtask.likelyWritePaths,
         context_files: context.files.map((file) => file.path),
       });
 
@@ -868,7 +786,7 @@ export async function run(options: RunOptions) {
             ...new Set([
               ...result.evidence.evidence,
               ...actualChangedPaths.map(
-                (path) => `mini_swe_changed_path:${path}`,
+                (path) => `aider_changed_path:${path}`,
               ),
             ]),
           ],
@@ -882,7 +800,7 @@ export async function run(options: RunOptions) {
 
         logger.log("stable_discovery_scope_locked", {
           subtaskId: subtask.id,
-          initial_write_scope: ["."],
+          initial_write_scope: subtask.likelyWritePaths,
           actual_changed_paths: actualChangedPaths,
           repair_write_scope: repairSubtask.likelyWritePaths,
         });
@@ -910,7 +828,7 @@ export async function run(options: RunOptions) {
       });
   } else if (strategy.execution_strategy === "direct") {
     const directEvidencePaths = directWritePaths(
-      routingResume.profile.likelyPaths,
+      exploration.editableCandidates.map(({ path }) => path),
       profile,
       options.task,
     );
@@ -928,6 +846,7 @@ export async function run(options: RunOptions) {
             directEvidencePaths.length ? directEvidencePaths : ["."],
             profile,
             options.config.context,
+            true,
           );
       const subtask: Subtask = {
         id: "direct",
@@ -1036,9 +955,13 @@ export async function run(options: RunOptions) {
         options.task,
         profile,
         routingResume,
+        exploration,
       );
       const normalized = normalizePlan(rawPlan);
       const plan = normalized.plan;
+      const inferredDependencies = inferRepositoryDependencies(plan, exploration.dependencies);
+      for (const edge of inferredDependencies)
+        logger.log("dependency_edge", edge);
       plannedSubtasks = normalized.before;
       coalescedSubtasks = normalized.after;
       logger.log("dag_normalized", {
@@ -1049,10 +972,7 @@ export async function run(options: RunOptions) {
       });
       await writeFile(join(output, "plan.json"), JSON.stringify(plan, null, 2));
       logger.log("dag", { plan });
-      const discoveryEvidence = new Map<
-        string,
-        Awaited<ReturnType<typeof discover>>
-      >();
+      const discoveryEvidence = new Map<string, EvidencePacket>();
       const execute = async (subtask: Subtask) => {
         logger.log("task_start", { subtaskId: subtask.id });
         const inheritedEvidence = subtask.dependsOn
@@ -1089,35 +1009,22 @@ export async function run(options: RunOptions) {
             await inheritDependencyEnvironment(integration!.path, wt.path);
             let evidence: EvidencePacket;
             try {
-              evidence = await discover(
-                gateway,
-                wt.path,
-                options.task,
-                subtask,
-                plan,
+              const continued = await repositoryExplorer.explore({
+                repoPath: wt.path,
+                task: subtask.objective,
                 profile,
-                inheritedEvidence,
-              );
+                previousExploration: exploration,
+                continuationReason: `Planner requested read-only evidence for ${subtask.id}`,
+              });
+              evidence = explorationPacket(continued);
             } catch (failure) {
-              // Discovery is advisory. A failed scout cannot grant writes or
-              // prevent a dependent coder from inspecting its own workspace.
+              // Infrastructure failure cannot grant writes or count as coding
+              // model quality evidence. Dependents retain only prior evidence.
               await assertWriteResponsibility(wt.path, subtask);
-              evidence = {
-                relevantFiles: subtask.likelyReadPaths.filter((file) =>
-                  profile.files.includes(file),
-                ),
-                symbols: [],
-                reproduction: "",
-                failingTests: [],
-                likelyRootCause: "",
-                dependencies: [],
-                uncertainty: "high",
-                suggestedApproach:
-                  "Inspect the relevant source before editing; discovery did not establish a finding.",
-                evidence: [],
-              };
-              logger.log("discovery_fallback", {
+              evidence = explorationPacket(exploration);
+              logger.log("repo_exploration_failure", {
                 subtaskId: subtask.id,
+                operational: true,
                 reason: String(failure),
                 relevantFiles: evidence.relevantFiles,
               });
@@ -1507,6 +1414,83 @@ export async function run(options: RunOptions) {
       return result;
     };
     verification = await runFinalVerification();
+    if (verification.status === "FAILED") {
+      const diagnostics = verification.checks
+        .filter((check) => check.outcome === "CHECK_FAIL")
+        .map((check) => `${check.command}\n${check.stderr || check.stdout}`)
+        .join("\n\n");
+      if (diagnostics) {
+        try {
+          const continued = await repositoryExplorer.explore({
+            repoPath: integration.path,
+            task: options.task,
+            profile: await profileRepo(integration.path),
+            previousExploration: exploration,
+            continuationReason: `Verification revealed missing repository context:\n${truncateBytes(diagnostics, 4_000)}`,
+          });
+          const existing = new Set(exploration.editableCandidates.map(({ path }) => path));
+          const added = continued.editableCandidates.filter(({ path }) => !existing.has(path));
+          if (added.length) {
+            exploration = {
+              confidence: continued.confidence,
+              editableCandidates: [...exploration.editableCandidates, ...added].slice(0, 12),
+              readonlyFiles: [...exploration.readonlyFiles, ...continued.readonlyFiles]
+                .filter(({ path }, index, values) => values.findIndex((item) => item.path === path) === index)
+                .slice(0, 16),
+              relatedTests: [...new Set([...exploration.relatedTests, ...continued.relatedTests])].slice(0, 12),
+              dependencies: [...exploration.dependencies, ...continued.dependencies].slice(0, 24),
+              evidence: [...exploration.evidence, ...continued.evidence].slice(0, 24),
+              unresolvedQuestions: continued.unresolvedQuestions,
+            };
+            const expanded = exploration.editableCandidates.map(({ path }) => path);
+            logger.log("scope_expansion_required", {
+              reason: "verification_missing_context",
+              requested_paths: added.map(({ path }) => path),
+              approved_paths: expanded,
+            });
+            if (stableRepairContext) {
+              stableRepairContext.subtask.likelyWritePaths = expanded;
+              stableRepairContext.subtask.likelyReadPaths = [...new Set([
+                ...expanded,
+                ...exploration.readonlyFiles.map(({ path }) => path),
+                ...exploration.relatedTests,
+              ])];
+              stableRepairContext.context = await compileContext(
+                integration.path,
+                options.task,
+                stableRepairContext.subtask.likelyReadPaths,
+                await profileRepo(integration.path),
+                options.config.context,
+                true,
+              );
+              stableRepairContext.evidence = explorationPacket(exploration);
+            }
+            if (directRepairContext) {
+              directRepairContext.subtask.likelyWritePaths = expanded;
+              directRepairContext.subtask.likelyReadPaths = [...new Set([
+                ...expanded,
+                ...exploration.readonlyFiles.map(({ path }) => path),
+                ...exploration.relatedTests,
+              ])];
+              directRepairContext.context = await compileContext(
+                integration.path,
+                options.task,
+                directRepairContext.subtask.likelyReadPaths,
+                await profileRepo(integration.path),
+                options.config.context,
+                true,
+              );
+            }
+          }
+        } catch (failure) {
+          logger.log("repo_exploration_failure", {
+            operational: true,
+            phase: "verification_continuation",
+            reason: String(failure),
+          });
+        }
+      }
+    }
     if (
       stableRepairContext &&
       changed.length > 0 &&

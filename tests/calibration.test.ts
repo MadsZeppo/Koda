@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { config } from "../src/config.js";
 import { calibrateModels } from "../src/calibration.js";
-import { codingWorkerFactory } from "./helpers/run.js";
+import { codingWorkerFactory, repositoryExplorerFactory } from "./helpers/run.js";
 
 test("strict calibration compares two models on one frozen baseline without changing the original", async () => {
   const root = await mkdtemp(join(tmpdir(), "koda-calibration-test-"));
@@ -117,6 +117,7 @@ test("strict calibration compares two models on one frozen baseline without chan
       config: c,
       output,
       codingWorkerFactory,
+      repositoryExplorerFactory,
     });
     const rows = result.results as any[];
     assert.deepEqual(
@@ -196,6 +197,7 @@ test("strict calibration compares two models on one frozen baseline without chan
       config: c,
       output: join(root, "substitution"),
       codingWorkerFactory,
+      repositoryExplorerFactory,
     });
     assert.equal(mismatch.results[0]!.status, "FAILED");
     assert.equal(mismatch.results[0]!.failureClass, "MODEL_MISMATCH");

@@ -5,7 +5,7 @@ import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { git } from "../src/repo/commands.js";
-import { codingWorkerFactory, run } from "./helpers/run.js";
+import { codingWorkerFactory, repositoryExplorerFactory, run } from "./helpers/run.js";
 import { config } from "../src/config.js";
 import { benchmark } from "../src/benchmark.js";
 import type { Plan, Subtask } from "../src/planner/schemas.js";
@@ -361,7 +361,7 @@ test("benchmark hidden failure cannot be overridden by model success and base ch
       models: { SCOUT_MODEL: "scout", CHEAP_CODER_A: "cheap-a" },
     });
     const results = await benchmark(manifest, c, join(output, "results"),
-      { codingWorkerFactory });
+      { codingWorkerFactory, repositoryExplorerFactory });
     assert.equal(results[0]!.status, "FAILED");
     assert.ok(results[0]!.verification.checks.length >= 4);
     assert.equal(results[0]!.verification.checks.at(-1)!.exitCode, 1);

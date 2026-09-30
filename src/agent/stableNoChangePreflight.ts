@@ -72,7 +72,7 @@ export async function routingBaselinePreflight(
  *
  * The proof needs executable assertion code and at least one passing,
  * repository-derived test command. An inconclusive proof simply delegates to
- * mini-SWE; it never blocks mutation work.
+ * the coding worker; it never blocks mutation work.
  */
 export async function stableNoChangePreflight(
   root: string,

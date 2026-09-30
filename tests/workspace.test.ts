@@ -1224,8 +1224,8 @@ test("localized README dogfood task is DIRECT and makes zero planner calls", asy
       result.verification.checks.map((check: any) => check.command),
       ["pnpm run lint", "internal:tiny-documentation-structure"],
     );
-    assert.equal(result.verificationCalls, 2,
-      "one bounded routing preflight plus final verification");
+    assert.equal(result.verificationCalls, 3,
+      "one bounded routing preflight plus two final verification checks");
     const events = (await readFile(join(f.output, "events.jsonl"), "utf8"))
       .trim()
       .split("\n")

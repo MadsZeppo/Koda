@@ -328,7 +328,7 @@ export function summarize(
       (e) =>
         e.type === "model_fallback" ||
         e.type === "coding_route_fallback" ||
-        (e.type === "mini_swe_fallback" && e.moved === true),
+        (e.type === "aider_fallback" && e.moved === true),
     ).length,
 
     plannerModels: [

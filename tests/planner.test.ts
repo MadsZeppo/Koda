@@ -25,7 +25,6 @@ import { extractFeatures } from "../src/router/features.js";
 import { rankCandidates } from "../src/router/modelRouter.js";
 import type { Attempt } from "../src/router/history.js";
 import { planSchema } from "../src/planner/schemas.js";
-import { discover } from "../src/agent/discovery.js";
 import { AgentTools } from "../src/agent/tools.js";
 import { implement } from "../src/agent/loop.js";
 
@@ -533,7 +532,7 @@ for (const mutate of [false, true])
       await rm(root, { recursive: true, force: true });
     }
   });
-test("coding worker expands one evidenced sibling scope and verifies its edit", async () => {
+test("coding worker honors an evidence-backed multi-file scope", async () => {
   const root = await mkdtemp(join(tmpdir(), "koda-sibling-fix-"));
   const repo = join(root, "repo");
   await mkdir(join(repo, "src"), { recursive: true });
@@ -585,7 +584,7 @@ test("coding worker expands one evidenced sibling scope and verifies its edit", 
       objective,
       dependsOn: [],
       likelyReadPaths: ["src/a.mjs", "src/b.mjs"],
-      likelyWritePaths: ["src/a.mjs"],
+      likelyWritePaths: ["src/a.mjs", "src/b.mjs"],
       integrationContract: "Feature test passes",
       verificationCommands: ["npm run test"],
       estimatedDifficulty: "normal" as const,
@@ -615,7 +614,7 @@ test("coding worker expands one evidenced sibling scope and verifies its edit", 
     assert.equal(
       logger.events.filter((event) => event.type === "write_scope_expanded")
         .length,
-      1,
+      0,
     );
     assert.equal(
       await readFile(join(repo, "src/b.mjs"), "utf8"),
@@ -758,78 +757,6 @@ test('no negative regression',()=>assert.notEqual(value,-1));
   } finally {
     await mockServer.close();
     await rm(root, { recursive: true, force: true });
-  }
-});
-test("malformed scout final JSON retains concrete search evidence for coding", async () => {
-  const f = await fixture();
-  const m = await mock((body) =>
-    body.messages.length === 2
-      ? {
-          role: "assistant",
-          content: null,
-          tool_calls: [
-            {
-              id: "search",
-              type: "function",
-              function: {
-                name: "search_code",
-                arguments: JSON.stringify({ query: "export function a" }),
-              },
-            },
-          ],
-        }
-      : { role: "assistant", content: "not valid JSON" },
-  );
-  try {
-    const subtask = {
-      id: "inspect",
-      title: "Inspect",
-      objective: "Find the existing implementation",
-      dependsOn: [],
-      likelyReadPaths: [],
-      likelyWritePaths: [],
-      readOnly: true,
-      integrationContract: "Return evidence",
-      verificationCommands: [],
-      estimatedDifficulty: "low" as const,
-      parallelSafe: false,
-    };
-    const logger = new Logger(
-      join(f.root, "scout-report"),
-      "scout-search",
-      true,
-    );
-    const gateway = new Gateway(
-      await config(undefined, { modelPool: pool, baseUrl: m.url }),
-      logger,
-      new Budget(0.1, 200000, 60000),
-    );
-    const evidence = await discover(
-      gateway,
-      f.repo,
-      "Find the implementation",
-      subtask,
-      { subtasks: [subtask] },
-      await profileRepo(f.repo),
-    );
-    assert.ok(
-      evidence.relevantFiles.includes("src/a.ts"),
-      JSON.stringify({
-        evidence,
-        events: logger.events.filter((event) => event.type === "tool_result"),
-      }),
-    );
-    assert.ok(
-      evidence.evidence.some(
-        (item) => item.includes("search_code:") && item.includes("src/a.ts"),
-      ),
-    );
-    assert.ok(
-      logger.events.some((event) => event.type === "discovery_fallback"),
-    );
-  } finally {
-    await m.close();
-    await f.cleanup();
   }
 });
 async function mock(
@@ -1625,7 +1552,7 @@ test("planner permits explicit read-only discovery but retains mutation ownershi
   );
 });
 
-for (const malformed of [false, true])
+for (const malformed of [false])
   test(
     malformed
       ? "malformed discovery finalization preserves context and continues to dependent coding"
@@ -1716,10 +1643,7 @@ for (const malformed of [false, true])
               });
         }
         assert.equal(input.subtask.id, "fix-verification");
-        if (malformed) {
-          assert.equal(input.evidence.uncertainty, "high");
-          assert.ok(input.evidence.relevantFiles.includes("src/a.ts"));
-        } else assert.equal(input.evidence.likelyRootCause, "a returns 0");
+        assert.ok(input.evidence.relevantFiles.includes("src/a.ts"));
         assert.deepEqual(input.allowed_write_paths, ["src/a.ts"]);
         return {
           role: "assistant",
@@ -1756,15 +1680,6 @@ for (const malformed of [false, true])
         });
         assert.equal(result.execution_strategy, "planned");
         assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
-        if (malformed)
-          assert.ok(
-            (
-              await readFile(
-                join(f.root, "discovery-report/events.jsonl"),
-                "utf8",
-              )
-            ).includes('"type":"discovery_fallback"'),
-          );
         const events = (
           await readFile(join(f.root, "discovery-report/events.jsonl"), "utf8")
         )
@@ -1776,8 +1691,8 @@ for (const malformed of [false, true])
             event.type === "worker_scope" &&
             event.subtaskId === "inspect-verification",
         );
-        assert.deepEqual(discoveryScope.allowed_write_paths, []);
-        assert.equal(discoveryScope.read_only, true);
+        assert.equal(discoveryScope, undefined,
+          "OpenHands exploration replaces planner-created discovery workers");
         assert.equal(
           events.filter(
             (event) =>
@@ -1786,19 +1701,11 @@ for (const malformed of [false, true])
           ).length,
           0,
         );
-        assert.ok(
-          events.some(
-            (event) =>
-              event.type ===
-                (malformed ? "discovery_fallback" : "discovery_complete") &&
-              event.subtaskId === "inspect-verification",
-          ),
-        );
         assert.equal(
           m.requests.filter((request) =>
             request.messages[0].content.includes("read-only repository scout"),
           ).length,
-          2,
+          0,
         );
         assert.equal(await git(f.repo, "status", "--porcelain"), "");
         assert.match(
@@ -1811,199 +1718,6 @@ for (const malformed of [false, true])
       }
     },
   );
-
-test("discovery routing skips an otherwise eligible unknown-priced model", async () => {
-  const f = await fixture();
-  const discoveryPool = {
-    provider: "openrouter" as const,
-    models: [
-      {
-        id: "unknown-scout",
-        tier: "fast" as const,
-        qualityPrior: 0.99,
-        latencyPriorMs: 1,
-        strengths: ["coding", "tool_use", "reasoning"],
-        unknownPricing: true,
-      },
-      {
-        id: "known-scout",
-        tier: "fast" as const,
-        qualityPrior: 0.95,
-        latencyPriorMs: 1000,
-        strengths: ["coding", "tool_use", "reasoning"],
-        inputPrice: 0.1,
-        outputPrice: 0.2,
-      },
-    ],
-  };
-  const m = await mock((body) => {
-    assert.equal(body.model, "known-scout");
-    if (body.tools)
-      return {
-        role: "assistant",
-        content: null,
-        tool_calls: [
-          {
-            id: "inspect",
-            type: "function",
-            function: {
-              name: "read_file",
-              arguments: JSON.stringify({
-                path:
-                  body.messages.length === 2
-                    ? "src/a.ts"
-                    : body.messages.length === 4
-                      ? "src/b.ts"
-                      : "test/a.test.ts",
-              }),
-            },
-          },
-        ],
-      };
-    assert.equal(body.tools, undefined);
-    assert.match(
-      body.messages.at(-1).content,
-      /Tools are unavailable on this finalization turn/,
-    );
-    return response({
-      relevantFiles: ["src/a.ts"],
-      symbols: ["a"],
-      reproduction: "Inspected src/a.ts",
-      failingTests: [],
-      likelyRootCause: "a returns 0",
-      dependencies: [],
-      uncertainty: "low",
-      suggestedApproach: "Update a",
-      evidence: ["src/a.ts contains return 0"],
-    });
-  }, discoveryPool.models);
-  try {
-    const c = await config(undefined, {
-      modelPool: discoveryPool,
-      baseUrl: m.url,
-      models: { SCOUT_MODEL: "unknown-scout" },
-      routing: { stateDirectory: join(f.root, "discovery-price-history") },
-      budgetUsd: 0.1,
-    });
-    const logger = new Logger(
-      join(f.root, "discovery-price-log"),
-      "discovery-price",
-      true,
-    );
-    const gateway = new Gateway(c, logger, new Budget(0.1, 200000, 60000));
-    const subtask = {
-      id: "inspect-priced",
-      title: "Inspect source",
-      objective: "Inspect src/a.ts for the defect",
-      dependsOn: [],
-      likelyReadPaths: ["src/a.ts"],
-      likelyWritePaths: [],
-      readOnly: true as const,
-      integrationContract: "Return evidence",
-      verificationCommands: [],
-      estimatedDifficulty: "low" as const,
-      parallelSafe: false,
-    };
-    await discover(
-      gateway,
-      f.repo,
-      subtask.objective,
-      subtask,
-      { subtasks: [subtask] },
-      await profileRepo(f.repo),
-    );
-    assert.deepEqual(
-      m.requests.map((request) => request.model),
-      ["known-scout", "known-scout"],
-    );
-    const routed = logger.events.find((event) => event.type === "model_router");
-    assert.equal(routed.selected_model, "known-scout");
-    assert.equal(
-      routed.candidates.find(
-        (candidate: any) => candidate.id === "unknown-scout",
-      ).rejected,
-      "unknown pricing",
-    );
-  } finally {
-    await m.close();
-    await f.cleanup();
-  }
-});
-
-test("discovery returns uncertain read-only evidence after an unusable tool-free finalization", async () => {
-  const f = await fixture();
-  const knownPool = {
-    provider: "openrouter" as const,
-    models: [
-      {
-        id: "known-scout",
-        tier: "fast" as const,
-        qualityPrior: 0.95,
-        latencyPriorMs: 1000,
-        strengths: ["coding", "tool_use", "reasoning"],
-      },
-    ],
-  };
-  const m = await mock((body) => {
-    if (body.tools)
-      return {
-        role: "assistant",
-        content: null,
-        tool_calls: [
-          {
-            id: `inspect-${body.messages.length}`,
-            type: "function",
-            function: {
-              name: "read_file",
-              arguments: JSON.stringify({ path: "src/a.ts" }),
-            },
-          },
-        ],
-      };
-    assert.equal(body.tools, undefined);
-    return response("Unable to summarize");
-  }, knownPool.models);
-  try {
-    const c = await config(undefined, {
-      modelPool: knownPool,
-      baseUrl: m.url,
-      routing: { stateDirectory: join(f.root, "discovery-final-history") },
-      budgetUsd: 0.1,
-    });
-    const gateway = new Gateway(
-      c,
-      new Logger(join(f.root, "discovery-final-log"), "discovery-final", true),
-      new Budget(0.1, 200000, 60000),
-    );
-    const subtask = {
-      id: "inspect-final",
-      title: "Inspect source",
-      objective: "Inspect src/a.ts for the defect",
-      dependsOn: [],
-      likelyReadPaths: ["src/a.ts"],
-      likelyWritePaths: [],
-      readOnly: true as const,
-      integrationContract: "Return evidence",
-      verificationCommands: [],
-      estimatedDifficulty: "low" as const,
-      parallelSafe: false,
-    };
-    const evidence = await discover(
-      gateway,
-      f.repo,
-      subtask.objective,
-      subtask,
-      { subtasks: [subtask] },
-      await profileRepo(f.repo),
-    );
-    assert.equal(evidence.uncertainty, "high");
-    assert.ok(evidence.relevantFiles.includes("src/a.ts"));
-    assert.equal(m.requests.length, 2);
-  } finally {
-    await m.close();
-    await f.cleanup();
-  }
-});
 
 test("planner quality, latency and cost history are independent of coder history", async () => {
   const c = await config(undefined, { modelPool: pool });

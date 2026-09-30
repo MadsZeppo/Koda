@@ -14,7 +14,7 @@ export type RoutingMetric = "result_at_1" | "pass_at_5" | "success_rate" |
   "completion_latency_p50_ms" | "completion_latency_p90_ms" |
   "completion_latency_p99_ms" |
   "task_count" | "market_share";
-export type RoutingExecutionEngine = "aider" | "direct-edit" | "mini-swe-agent" | "unknown";
+export type RoutingExecutionEngine = "aider" | "direct-edit" | "unknown";
 export type ProviderCapabilityMetric = "tools_supported" | "tool_choice_supported" |
   "structured_output_supported" | "context_tokens" | "input_price_per_million" |
   "output_price_per_million" | "availability" | "text_modality" | "vision_modality";

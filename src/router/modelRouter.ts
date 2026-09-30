@@ -1084,8 +1084,7 @@ export class PoolRouter {
         (event) =>
           event.subtaskId === subtaskId &&
           (event.type === "verification" ||
-            event.type === "aider_attempt_verification" ||
-            event.type === "mini_swe_attempt_verification"),
+            event.type === "aider_attempt_verification"),
       )
       .map((event) =>
         String(event.outcome ?? event.verification ?? "unknown"),
@@ -1160,8 +1159,7 @@ export class PoolRouter {
         .reverse()
         .find(
           (event) =>
-            (event.type === "aider_attempt_verification" ||
-              event.type === "mini_swe_attempt_verification") &&
+            event.type === "aider_attempt_verification" &&
             event.subtaskId === subtaskId &&
             event.model === model.id,
         )?.outcome,
@@ -1178,8 +1176,6 @@ export class PoolRouter {
         ? ("direct-edit" as const)
         : worker?.worker_engine === "aider"
           ? ("aider" as const)
-        : worker?.worker_engine === "mini-swe-agent"
-          ? ("mini-swe-agent" as const)
           : undefined,
       contextStrategy: worker?.worker_engine === "direct-edit"
         ? ("localized" as const)

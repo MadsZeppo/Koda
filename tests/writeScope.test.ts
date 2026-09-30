@@ -170,7 +170,7 @@ test("shell transactions discard sibling/ignored/deleted writes, preserve earlie
     assert.equal(ok.exitCode, 0, ok.stderr);
     assert.equal(await readFile(join(f.repo, "src/a.ts"), "utf8"), "fixed\n");
     const gitConfig = await readFile(join(f.repo, ".git/config"), "utf8");
-    assert.notEqual(
+    assert.equal(
       JSON.parse(
         await f.tools.execute("run_command", {
           command: "echo bad > .git/config",

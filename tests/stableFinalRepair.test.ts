@@ -203,9 +203,9 @@ for (const mode of [
         .map((line) => JSON.parse(line));
       assert.equal(result.execution_strategy, "stable");
       assert.deepEqual(events.find((event) => event.type === "stable_discovery_start")
-        ?.initial_write_scope, ["."]);
+        ?.initial_write_scope, ["src/calc.cjs", "tests/calc.test.cjs"]);
       assert.equal(events.some((event) => event.type === "stable_scope_locked"), false,
-        "production does not invoke the legacy Stable pre-localizer");
+        "production receives scope from repository exploration");
       const repairRequests = f.requests.filter((request) => {
         const input = JSON.parse(request.messages[1].content);
         return Boolean(input.context?.diagnostics || input.context?.previousFailedDiff);

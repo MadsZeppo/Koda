@@ -20,7 +20,7 @@ export async function benchmark(
   manifest: string,
   config: Config,
   output: string,
-  runOverrides: Pick<RunOptions, "codingWorkerFactory"> = {},
+  runOverrides: Pick<RunOptions, "codingWorkerFactory" | "repositoryExplorerFactory"> = {},
 ) {
   const tasks = manifestSchema.parse(
     JSON.parse(await readFile(manifest, "utf8")),

@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execa } from "execa";
-import { AiderExecutor, aiderOpenRouterModel, preferredAiderFormat, type AiderInvocation } from "../src/agent/aiderExecutor.js";
+import { AiderExecutor, aiderOpenRouterModel, preferredAiderFormat, selectAiderFiles, type AiderInvocation } from "../src/agent/aiderExecutor.js";
 import { ensureAiderRuntime } from "../src/agent/aiderRuntime.js";
 import { Budget } from "../src/openrouter/usage.js";
 import { Logger } from "../src/telemetry/logger.js";
@@ -33,7 +33,10 @@ const input = (root: string): CodingWorkerInput => ({ repoPath: root, attemptId:
   task: "Change both values to 3", model: "foo/bar", budgetUsd: .1,
   maxTokens: 10000, maxSteps: 4, timeoutMs: 30000, requestTimeoutMs: 5000,
   commandTimeoutMs: 2000, maxOutputTokens: 1000, promptPricePerMillion: 1,
-  completionPricePerMillion: 1, baseUrl: "http://localhost:1", writeScope: ["src"] });
+  completionPricePerMillion: 1, baseUrl: "http://localhost:1", writeScope: ["src"],
+  context: { relevantFiles: ["src/value.cjs", "src/other.cjs"],
+    completePaths: ["src/value.cjs", "src/other.cjs"],
+    evidence: { relevantFiles: ["src/value.cjs", "src/other.cjs"] } } });
 const success = { command: "mock aider", cwd: ".", exitCode: 0, stdout: "done", stderr: "", timedOut: false, wallClockMs: 2 };
 async function report(i: AiderInvocation, format: string, failureKind?: string) {
   await writeFile(i.reportPath, JSON.stringify({ format, failureKind, version: "mock" }));
@@ -48,6 +51,98 @@ test("arbitrary OpenRouter model IDs transform deterministically without an allo
   for (const id of ["foo/bar", "new-company/future-model:free", "vendor/model-v123", "openrouter/future-route"]) {
     assert.equal(aiderOpenRouterModel(id), `openrouter/${id}`);
   }
+});
+
+test("Aider file handoff keeps grounded source editable and tests/read context read-only", () => {
+  const selected = selectAiderFiles({
+    ...input("/repo"),
+    writeScope: ["."],
+    task: "Fix the failing value test without changing the test",
+    context: {
+      relevantFiles: ["package.json", "src/value.cjs", "tests/value.test.cjs", "../outside.cjs", "."],
+      sourceFiles: [
+        { path: "package.json", snippet: "{}" },
+        { path: "src/value.cjs", snippet: "module.exports = 1" },
+      ],
+      completePaths: [],
+      evidence: { relevantFiles: ["src/value.cjs", "tests/value.test.cjs"] },
+    },
+  });
+  assert.deepEqual(selected.editable, ["src/value.cjs"]);
+  assert.deepEqual(selected.readOnly, ["tests/value.test.cjs", "package.json"]);
+});
+
+test("Aider invocation pre-attaches bounded editable and read-only files without interactive add", async (t) => {
+  const root = await fixture(t);
+  await mkdir(join(root, "tests"));
+  await writeFile(join(root, "tests/value.test.cjs"), "const {test}=require('node:test'); test('value',()=>{});\n");
+  const runInput: CodingWorkerInput = {
+    ...input(root),
+    writeScope: ["."],
+    task: "Fix the failing value test. Make the smallest correct source change.",
+    context: {
+      relevantFiles: ["src/value.cjs", "tests/value.test.cjs"],
+      sourceFiles: [
+        { path: "src/value.cjs", snippet: "module.exports = 1" },
+        { path: "tests/value.test.cjs", snippet: "test" },
+      ],
+      completePaths: [],
+      evidence: { relevantFiles: ["src/value.cjs", "tests/value.test.cjs"] },
+    },
+  };
+  const w = worker(root, async (cwd, i) => {
+    assert.ok(i.args[2]);
+    assert.equal(i.args[3], "src/value.cjs");
+    const readIndex = i.args.indexOf("--read");
+    assert.ok(readIndex > 0);
+    assert.equal(i.args[readIndex + 1], "tests/value.test.cjs");
+    assert.equal(i.args.includes("."), false);
+    assert.equal(i.args.includes("../outside.cjs"), false);
+    await writeFile(join(cwd, "src/value.cjs"), "module.exports = 3;\n");
+    await report(i, "whole");
+    return success;
+  });
+  const result = await w.run(runInput);
+  assert.equal(result.exitStatus, "completed");
+  assert.deepEqual(result.changedPaths, ["src/value.cjs"]);
+});
+
+test("Aider refuses to dispatch until repository exploration supplies an editable file", async (t) => {
+  const root = await fixture(t);
+  let dispatched = false;
+  const w = worker(root, async () => { dispatched = true; return success; });
+  const result = await w.run({ ...input(root), context: undefined });
+  assert.equal(dispatched, false);
+  assert.equal(result.exitStatus, "infra_failure");
+  assert.match(result.terminationReason!, /missing_editable_scope/);
+});
+
+test("attempt-local Aider preflight exhaustion remains operational evidence", async (t) => {
+  const root = await fixture(t);
+  const result = await worker(root, async (_cwd, i) => {
+    await report(i, "diff", "attempt_budget_exhausted");
+    return { ...success, exitCode: 1 };
+  }).run({ ...input(root), context: {
+    relevantFiles: ["src/value.cjs"],
+    completePaths: ["src/value.cjs"],
+    evidence: { relevantFiles: ["src/value.cjs"] },
+  } });
+  assert.equal(result.exitStatus, "infra_failure");
+  assert.equal(result.terminationReason, "attempt_budget_exhausted");
+  assert.equal(result.limitKind, "token_preflight");
+  assert.equal(result.progressPhase, "DISCOVERY");
+});
+
+test("Aider sandbox metadata never becomes an authorized source change", async (t) => {
+  const root = await fixture(t);
+  const original = await readFile(join(root, ".git/config"), "utf8");
+  const result = await worker(root, async (cwd, i) => {
+    await writeFile(join(cwd, ".git/config"), "[unsafe]\nvalue=true\n");
+    await report(i, "diff");
+    return success;
+  }).run(input(root));
+  assert.deepEqual(result.changedPaths, []);
+  assert.equal(await readFile(join(root, ".git/config"), "utf8"), original);
 });
 
 test("Aider receives native identifiers, temporary metadata, controlled secondary models and scoped multi-file edits", async (t) => {
@@ -163,7 +258,10 @@ test("Aider fixture reaches VERIFIED_SUCCESS only through Koda's real checks", a
     verificationCommands: ["node --test tests/value.test.cjs"], estimatedDifficulty: "normal", parallelSafe: false };
   const result = await implement(gateway, root, subtask.objective, subtask,
     { acceptanceCriteria: ["value equals 3"] }, { files: ["src/value.cjs", "tests/value.test.cjs"], verificationCommands: subtask.verificationCommands } as any,
-    { codingWorker, compiledContext: { files: [], localDependencies: [], completePaths: [], repoMap: [] } as any });
+    { codingWorker, compiledContext: {
+      files: [{ path: "src/value.cjs", snippet: "module.exports = 1" }],
+      localDependencies: [], completePaths: ["src/value.cjs"], repoMap: ["src/value.cjs"],
+    } as any });
   assert.equal(result.verification.status, "VERIFIED_SUCCESS");
   assert.ok(logger.events.some((e) => e.type === "aider_attempt_verification" && e.outcome === "VERIFIED_SUCCESS"));
   assert.ok(history.readOperations().some((e) => e.editFormat === "whole" && e.verification === "VERIFIED_SUCCESS"));
@@ -183,8 +281,97 @@ test("Aider fixture reaches VERIFIED_SUCCESS only through Koda's real checks", a
   const roleResult = await implement(gateway, root, subtask.objective, subtask,
     { acceptanceCriteria: ["value equals 3"] }, { files: ["src/value.cjs", "tests/value.test.cjs"], verificationCommands: subtask.verificationCommands } as any,
     { model: "foo/bar", codingWorker: roleWorker,
-      compiledContext: { files: [], localDependencies: [], completePaths: [], repoMap: [] } as any });
+      compiledContext: {
+        files: [{ path: "src/value.cjs", snippet: "module.exports = 1" }],
+        localDependencies: [], completePaths: ["src/value.cjs"], repoMap: ["src/value.cjs"],
+      } as any });
   assert.equal(roleResult.verification.status, "VERIFIED_SUCCESS");
+});
+
+test("OpenHands-localized work reaches Aider once with a bounded focused budget", async (t) => {
+  const root = await fixture(t);
+  await mkdir(join(root, "tests"));
+  await writeFile(join(root, "tests/value.test.cjs"), "const {test}=require('node:test');const a=require('node:assert/strict');test('value',()=>a.equal(require('../src/value.cjs'),3));\n");
+  const cfg = await config(undefined, { maxIterations: 1 });
+  const logger = new Logger(join(root, ".koda"), "aider-discovery", true);
+  const sharedBudget = new Budget(2, 100_000, 120_000);
+  const gateway: any = {
+    config: cfg,
+    logger,
+    budget: sharedBudget,
+  };
+  const tokenLimits: number[] = [];
+  let calls = 0;
+  const runner: NonNullable<ConstructorParameters<typeof AiderExecutor>[2]>["runner"] = async (cwd, i) => {
+    calls++;
+    const request = JSON.parse(await readFile(i.args[2]!, "utf8"));
+    tokenLimits.push(request.maxTokens);
+    assert.equal(i.args[3], "src/value.cjs");
+    await writeFile(join(cwd, "src/value.cjs"), "module.exports = 3;\n");
+    await report(i, "diff");
+    return success;
+  };
+  const codingWorker = new AiderExecutor(sharedBudget, logger, {
+    ensureRuntime: async () => "mock-python",
+    runner,
+  });
+  const subtask: any = {
+    id: "broad-fix",
+    title: "Find and fix value",
+    objective: "Find the implementation that supplies the tested value and make it return 3",
+    likelyReadPaths: ["src/value.cjs", "tests/value.test.cjs"],
+    likelyWritePaths: ["src/value.cjs"],
+    dependsOn: [],
+    integrationContract: "the value test passes",
+    verificationCommands: ["node --test tests/value.test.cjs"],
+    estimatedDifficulty: "normal",
+    parallelSafe: false,
+  };
+  const output = await implement(
+    gateway,
+    root,
+    subtask.objective,
+    subtask,
+    { acceptanceCriteria: ["the value test passes"] },
+    {
+      files: ["src/value.cjs", "src/other.cjs", "tests/value.test.cjs"],
+      verificationCommands: subtask.verificationCommands,
+    } as any,
+    {
+      model: "foo/bar",
+      codingWorker,
+      evidence: {
+        relevantFiles: ["src/value.cjs", "tests/value.test.cjs"], symbols: [],
+        reproduction: "", failingTests: ["tests/value.test.cjs"], likelyRootCause: "",
+        dependencies: [], uncertainty: "low", suggestedApproach: "Edit the localized file", evidence: [],
+      },
+      compiledContext: {
+        files: [
+          { path: "src/value.cjs", snippet: "module.exports = 1" },
+          { path: "tests/value.test.cjs", snippet: "test" },
+        ],
+        localDependencies: [], completePaths: ["src/value.cjs"],
+        repoMap: ["src/value.cjs", "tests/value.test.cjs"],
+      },
+    },
+  );
+
+  assert.equal(output.verification.status, "VERIFIED_SUCCESS", JSON.stringify({
+    calls,
+    tokenLimits,
+    events: logger.events.filter((event) => [
+      "coding_attempt_non_viable",
+      "coding_worker_start",
+      "coding_worker_stop",
+      "execution_plan_exhausted",
+    ].includes(event.type)),
+  }));
+  assert.equal(calls, 1);
+  assert.equal(tokenLimits.length, 1);
+  assert.ok(tokenLimits[0]! <= cfg.stageMaxTokens);
+  assert.equal(logger.events.some((event) =>
+    event.type === "coding_worker_start" && event.worker_engine !== "aider"), false);
+  assert.equal(logger.events.some((event) => event.type === "discovery_continuation"), false);
 });
 
 test("Python launcher preserves native settings, synthesizes unknown settings and guards every completion", async () => {

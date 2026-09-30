@@ -172,7 +172,7 @@ test("legacy DirectEdit usage cannot collapse a multi-turn agent token forecast"
   const estimate = estimateEfficiency(agentic, 1_270, 8_192, undefined,
     [legacyDirect]);
   assert.deepEqual(estimate, prior,
-    "an inferable legacy DirectEdit row is not mini-SWE efficiency evidence");
+    "an inferable legacy DirectEdit row is not current Aider efficiency evidence");
   assert.ok(estimate.p90TotalTokens > 10_000);
   const agenticFeatures = { ...features, executionStrategy: "planned",
     estimatedFiles: 3, implementationFiles: 3,

@@ -308,7 +308,7 @@ test("Aider evidence outweighs legacy engines across execution strategies", () =
       routingTerms: ["discount", "round", "money"], evidenceQuality: 1,
       contaminationConfidence: 1, outcomes: [{ modelId: "vendor/model", success: true,
         identityLevel: "EXACT" as const }] },
-    { sourceId: "agent-harness", harness: "agent-v1", engine: "mini-swe-agent" as const,
+    { sourceId: "agent-harness", harness: "agent-v1", engine: "direct-edit" as const,
       taskKey: `agent-${index}`, taskFamily: "localized_bugfix", languages: ["typescript"],
       routingTerms: ["discount", "round", "money"], evidenceQuality: 1,
       contaminationConfidence: 1, outcomes: [{ modelId: "vendor/model", success: false,

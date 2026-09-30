@@ -12,7 +12,7 @@ import {
 import type { TaskFingerprint } from "../src/router/taskFingerprint.js";
 import { impactAwareVerificationSelection } from "../src/verifier/selection.js";
 import type { VerificationCandidate } from "../src/repo/ecosystem.js";
-import { codingContextPacket } from "../src/agent/miniSweExecutor.js";
+import { codingContextPacket } from "../src/agent/codingExecutor.js";
 
 const fingerprint = (
   overrides: Partial<TaskFingerprint> = {},

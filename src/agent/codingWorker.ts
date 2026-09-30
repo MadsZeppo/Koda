@@ -7,7 +7,7 @@ export interface CodingWorkerContext {
   previousFailedDiff?: string;
   /** Bounded, repository-derived evidence supporting the selected mutation scope. */
   evidence?: unknown;
-  /** Stable's bounded localization packet. mini-SWE may use it as implementation context. */
+  /** Stable's bounded repair packet, supplied as implementation context. */
   repairPacket?: unknown;
 }
 
@@ -44,7 +44,7 @@ export interface CodingWorkerInput {
 export interface CodingWorkerResult {
   exitStatus: "completed" | "failed" | "infra_failure";
   model: string;
-  engine: "aider" | "mini-swe-agent" | "direct-edit";
+  engine: "aider" | "direct-edit";
   engineVersion: string;
   trajectoryPath?: string;
   changedPaths: string[];

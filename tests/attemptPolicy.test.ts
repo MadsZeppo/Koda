@@ -81,7 +81,7 @@ test("localized single-file PLANNED worker uses the same one-call edit contract"
   assert.equal(policy.viable, true);
 });
 
-test("localized STABLE keeps the existing multi-turn mini-SWE viability bound", () => {
+test("localized STABLE keeps its bounded multi-turn viability policy", () => {
   const policy = attemptLimitPolicy({
     ...base,
     fingerprint: fingerprint({ executionStrategy: "stable" }),
@@ -188,4 +188,25 @@ test("bounded discovery starts even when the unresolved task fingerprint is broa
   assert.ok(policy.maxTokens >= 16_000);
   assert.equal(policy.timeoutMs, 45_000);
   assert.ok(policy.budgetUsd > base.plannedBudgetUsd);
+});
+
+test("focused Aider attempts include framing overhead and remain stage bounded", () => {
+  const broad = fingerprint({
+    scope: "multi-file",
+    executionStrategy: "planned",
+    localizationConfidence: "low",
+    expectedFiles: 4,
+  });
+  const policy = attemptLimitPolicy({
+    ...base,
+    promptBytes: 4_000,
+    remainingUsd: 0.2,
+    stageMaxUsd: 0.2,
+    directEditEligible: false,
+    modelContextTokens: 32_000,
+    fingerprint: broad,
+  });
+  assert.equal(policy.viable, true);
+  assert.ok(policy.forecastProviderInputTokens >= 3_048);
+  assert.ok(policy.maxTokens <= base.stageMaxTokens);
 });

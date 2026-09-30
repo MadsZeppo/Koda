@@ -760,9 +760,7 @@ export async function implement(
 
   const worker =
     options.codingWorker ?? new AiderExecutor(gateway.budget, gateway.logger);
-  const workerEngine = worker instanceof AiderExecutor
-    ? "aider"
-    : "mini-swe-agent";
+  const workerEngine = "aider";
   let diagnostics = options.stableRepair?.failedChecks
     .map((check) => `${check.command}\n${check.stderr || check.stdout}`)
     .join("\n");
@@ -841,6 +839,12 @@ export async function implement(
       // a compact repair handoff.
       repair: !!diagnostics || !!previousFailedDiff,
     });
+    // Role-based and virtual routes use Koda's configured price ceilings, as
+    // Gateway.call does. A concrete catalog selection keeps its own metadata.
+    const attemptMetadata = selected?.metadata ??
+      (!pool || adaptiveTier
+        ? { inputPrice: gateway.config.maxInputPrice, outputPrice: gateway.config.maxOutputPrice }
+        : (await pool.catalog?.get?.())?.get(model));
     const limits = attemptLimitPolicy({
       fingerprint,
       effort,
@@ -858,8 +862,8 @@ export async function implement(
       plannedBudgetUsd: plannedAttemptCost,
       remainingUsd: remaining,
       stageMaxUsd: gateway.config.stageMaxUsd,
-      promptPricePerMillion: selected?.metadata.inputPrice,
-      completionPricePerMillion: selected?.metadata.outputPrice,
+      promptPricePerMillion: attemptMetadata?.inputPrice,
+      completionPricePerMillion: attemptMetadata?.outputPrice,
       remainingMs: Math.max(
         1,
         gateway.budget.remainingMs() -
@@ -873,6 +877,8 @@ export async function implement(
       // Broad primary attempts now run through the same complete Aider
       // loop as recovery attempts; fund discover/read/mutate/verify up front.
       boundedDiscovery: false,
+      aiderWorker: worker instanceof AiderExecutor,
+      modelContextTokens: attemptMetadata?.contextLength,
       directEditEligible:
         !(worker instanceof AiderExecutor) &&
         subtask.id !== "stable" &&
@@ -886,10 +892,12 @@ export async function implement(
         model: skippedModel,
         limit_kind: limits.nonViableLimitKind,
         required_tokens: limits.minimumViableTokens,
-        available_tokens: Math.min(
-          gateway.budget.remainingTokens(),
-          gateway.config.stageMaxTokens,
-        ),
+        available_tokens: limits.attemptTokenCapacity,
+        required_context_tokens: limits.providerContextRequired,
+        available_context_tokens:
+          Number.isFinite(limits.providerContextCapacity)
+            ? limits.providerContextCapacity
+            : null,
         required_cost_usd: limits.minimumViableCostUsd ?? null,
         available_cost_usd: Math.min(remaining, gateway.config.stageMaxUsd),
         required_steps: limits.viableCalls,
@@ -947,12 +955,6 @@ export async function implement(
       context_bytes_repeated:
         attempt === 0 ? 0 : Buffer.byteLength(JSON.stringify(workerContext)),
     });
-    // Role-based and virtual routes use Koda's configured price ceilings, as
-    // Gateway.call does. A concrete catalog selection keeps its own metadata.
-    const attemptMetadata = selected?.metadata ??
-      (!pool || adaptiveTier
-        ? { inputPrice: gateway.config.maxInputPrice, outputPrice: gateway.config.maxOutputPrice }
-        : (await pool.catalog?.get?.())?.get(model));
     const workerStarted = Date.now();
     const rawResult = await worker.run({
       repoPath: path,
@@ -1049,7 +1051,7 @@ export async function implement(
           : undefined,
       });
     } else if (
-      (result.engine === "aider" || result.engine === "mini-swe-agent") && pool
+      result.engine === "aider" && pool
     ) {
       const operationalMessage = [result.terminationReason, result.fatalError]
         .filter(Boolean).join(": ");
@@ -1250,7 +1252,7 @@ export async function implement(
         escalated: moved,
         reason: `Coding worker infrastructure fallback ${moved ? "succeeded" : "exhausted"}: ${result.fatalError ?? result.terminationReason}`,
       });
-      gateway.logger.log(result.engine === "aider" ? "aider_fallback" : "mini_swe_fallback", {
+      gateway.logger.log("aider_fallback", {
         subtaskId: subtask.id,
         from: failedModel,
         to: moved ? model : null,
@@ -1360,7 +1362,7 @@ export async function implement(
         escalated: moved,
         reason: `execution_limit:${result.limitKind}:${result.progressPhase ?? "DISCOVERY"}`,
       });
-      gateway.logger.log(result.engine === "aider" ? "aider_fallback" : "mini_swe_fallback", {
+      gateway.logger.log("aider_fallback", {
         subtaskId: subtask.id,
         from: limitedModel,
         to: moved ? model : null,
@@ -1547,9 +1549,7 @@ export async function implement(
       result.changedPaths,
     );
     gateway.logger.log(
-      result.engine === "aider"
-        ? "aider_attempt_verification"
-        : "mini_swe_attempt_verification",
+      "aider_attempt_verification",
       {
       subtaskId: subtask.id,
       worker_engine: result.engine,
@@ -1740,7 +1740,7 @@ export async function implement(
           ? "focused_verification_failed"
           : "candidate_not_verified",
       });
-    gateway.logger.log(result.engine === "aider" ? "aider_fallback" : "mini_swe_fallback", {
+    gateway.logger.log("aider_fallback", {
       subtaskId: subtask.id,
       from: failedModel,
       to: moved ? model : null,
