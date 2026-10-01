@@ -231,6 +231,63 @@ const relevantTests = (target: string, tests: WorkerContext["files"]) => {
   );
 };
 
+export function verificationImpactRelationships(
+  changedPaths: readonly string[],
+  context: WorkerContext,
+): VerificationImpactEvidence[] {
+  const known = new Set(context.files.map((file) => file.path));
+
+  const imports = new Map(
+    context.files.map((file) => [
+      file.path,
+      resolveImports(file.path, file.snippet, known),
+    ]),
+  );
+
+  const reaches = (from: string, target: string) => {
+    const pending = [from];
+    const seen = new Set<string>();
+
+    while (pending.length) {
+      const current = pending.pop()!;
+
+      if (current === target) return true;
+      if (seen.has(current)) continue;
+
+      seen.add(current);
+      pending.push(...(imports.get(current) ?? []));
+    }
+
+    return false;
+  };
+
+  return changedPaths
+    .filter(isSourcePath)
+    .flatMap((source): VerificationImpactEvidence[] => {
+      const tests = [
+        ...new Set(
+          context.files
+            .filter(
+              (file) =>
+                isTestPath(file.path) &&
+                reaches(file.path, source),
+            )
+            .map((file) => file.path),
+        ),
+      ];
+
+      return tests.length
+        ? [
+            {
+              source,
+              tests,
+              basis: "import" as const,
+            },
+          ]
+        : [];
+    });
+}
+
 function targetedNativeCheck(
   subtask: Subtask,
   profile: RepoProfile,
@@ -286,13 +343,41 @@ function targetedTsxCheck(
     profile.packageManager !== "pnpm"
   )
     return undefined;
-  const tests = context.files
-    .map((file) => file.path)
-    .filter(
-      (file) =>
-        subtask.likelyWritePaths.includes(file) &&
-        /^tests\/[\w./-]+\.test\.ts$/.test(file),
-    );
+
+  const directTests = subtask.likelyWritePaths.filter(
+    (file) => /^tests\/[\w./-]+\.test\.ts$/.test(file),
+  );
+
+  const sourcePaths = subtask.likelyWritePaths.filter(isSourcePath);
+
+  const relationships = verificationImpactRelationships(
+    subtask.likelyWritePaths,
+    context,
+  );
+
+  if (
+    sourcePaths.length &&
+    !sourcePaths.every((source) =>
+      relationships.some(
+        (relationship) =>
+          relationship.source === source &&
+          relationship.tests.length > 0,
+      ),
+    )
+  )
+    return undefined;
+
+  const tests = [
+    ...new Set([
+      ...directTests,
+      ...relationships.flatMap(
+        (relationship) => relationship.tests,
+      ),
+    ]),
+  ].filter(
+    (file) => /^tests\/[\w./-]+\.test\.ts$/.test(file),
+  );
+
   return tests.length
     ? `pnpm exec tsx --test ${tests.map(quote).join(" ")}`
     : undefined;
@@ -358,6 +443,18 @@ export function targetedProjectUnitNativeCheck(
   return undefined;
 }
 
+export function focusedVerificationCheck(
+  subtask: Subtask,
+  profile: RepoProfile,
+  context: WorkerContext,
+) {
+  return (
+    targetedNativeCheck(subtask, profile, context) ??
+    targetedTsxCheck(subtask, profile, context) ??
+    targetedProjectUnitNativeCheck(subtask, profile, context)
+  );
+}
+
 export function workerChecks(
   subtask: Subtask,
   profile: RepoProfile,
@@ -372,13 +469,11 @@ export function workerChecks(
     return declared;
   }
 
-  // Keep existing root-runner behavior unchanged.
-  // Only specialize nested project-unit runners when there is a clear
-  // source -> test relationship.
-  const targeted =
-    targetedNativeCheck(subtask, profile, context) ??
-    targetedTsxCheck(subtask, profile, context) ??
-    targetedProjectUnitNativeCheck(subtask, profile, context);
+  const targeted = focusedVerificationCheck(
+    subtask,
+    profile,
+    context,
+  );
 
   if (targeted) return [targeted];
 
@@ -426,9 +521,11 @@ export function workerChecksAreTaskSpecific(
   context: WorkerContext,
 ) {
   if (
-    targetedNativeCheck(subtask, profile, context) !== undefined ||
-    targetedTsxCheck(subtask, profile, context) !== undefined ||
-    targetedProjectUnitNativeCheck(subtask, profile, context) !== undefined
+    focusedVerificationCheck(
+      subtask,
+      profile,
+      context,
+    ) !== undefined
   ) {
     return true;
   }

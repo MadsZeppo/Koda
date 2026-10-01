@@ -54,8 +54,9 @@ import {
 import {
   repoBackedVerificationCommands,
   impactAwareVerificationSelection,
+  focusedVerificationCheck,
   tinyDocumentationChecks,
-  targetedProjectUnitNativeCheck,
+  verificationImpactRelationships,
 } from "./verifier/selection.js";
 import type { Status, CommandResult, VerificationResult } from "./types.js";
 import type { EvidencePacket, Subtask } from "./planner/schemas.js";
@@ -757,13 +758,18 @@ export async function run(options: RunOptions) {
         const repairContext = await compileContext(
           integration.path,
           options.task,
-          actualChangedPaths,
+          [
+            ...new Set([
+              ...actualChangedPaths,
+              ...exploration.relatedTests,
+            ]),
+          ],
           repairProfile,
           options.config.context,
           true,
         );
 
-        const stableFocusedCheck = targetedProjectUnitNativeCheck(
+        const stableFocusedCheck = focusedVerificationCheck(
           repairSubtask,
           repairProfile,
           repairContext,
@@ -885,20 +891,39 @@ export async function run(options: RunOptions) {
         },
       );
       // Preserve the authoritative DIRECT target even when the worker returns
-      // no diff. Final verification must not expand an empty change set to all
-      // project units (for example unrelated fixture packages).
-      directRepairContext = { subtask, context };
-      const directTestTargets = subtask.likelyWritePaths.filter(isTestPath);
-      const directFocusedChecks = result.verification.checks
-        .filter((check) =>
-          directTestTargets.some((path) => check.command.includes(path)),
-        )
-        .map((check) => check.command);
-      if (
-        directTestTargets.length === subtask.likelyWritePaths.length &&
-        directFocusedChecks.length
-      ) {
-        taskVerificationCommands = [...new Set(directFocusedChecks)];
+      // no diff. Build a bounded post-mutation verification context so source
+      // -> test relationships can be proven without running the aggregate suite.
+      const directVerificationProfile = await profileRepo(
+        integration.path,
+      );
+
+      const directVerificationContext = await compileContext(
+        integration.path,
+        options.task,
+        [
+          ...new Set([
+            ...subtask.likelyWritePaths,
+            ...exploration.relatedTests,
+          ]),
+        ],
+        directVerificationProfile,
+        options.config.context,
+        true,
+      );
+
+      directRepairContext = {
+        subtask,
+        context: directVerificationContext,
+      };
+
+      const directFocusedCheck = focusedVerificationCheck(
+        subtask,
+        directVerificationProfile,
+        directVerificationContext,
+      );
+
+      if (directFocusedCheck) {
+        taskVerificationCommands = [directFocusedCheck];
         taskVerificationIsFocused = true;
       }
       if (
@@ -1284,11 +1309,59 @@ export async function run(options: RunOptions) {
           ),
         )
       : undefined;
+    const impactContext = verificationPaths.length
+      ? await compileContext(
+          integration.path,
+          options.task,
+          [
+            ...new Set([
+              ...verificationPaths,
+              ...exploration.relatedTests,
+            ]),
+          ],
+          finalProfile,
+          options.config.context,
+          true,
+        )
+      : undefined;
+
+    const verificationRelationships = impactContext
+      ? verificationImpactRelationships(
+          verificationPaths,
+          impactContext,
+        )
+      : [];
+
+    const verificationSubtask =
+      stableRepairContext?.subtask ??
+      directRepairContext?.subtask;
+
+    if (
+      !taskVerificationIsFocused &&
+      verificationSubtask &&
+      impactContext
+    ) {
+      const finalFocusedCheck = focusedVerificationCheck(
+        {
+          ...verificationSubtask,
+          likelyWritePaths: [...verificationPaths],
+        },
+        finalProfile,
+        impactContext,
+      );
+
+      if (finalFocusedCheck) {
+        taskVerificationCommands = [finalFocusedCheck];
+        taskVerificationIsFocused = true;
+      }
+    }
+
     if (!taskVerificationIsFocused)
       taskVerificationCommands = repoBackedVerificationCommands(
         taskVerificationCommands,
         finalProfile,
       );
+
     const impact = impactAwareVerificationSelection({
       changedPaths:
         !changed.length &&
@@ -1301,6 +1374,7 @@ export async function run(options: RunOptions) {
           : changed,
       candidates: allFinalCandidates,
       focusedCommands: taskVerificationCommands,
+      relationships: verificationRelationships,
     });
     const finalPlan = documentCommands
       ? allFinalCandidates.filter((candidate) =>

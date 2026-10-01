@@ -29,6 +29,7 @@ import type { FrozenExecutionPlan } from "../router/modelRouter.js";
 import { requiredQualityClass } from "../router/controlPolicy.js";
 import { verificationPlan } from "../verifier/plan.js";
 import {
+  focusedVerificationCheck,
   objectiveCanBeAlreadySatisfied,
   workerChecks,
   workerChecksAreTaskSpecific,
@@ -255,9 +256,15 @@ export async function implement(
         : subtask.verificationCommands.length
           ? subtask.verificationCommands
           : options.finalVerificationOnly
-            ? verificationPlan(profile, [...writeScope.paths], true)
-                .filter((check) => check.available)
-                .map((check) => check.command)
+            ? (() => {
+                const focused = focusedVerificationCheck(
+                  subtask,
+                  profile,
+                  context,
+                );
+
+                return focused ? [focused] : [];
+              })()
             : workerChecks(subtask, profile, context));
   const profiledCandidates =
     profile.ecosystem?.projectUnits.flatMap((unit) => unit.verification) ?? [];
@@ -298,6 +305,7 @@ export async function implement(
   ) => {
     if (
       afterMutation &&
+      !options.finalVerificationOnly &&
       !tinyDocs &&
       !selected.length &&
       !postMutationRecoveryAttempted
@@ -1564,8 +1572,17 @@ export async function implement(
       relative.status === "VERIFIED_SUCCESS" ||
       relative.status === "CANDIDATE_NEUTRAL" ||
       relative.status === "CANDIDATE_IMPROVEMENT";
+
+    const finalVerificationHandoff =
+      options.finalVerificationOnly &&
+      (
+        candidateVerification.checks.length === 0 ||
+        candidateVerification.status === "VERIFIED_SUCCESS"
+      );
+
     if (
       candidateAccepted ||
+      finalVerificationHandoff ||
       advisoryInfrastructureOnly(relative) ||
       (options.tinyDirect &&
         options.finalVerificationOnly &&
