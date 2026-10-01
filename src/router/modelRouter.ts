@@ -62,7 +62,7 @@ export function selectQualitySafeJointPlan<T extends {
 }>(evaluated: readonly T[]) {
   const comparisonQualities = evaluated.flatMap(({ plan }) => [
     ...(plan.evaluatedPlans ?? [])
-      .filter((candidate) => !candidate.hardRejection)
+      .filter((candidate) => candidate.eligible && !candidate.hardRejection)
       .map((candidate) => candidate.conservativeFinalSuccess),
     plan.conservativeQuality,
   ]).filter(Number.isFinite);
@@ -363,7 +363,7 @@ export class PoolRouter {
     if (!selected) throw Error("No quality-safe model + execution strategy plan");
     const reference = Math.max(...evaluated.flatMap(({ plan }) => [
       ...(plan.evaluatedPlans ?? [])
-        .filter((candidate) => !candidate.hardRejection)
+        .filter((candidate) => candidate.eligible && !candidate.hardRejection)
         .map((candidate) => candidate.conservativeFinalSuccess),
       plan.conservativeQuality,
     ]).filter(Number.isFinite));
@@ -662,6 +662,9 @@ export class PoolRouter {
       type: planType,
       executionEngine: fingerprint.executionStrategy,
       taskFingerprint: fingerprint,
+      routingMode: zeroEligibleFallback
+        ? "bounded_zero_eligible_fallback"
+        : "quality_safe",
       qualityClass,
       requiredQuality: Number(requiredQuality.toFixed(3)),
       approvedCandidateSet,

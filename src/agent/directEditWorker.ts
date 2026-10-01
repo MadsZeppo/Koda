@@ -139,7 +139,13 @@ const operationalFailure = (error: unknown) => {
 };
 
 export const directEditRequestTimeoutMs = (input: CodingWorkerInput) =>
-  Math.max(1, input.timeoutMs);
+  Math.max(
+    1,
+    Math.min(
+      input.requestTimeoutMs,
+      Math.max(5_000, Math.floor(input.timeoutMs / 2)),
+    ),
+  );
 
 const validDirectEditCall = (response: DirectEditResponse) => {
   const calls = response.toolCalls;
@@ -417,6 +423,8 @@ export class DirectEditWorker implements CodingWorker {
     messages: ChatCompletionMessageParam[],
 
     maxOutputTokens: number,
+
+    timeoutOverrideMs?: number,
   ): Promise<DirectEditResponse> {
     if (this.requester) {
       return this.requester(input, messages, directEditTool, maxOutputTokens);
@@ -428,7 +436,7 @@ export class DirectEditWorker implements CodingWorker {
       throw Error("INFRA_FAILURE: OPENROUTER_API_KEY is missing");
     }
 
-    const timeoutMs = directEditRequestTimeoutMs(input);
+    const timeoutMs = timeoutOverrideMs ?? directEditRequestTimeoutMs(input);
 
     const sdk = new OpenAI({
       apiKey,
@@ -1078,6 +1086,12 @@ export class DirectEditWorker implements CodingWorker {
           requestInput,
           requestMessages,
           requestOutputTokens,
+          round === 0
+            ? directEditRequestTimeoutMs(requestInput)
+            : Math.max(
+                1,
+                Math.min(requestInput.requestTimeoutMs, requestInput.timeoutMs),
+              ),
         );
         responses.push(response);
         outcome = await evaluate(response);
@@ -1229,9 +1243,15 @@ export class DirectEditWorker implements CodingWorker {
       };
 
       if (!outcome.applied) {
+        const protocolFailure = [
+          "missing_submit_direct_edit",
+          "multiple_submit_direct_edit_calls",
+          "malformed_argument_json",
+          "invalid_argument_schema",
+        ].includes(outcome.reason ?? "");
         return {
           ...common,
-          exitStatus: "failed",
+          exitStatus: protocolFailure ? "infra_failure" : "failed",
           terminationReason: "direct_edit_protocol_error",
           progressPhase: outcome.progressPhase,
           fatalError: `${outcome.error ?? "Direct edit structural failure"}${

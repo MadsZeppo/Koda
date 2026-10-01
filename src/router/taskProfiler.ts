@@ -2,6 +2,7 @@ import { extname } from "node:path";
 import { createHash } from "node:crypto";
 import type { RepoProfile } from "../types.js";
 import type { ExecutionStrategy } from "./executionStrategy.js";
+import { explicitTaskPaths } from "./executionStrategy.js";
 
 export type ProfileConfidence = "high" | "medium" | "low";
 
@@ -73,8 +74,7 @@ const testPath = (path: string) => /(?:^|\/)(?:tests?|__tests__)(?:\/|$)|\.(?:te
 /** Bounded, repository-backed profiling. It performs no I/O and no model call. */
 export function profileTask(task: string, repo: RepoProfile, strategy: ExecutionStrategy): DeterministicTaskProfile {
   const lower = task.toLowerCase();
-  const explicit = repo.files.filter((path) =>
-    task.includes(path) || task.includes(path.split("/").at(-1) ?? path));
+  const explicit = explicitTaskPaths(task, repo);
   const terms = words(task);
   const ranked = repo.files.slice(0, 1500).map((path) => ({ path, score: terms.reduce((score, term) =>
     score + (path.toLowerCase().includes(term) ? 2 : 0), 0) + (testPath(path) && /\btest\b/.test(lower) ? 2 : 0) }))
@@ -94,7 +94,7 @@ export function profileTask(task: string, repo: RepoProfile, strategy: Execution
       path.split("/").at(-1)!.replace(/\.[^.]+$/, "").toLowerCase(),
     ));
   const grounded = [
-    ...(strategy.preciseTarget && repo.files.includes(strategy.preciseTarget)
+    ...(strategy.preciseTarget
       ? [strategy.preciseTarget]
       : []),
     ...companionSources,

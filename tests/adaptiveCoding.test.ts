@@ -257,8 +257,8 @@ test("Pareto requests use tier plugin and stable worker session; telemetry recor
 for (const rescueToFrontier of [false, true])
   test(
     rescueToFrontier
-      ? "verified low, medium and high failures reach explicit frontier rescue"
-      : "verified low-tier coding failure escalates to medium and stops after success",
+      ? "a failed bounded repair stops before frontier rescue"
+      : "a failed bounded repair stops before adaptive escalation",
     async () => {
       const root = await mkdtemp(join(tmpdir(), "koda-adaptive-run-"));
       const requests: any[] = [];
@@ -369,17 +369,22 @@ for (const rescueToFrontier of [false, true])
           quiet: true,
           output: join(root, "report"),
         });
-        assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
+        assert.equal(result.status, "FAILED");
         assert.deepEqual(
           requests.map((r) => r.plugins?.[0]?.min_coding_score),
-          rescueToFrontier ? [0, 0.33, 0.66, undefined] : [0, 0.33],
+          [0, 0],
           JSON.stringify({
             strategy: result.execution_strategy,
             effort: result.execution_effort,
             reason: result.strategy_reason,
           }),
         );
-        assert.equal(result.escalations, rescueToFrontier ? 3 : 1);
+        assert.equal(result.escalations, 0);
+        const events = (await readFile(join(root, "report", "events.jsonl"), "utf8"))
+          .trim().split("\n").map((line) => JSON.parse(line));
+        assert.equal(events.filter((event) => event.type === "verification_repair").length, 1);
+        assert.ok(events.some((event) => event.type === "verification_repair_exhausted" &&
+          event.reason === "repair_produced_no_mutation"));
       } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
         await rm(root, { recursive: true, force: true });
@@ -389,7 +394,7 @@ for (const rescueToFrontier of [false, true])
 
 for (const cheapFails of [false, true])
   test(cheapFails
-    ? "specialist DIRECT routes cheap failed verification to stronger candidate"
+    ? "specialist DIRECT stops after one failed same-candidate repair"
     : "specialist DIRECT completes focused fix cheaply with one terminal success", async () => {
     const root = await mkdtemp(join(tmpdir(), "koda-specialist-direct-"));
     const requests: any[] = [];
@@ -440,10 +445,10 @@ for (const cheapFails of [false, true])
       const result = await run({ repo: join(root, "direct"),
         task: "Fix src/calculator.js for the failure in test/calculator.test.js, and verify that all tests pass.",
         config: settings, quiet: true, output: join(root, "report") });
-      assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
+      assert.equal(result.status, cheapFails ? "FAILED" : "VERIFIED_SUCCESS", result.error);
       assert.equal(result.frontierCalls, 0);
       assert.deepEqual(requests.map((request) => request.model),
-        cheapFails ? ["cheap", "strong"] : ["cheap"]);
+        cheapFails ? ["cheap", "cheap"] : ["cheap"]);
       const events = (await readFile(join(root, "report", "events.jsonl"), "utf8"))
         .trim().split("\n").map((line) => JSON.parse(line));
       assert.deepEqual(events.find((event) => event.type === "worker_scope")?.allowed_write_paths,
@@ -454,9 +459,13 @@ for (const cheapFails of [false, true])
         "strong");
       const attempts = events.filter((event) => event.type === "model_attempt");
       assert.deepEqual(attempts.map((event) => event.verification),
-        cheapFails ? ["FAILED", "VERIFIED_SUCCESS"] : ["VERIFIED_SUCCESS"]);
-      if (cheapFails) assert.equal(events.find((event) =>
-        event.type === "coding_route_escalation")?.reason, "focused_verification_failed");
+        cheapFails ? ["FAILED"] : ["VERIFIED_SUCCESS"]);
+      if (cheapFails) {
+        assert.equal(events.filter((event) => event.type === "verification_repair").length, 1);
+        assert.ok(events.some((event) => event.type === "verification_repair_exhausted" &&
+          event.reason === "repair_produced_no_mutation"));
+        assert.equal(events.some((event) => event.type === "coding_route_escalation"), false);
+      }
       assert.equal(attempts.some((event) => event.reason === "worker ended"), false);
       const routeDecision = events.find((event) => event.type === "coding_route_decision");
       const frozenPlan = events.find((event) => event.type === "specialist_route");
@@ -476,8 +485,8 @@ for (const cheapFails of [false, true])
       assert.ok(Array.isArray(routeDecision?.approved_recovery_candidates));
       assert.equal("estimated_success" in routeDecision, false);
       assert.equal("evidence_source" in routeDecision, false);
-      if (cheapFails) assert.equal(events.find((event) =>
-        event.type === "coding_route_escalation")?.to, "strong");
+      if (cheapFails) assert.equal(events.some((event) =>
+        event.type === "coding_route_escalation"), false);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await rm(root, { recursive: true, force: true });

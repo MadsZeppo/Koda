@@ -16,7 +16,6 @@ import type {
 import type { WorkerContext } from "../context/compiler.js";
 import {
   compileContext,
-  compileTargetContext,
   isSourcePath,
   isTestPath,
   resolveImports,
@@ -35,8 +34,6 @@ import { requiredQualityClass } from "../router/controlPolicy.js";
 import { verificationPlan } from "../verifier/plan.js";
 import {
   focusedVerificationCheck,
-  impactAwareVerificationSelection,
-  verificationImpactRelationships,
   objectiveCanBeAlreadySatisfied,
   workerChecks,
   workerChecksAreTaskSpecific,
@@ -64,12 +61,12 @@ import {
 } from "./aiderExecutor.js";
 import { WriteScope } from "../repo/writeScope.js";
 import { AttemptCheckpoint } from "./attemptCheckpoint.js";
-import { currentDiff, safePath } from "./tools.js";
+import { currentDiff } from "./tools.js";
 import { router } from "../router/router.js";
 import { taskBucket } from "../router/features.js";
 import { tierRank } from "../router/pool.js";
 import { testRequirementAlreadyCovered } from "./mutationInvariant.js";
-import { readFile, lstat } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { join, posix } from "node:path";
 import {
   attemptLimitPolicy,
@@ -293,94 +290,6 @@ export async function evidenceBasedCompletionRepairScope(input: {
   return [...new Set([...expanded, posix.join(directory!, `${stem}${suffix}`)])];
 }
 
-/** Bounded local retrieval for unresolved root scope; never expands write authority. */
-export async function rootCodingContext(
-  root: string, task: string, profile: RepoProfile, limits: Gateway["config"]["context"],
-): Promise<WorkerContext> {
-  const terms = taskTerms(task);
-  const corpus: { path: string; text: string }[] = [];
-  let remainingBytes = 4_000_000;
-  for (const path of (profile.files ?? []).filter((path) =>
-    (isSourcePath(path) || isTestPath(path)) && /\.[cm]?[jt]sx?$/.test(path) &&
-    !/(?:^|\/)\./.test(path) &&
-    !/(?:^|\/)(?:fixtures|node_modules|dist|build)(?:\/|$)/.test(path)).slice(0, limits.scanFiles)) {
-    if (remainingBytes <= 0) break;
-    try {
-      const target = await safePath(root, path);
-      const info = await lstat(target);
-      if (!info.isFile() || info.nlink > 1 || info.size > Math.min(1_000_000, remainingBytes)) continue;
-      const text = await readFile(target, "utf8");
-      remainingBytes -= Buffer.byteLength(text);
-      if (!text.includes("\0")) corpus.push({ path, text });
-    } catch {}
-  }
-  const weights = new Map(terms.map((term) => [term,
-    1 + Math.log((corpus.length + 1) / (1 + corpus.filter((file) => file.text.toLowerCase().includes(term)).length)),
-  ]));
-  const ranked = corpus.map((file) => {
-    // Task descriptions embedded in test fixtures are not implementation evidence.
-    const code = file.text.replace(/\/\*[^]*?\*\//g, " ")
-      .replace(/(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)/g, " ")
-      .replace(/\/\/[^\n]*/g, " ");
-    const lines = code.toLowerCase().split("\n");
-    const normalizedPath = file.path.toLowerCase().replace(/[^a-z0-9]+/g, " ");
-    const pathScore = terms.reduce((sum, term) => {
-      const pieces = term.split(/[-_]+/).filter((piece) => piece.length >= 3);
-      return sum + pieces.reduce((pieceSum, piece) =>
-        pieceSum + (normalizedPath.includes(piece) ? (weights.get(term) ?? 1) * 3 : 0), 0);
-    }, 0);
-    let score = pathScore;
-    for (let line = 0; line < lines.length; line++) {
-      const window = lines.slice(line, line + 32).join("\n");
-      score = Math.max(score, pathScore + terms.reduce((sum, term) =>
-        sum + (window.includes(term) ? weights.get(term)! : 0), 0));
-    }
-    return { path: file.path, score };
-  }).filter((file) => file.score > 0).sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
-  const paths = [...new Set([
-    ...ranked.filter((file) => isSourcePath(file.path)).slice(0, 3).map((file) => file.path),
-    ...ranked.filter((file) => isTestPath(file.path)).slice(0, 3).map((file) => file.path),
-  ])].slice(0, limits.maxFiles);
-  const context: WorkerContext = { files: [], repoMap: paths, localDependencies: [] };
-  for (const path of paths) {
-    const perFileBytes = Math.min(limits.fileBytes, Math.floor((Math.min(limits.maxBytes, 8000) - 512) / Math.max(1, paths.length)));
-    const target = await compileTargetContext(root, path, task, { ...limits,
-      fileBytes: perFileBytes, maxBytes: perFileBytes + 256,
-    });
-    context.files.push(...target.files);
-    if (Buffer.byteLength(JSON.stringify(context)) > limits.maxBytes) context.files.pop();
-  }
-  return context;
-}
-
-function mergeCodingContexts(
-  primary: WorkerContext,
-  secondary: WorkerContext,
-  maxBytes: number,
-): WorkerContext {
-  const merged: WorkerContext = {
-    files: [],
-    repoMap: [...new Set([...primary.repoMap, ...secondary.repoMap])],
-    localDependencies: [...new Set([
-      ...primary.localDependencies,
-      ...secondary.localDependencies,
-    ])],
-    completePaths: [...new Set([
-      ...(primary.completePaths ?? []),
-      ...(secondary.completePaths ?? []),
-    ])],
-  };
-  const seen = new Set<string>();
-  for (const file of [...primary.files, ...secondary.files]) {
-    if (seen.has(file.path)) continue;
-    const next = { ...merged, files: [...merged.files, file] };
-    if (Buffer.byteLength(JSON.stringify(next)) > maxBytes) continue;
-    merged.files.push(file);
-    seen.add(file.path);
-  }
-  return merged;
-}
-
 /** Sole production coding executor. Koda routes/verifies; Aider mutates one isolated attempt. */
 export async function implement(
   gateway: Gateway,
@@ -406,29 +315,6 @@ export async function implement(
       gateway.config.context,
       true,
     ));
-  const hasCodeContext = context.files.some((file) =>
-    isSourcePath(file.path) || isTestPath(file.path));
-  const hasMissingCodeTarget = (await Promise.all(
-    [...writeScope.paths].filter((target) => target !== "." &&
-      (isSourcePath(target) || isTestPath(target))).map(async (target) => {
-      try {
-        return !(await lstat(await safePath(path, target))).isFile();
-      } catch {
-        return true;
-      }
-    }),
-  )).some(Boolean);
-  if (!hasCodeContext &&
-    (writeScope.paths.includes(".") || hasMissingCodeTarget)) {
-    const discovered = await rootCodingContext(path, task, profile, gateway.config.context);
-    if (discovered.files.length) {
-      context = mergeCodingContexts(
-        discovered,
-        context,
-        gateway.config.context.maxBytes,
-      );
-    }
-  }
   const evidence: EvidencePacket = options.evidence ?? {
     relevantFiles: context.files.map((file) => file.path).filter(isSourcePath),
     symbols: [],
@@ -526,15 +412,6 @@ export async function implement(
     });
   }
   commands = [...new Set(commands)];
-  const commandReferencesPath = (command: string, file: string) =>
-    command.includes(file) || command.includes(`./${file}`);
-  const baselineCommands = (
-    selected: readonly string[],
-    candidatePaths: readonly string[] = writeScope.paths,
-  ) =>
-    selected.filter((command) => !candidatePaths.some((file) =>
-      file !== "." && !profile.files.includes(file) &&
-      commandReferencesPath(command, file)));
   const candidates = profiledCandidates;
   const runChecks = async (
     selected: string[],
@@ -557,7 +434,6 @@ export async function implement(
         path,
         task,
         recoveryPaths,
-        { fingerprint },
       );
       selected = discovered.map((candidate) => candidate.command);
       commands = [...new Set(selected)];
@@ -613,8 +489,8 @@ export async function implement(
       ? options.canonicalVerification
     : options.tinyDirect
       ? verificationResult([])
-      : baselineCommands(commands).length
-        ? await runChecks(baselineCommands(commands))
+      : commands.length
+        ? await runChecks(commands)
         : verificationResult([]);
   const initialInfrastructureError = infrastructureError(baseline);
   if (initialInfrastructureError) {
@@ -1015,9 +891,6 @@ export async function implement(
   let codingAttempts = 0;
   let operationalRetries = 0;
   let completionContinuations = 0;
-  let verificationRepairUsed = false;
-  let verificationRepairPending = false;
-  let verificationFailureBeforeRepair: VerificationResult | undefined;
   let completionRepair: CodingWorkerContext["completionRepair"];
   const maxCompletionContinuations = 2;
   const maxOperationalRetries = 2;
@@ -1303,9 +1176,7 @@ export async function implement(
       model,
       budgetUsd: attemptBudget,
       maxTokens: attemptTokenBound,
-      maxSteps: completionRepair?.unresolvedRequirementIds.includes(
-        "VERIFICATION_REGRESSION",
-      ) ? 1 : attemptSteps,
+      maxSteps: attemptSteps,
       timeoutMs: attemptTimeoutMs,
       requestTimeoutMs: gateway.config.modelTimeoutMs.implementation,
       commandTimeoutMs: gateway.config.commandTimeoutMs,
@@ -1327,11 +1198,9 @@ export async function implement(
           : undefined,
       writeScope: [...writeScope.paths],
       returnOnMutation:
-        (limits.localized || options.tinyDirect ||
-          (fingerprint.scope === "single" &&
-            !fingerprint.architectureHeavy && !fingerprint.crossComponent &&
-            fingerprint.difficulty.changeRisk !== "high")) &&
-        writeScope.paths.length === 1,
+        limits.localized &&
+        writeScope.paths.length === 1 &&
+        writeScope.paths[0] !== ".",
       directFullScope:
         subtask.id === "stable" &&
         !subtask.parallelSafe &&
@@ -1561,31 +1430,6 @@ export async function implement(
     }
     if (result.exitStatus === "infra_failure") {
       await checkpoint.restore(path, writeScope);
-      if (verificationRepairPending) {
-        gateway.logger.log("verification_repair_exhausted", {
-          subtaskId: subtask.id,
-          model,
-          reason: "repair_worker_infrastructure_failure",
-        });
-        return {
-          verification: verificationResult([{
-            command: result.engine,
-            cwd: ".",
-            exitCode: 1,
-            stdout: "",
-            stderr: result.fatalError ?? "Repair worker infrastructure failure",
-            wallClockMs: result.wallClockMs,
-            timedOut: false,
-            outcome: "INFRA_FAILURE",
-            unavailable: "worker_infrastructure_unavailable",
-            source: result.engine,
-            kind: "test",
-            requirement: "required",
-          }]),
-          role,
-          evidence,
-        };
-      }
       const failedModel = model;
       if (result.discoveryEvidence?.trim())
         diagnostics = [diagnostics,
@@ -1662,25 +1506,11 @@ export async function implement(
     }
     const diffStarted = Date.now();
     const diff = await currentDiff(path);
-    const attemptChangedPaths = (await checkpoint.changed(path, writeScope))
-      .map((change) => change.path);
     gateway.logger.log("latency", {
       subtaskId: subtask.id,
       candidate_diff_ms: Date.now() - diffStarted,
     });
     const candidateMutation = result.changedPaths.length > 0 && !!diff.trim();
-    if (verificationRepairPending && attemptChangedPaths.length === 0) {
-      gateway.logger.log("verification_repair_exhausted", {
-        subtaskId: subtask.id,
-        model,
-        reason: "repair_produced_no_mutation",
-      });
-      return {
-        verification: verificationFailureBeforeRepair ?? verificationResult([]),
-        role,
-        evidence,
-      };
-    }
     if (result.limitKind && !candidateMutation) {
       await checkpoint.restore(path, writeScope);
       const limitedModel = model;
@@ -1868,25 +1698,6 @@ export async function implement(
           ),
         ),
       ];
-    if (!tinyDocs && !options.stableRepair) {
-      const changedContext = await compileContext(path, subtask.objective,
-        result.changedPaths, profile, gateway.config.context, true);
-      const focused = focusedVerificationCheck(
-        { ...subtask, likelyWritePaths: result.changedPaths }, profile, changedContext);
-      if (focused) {
-        const impact = impactAwareVerificationSelection({
-          changedPaths: result.changedPaths,
-          candidates: verificationPlan(profile, result.changedPaths),
-          focusedCommands: [focused], fingerprint,
-          relationships: verificationImpactRelationships(result.changedPaths, changedContext),
-        });
-        postCommands = [...new Set([
-          focused, ...impact.candidates.map((candidate) => candidate.command),
-          ...subtask.verificationCommands,
-        ])];
-        commands = postCommands;
-      }
-    }
     const verificationStarted = Date.now();
     const candidateVerification = await runChecks(
       postCommands,
@@ -1902,21 +1713,14 @@ export async function implement(
     // Once the exact changed paths identify a focused command, evaluate that
     // command against the pre-attempt state and then restore the candidate.
     if (
-      !tinyDocs &&
-      commands.length &&
-      baselineCommands(commands, result.changedPaths).some((command) =>
-        !baseline.checks.some((check) => check.command === command))
+      boundedDiscoveryFirstPass &&
+      !baseline.checks.length &&
+      commands.length
     ) {
       const candidateState = await AttemptCheckpoint.capture(path, writeScope);
       await checkpoint.restore(path, writeScope);
-      try {
-        const comparableCommands = baselineCommands(commands, result.changedPaths);
-        baseline = comparableCommands.length
-          ? await runChecks(comparableCommands)
-          : verificationResult([]);
-      } finally {
-        await candidateState.restore(path, writeScope);
-      }
+      baseline = await runChecks(commands);
+      await candidateState.restore(path, writeScope);
     }
 
     if (options.stableHandoff) {
@@ -2250,58 +2054,6 @@ export async function implement(
       writeScope.paths.includes(".")
         ? [...new Set(result.changedPaths)]
         : [];
-    if (
-      result.exitStatus === "completed" &&
-      candidateMutation &&
-      attributable &&
-      !options.stableRepair &&
-      !verificationRepairUsed
-    ) {
-      verificationRepairUsed = true;
-      verificationRepairPending = true;
-      verificationFailureBeforeRepair = attemptVerification;
-      diagnostics = [
-        `Changed files: ${result.changedPaths.join(", ")}`,
-        ...candidateVerification.checks
-          .filter((check) => check.outcome === "CHECK_FAIL")
-          .map((check) => [
-            `Failing command: ${check.command}`,
-            check.stderr || check.stdout,
-          ].filter(Boolean).join("\n")),
-      ].join("\n\n");
-      previousFailedDiff = diff;
-      completionRepair = {
-        unresolvedRequirementIds: ["VERIFICATION_REGRESSION"],
-        mutationRequiredBeforeDiscovery: true,
-      };
-      if (discoveredRepairPaths.length) {
-        writeScope = new WriteScope(
-          discoveredRepairPaths,
-          gateway.logger,
-          subtask.id,
-        );
-      }
-      gateway.logger.log("verification_repair", {
-        subtaskId: subtask.id,
-        model,
-        changed_paths: result.changedPaths,
-        write_scope: writeScope.paths,
-        failing_commands: candidateVerification.checks
-          .filter((check) => check.outcome === "CHECK_FAIL")
-          .map((check) => check.command),
-      });
-      attempt--;
-      continue;
-    }
-    if (verificationRepairPending) {
-      gateway.logger.log("verification_repair_exhausted", {
-        subtaskId: subtask.id,
-        model,
-        reason: "repaired_candidate_failed_verification",
-        changed_paths: result.changedPaths,
-      });
-      return { verification: attemptVerification, role, evidence };
-    }
     if (result.exitStatus === "completed") {
       await checkpoint.restore(path, writeScope);
     } else {
@@ -2345,12 +2097,10 @@ export async function implement(
     });
     const failedModel = model;
     const failedKind = relative.checks.some((check) =>
-      check.outcome === "CHECK_FAIL" &&
       /typecheck|tsc|compile|build/i.test(check.command),
     )
       ? ("compiler_failure" as const)
-      : relative.checks.some((check) =>
-          check.outcome === "CHECK_FAIL" && check.kind === "test")
+      : relative.checks.some((check) => check.kind === "test")
         ? ("test_failure" as const)
         : ("verification_failure" as const);
     codingAttempts++;

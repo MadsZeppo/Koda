@@ -256,6 +256,31 @@ test("operational recovery ignores prior tier and selects the cheapest quality-s
   assert.equal(selected?.model.id, cheapSafe.model.id);
 });
 
+test("operational recovery uses each remaining frozen approved candidate once", () => {
+  const initial = candidate("initial", "strong", 0.95, 0.02, "PROVEN");
+  const approvedPeer = candidate("approved-peer", "cheap", 0.7, 0.003, "UNKNOWN");
+  const frozen = policy([initial, approvedPeer]);
+  const observation = {
+    failureMode: "operational" as const,
+    failurePhase: "PROVIDER",
+    previousModel: initial.model.id,
+    mutationObserved: false,
+    terminationReason: "direct_edit_protocol_error",
+  };
+  assert.equal(
+    chooseAdaptiveRecovery(frozen, observation, new Set([initial.model.id]))?.model.id,
+    approvedPeer.model.id,
+  );
+  assert.equal(
+    chooseAdaptiveRecovery(
+      frozen,
+      { ...observation, previousModel: approvedPeer.model.id },
+      new Set([initial.model.id, approvedPeer.model.id]),
+    ),
+    undefined,
+  );
+});
+
 test("discovery recovery cannot jump to an expensive model on a low-cost task", () => {
   const initial = candidate("openai/gpt-5.1-codex-mini", "cheap", .91, .002);
   const cheapRecovery = candidate("deepseek/deepseek-v3.2", "cheap", .92, .006);
@@ -357,6 +382,49 @@ test("an explicit operational peer is tried before the quality rescue but cannot
 
   assert.equal(operational?.model.id, peer.model.id);
   assert.equal(coding?.model.id, rescue.model.id);
+});
+
+test("bounded fallback recovers from provider failure", () => {
+  const initial = candidate(
+    "deepseek/deepseek-v4.1-flash",
+    "cheap",
+    0.781,
+    0.001,
+    "PROMISING",
+  );
+
+  const recovery = candidate(
+    "google/gemini-3.8-flash",
+    "fast",
+    0.74,
+    0.002,
+    "PROMISING",
+  );
+
+  const frozen = freezeExecutionPolicy({
+    ...policy([initial, recovery], 2),
+    routingMode: "bounded_zero_eligible_fallback" as const,
+    requiredQuality: 0.771,
+    qualityCascadeModelIds: [
+      initial.model.id,
+      recovery.model.id,
+    ],
+  });
+
+  const selected = chooseAdaptiveRecovery(
+    frozen,
+    {
+      failureMode: "operational",
+      failurePhase: "PROVIDER",
+      previousModel: initial.model.id,
+      mutationObserved: false,
+      codingAttempts: 0,
+      terminationReason: "agentic_provider_error",
+    },
+    new Set([initial.model.id]),
+  );
+
+  assert.equal(selected?.model.id, recovery.model.id);
 });
 
 test("direct edit protocol errors are operational even when the executor reports no mutation", () => {

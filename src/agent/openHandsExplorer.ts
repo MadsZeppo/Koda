@@ -7,7 +7,7 @@ import { z } from "zod";
 
 import type { Gateway } from "../openrouter/client.js";
 import type { RepoProfile, Usage } from "../types.js";
-import type { ExecutionStrategy } from "../router/executionStrategy.js";
+import { explicitTaskPaths, type ExecutionStrategy } from "../router/executionStrategy.js";
 import { extractFeatures } from "../router/features.js";
 import { snapshotTree, changesBetween } from "../workspace/files.js";
 import { isSourcePath, isTestPath } from "../context/compiler.js";
@@ -178,18 +178,13 @@ async function defaultRunner(python: string, invocation: OpenHandsInvocation) {
   }
 }
 
-function exactTaskPath(task: string, path: string) {
-  const escaped = path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(?:^|[^A-Za-z0-9_./-])${escaped}(?=$|[^A-Za-z0-9_/-])`).test(task);
-}
-
-/** The only no-agent fast path: one exact existing path and an isolated task. */
+/** The only no-agent fast path: one exact safe file path and an isolated task. */
 export function fastPathExploration(
   task: string,
   profile: RepoProfile,
   strategy: ExecutionStrategy,
 ): RepositoryExploration | undefined {
-  const exact = profile.files.filter((path) => exactTaskPath(task, path));
+  const exact = explicitTaskPaths(task, profile);
   const broad = /\b(?:across|multiple|multi[- ]component|throughout|entire|refactor|migrat|architecture|client and server|independent|parallel)\b/i.test(task);
   if (
     broad ||
@@ -199,11 +194,13 @@ export function fastPathExploration(
   const path = exact[0]!;
   return {
     confidence: "high",
-    editableCandidates: [{ path, reason: "The task explicitly names this exact existing repository path." }],
+    editableCandidates: [{ path, reason: "The task explicitly names this exact repository-relative file path." }],
     readonlyFiles: [],
     relatedTests: [],
     dependencies: [],
-    evidence: [{ path, detail: "Exact path supplied by the user and validated against the repository profile." }],
+    evidence: [{ path, detail: profile.files.includes(path)
+      ? "Exact path supplied by the user and validated against the repository profile."
+      : "Exact new file path supplied by the user and validated as a safe repository-relative path." }],
     unresolvedQuestions: [],
   };
 }

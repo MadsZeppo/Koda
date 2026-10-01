@@ -39,6 +39,38 @@ const mentionedPath = (task: string, path: string) => {
   ).test(task);
 };
 
+/**
+ * Extract safe repository-relative file paths named by the task, including a
+ * file that does not exist yet. Existing repository paths remain authoritative
+ * even when they have no extension; unknown paths must look like files so
+ * ordinary prose and directory names cannot silently become write scope.
+ */
+export function explicitTaskPaths(task: string, profile: RepoProfile): string[] {
+  const existing = profile.files.filter((path) => mentionedPath(task, path));
+  const literals: string[] = [];
+  const pattern = /(?:^|[^A-Za-z0-9_./-])((?:\.\/)?(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+|[A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+)(?=$|[^A-Za-z0-9_/-])/g;
+  for (const match of task.matchAll(pattern)) {
+    const value = match[1]!.replace(/^\.\//, "").replace(/[.,;:!?]+$/, "");
+    const parts = value.split("/");
+    const basename = parts.at(-1) ?? "";
+    if (
+      !value || value.startsWith("/") ||
+      parts.some((part) => !part || part === "." || part === ".." || part === ".git" || part === ".koda") ||
+      (!value.includes("/") && !/^[A-Za-z_][A-Za-z0-9_.-]*\.[A-Za-z0-9]+$/.test(basename)) ||
+      !/\.[A-Za-z0-9]+$/.test(basename)
+    ) continue;
+    const normalized = posix.normalize(value);
+    const basenameMatches = profile.files.filter((path) =>
+      posix.basename(path) === posix.basename(normalized));
+    literals.push(
+      !profile.files.includes(normalized) && basenameMatches.length === 1
+        ? basenameMatches[0]!
+        : normalized,
+    );
+  }
+  return [...new Set([...existing, ...literals])];
+}
+
 /** Plan for decomposition benefit, not merely for repository size or the word 'all'. */
 export function chooseExecutionStrategy(
   task: string,
@@ -64,7 +96,7 @@ export function chooseExecutionStrategy(
   // A root path such as README.md can share its basename with nested files.
   // Prefer exact repository-relative mentions; only fall back to a basename
   // when that basename identifies one file in the repository.
-  const exactPaths = profile.files.filter((f) => mentionedPath(task, f));
+  const exactPaths = explicitTaskPaths(task, profile);
 
   const basenameMatches = profile.files.filter((f) =>
     mentionedPath(task, posix.basename(f)),

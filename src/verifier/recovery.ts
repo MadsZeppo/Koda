@@ -3,6 +3,10 @@ import type { RepoProfile } from "../types.js";
 import { readFile, lstat } from "node:fs/promises";
 import { safePath } from "../agent/tools.js";
 import { profileRepo } from "../repo/profiler.js";
+import { compileContext } from "../context/compiler.js";
+import { focusedVerificationCheck, impactAwareVerificationSelection, verificationImpactRelationships } from "./selection.js";
+import type { TaskFingerprint } from "../router/taskFingerprint.js";
+import type { Subtask } from "../planner/schemas.js";
 import { verificationPlan } from "./plan.js";
 
 const literal = (value: string) => /^(?:-?\d+(?:\.\d+)?|True|False|None|"[^"\\\n]{0,80}"|'[^'\\\n]{0,80}')$/.test(value);
@@ -45,7 +49,7 @@ export async function focusedLocalReproduction(
 
 /** Reinspect the mutated workspace once; the pre-edit profile may be stale or incomplete. */
 export async function recoverPostMutationChecks(root: string, task: string, paths: readonly string[],
-  options: { structuralOnly?: boolean } = {}) {
+  options: { structuralOnly?: boolean; fingerprint?: TaskFingerprint } = {}) {
   const updated = await profileRepo(root);
   let discovered = verificationPlan(updated, [...paths], options.structuralOnly)
     .filter((candidate) => candidate.available);
@@ -57,6 +61,21 @@ export async function recoverPostMutationChecks(root: string, task: string, path
       .filter((candidate) => candidate.kind !== "test")
       .sort((a, b) => (priority.get(a.kind) ?? 9) - (priority.get(b.kind) ?? 9))
       .slice(0, 1);
+  }
+  if (!options.structuralOnly && discovered.length) {
+    const context = await compileContext(root, task, [...paths], updated, {
+      maxBytes: 16000, maxFiles: 8, fileBytes: 2400, toolResultBytes: 4000,
+      maxPromptBytes: 64000, scanFiles: 200, readBytes: 16000,
+    }, true);
+    const focused = focusedVerificationCheck({ likelyWritePaths: [...paths] } as Subtask, updated, context);
+    if (focused) {
+      const impact = impactAwareVerificationSelection({ changedPaths: [...paths], candidates: discovered,
+        focusedCommands: [focused], fingerprint: options.fingerprint, relationships: verificationImpactRelationships(paths, context) });
+      if (!impact.whyFullSuite) {
+        const runner = discovered.find((candidate) => candidate.kind === "test");
+        if (runner) return [{ ...runner, command: focused }, ...impact.candidates];
+      }
+    }
   }
   if (discovered.length) return discovered;
   if (options.structuralOnly) return [];

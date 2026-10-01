@@ -15,7 +15,7 @@ const schema = z.object({
   modelTimeoutMs: z.object({
     inspection: z.number().positive().default(18000),
     planning: z.number().positive().default(30000),
-    implementation: z.number().positive().default(45000),
+    implementation: z.number().positive().default(30000),
     finalization: z.number().positive().default(12000),
   }).default({}),
   phaseBudget: z.object({

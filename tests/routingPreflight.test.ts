@@ -36,6 +36,18 @@ test("routing preflight skips a full suite without a focused test target", async
     );
     assert.equal(focused.checks.length, 1);
     assert.match(focused.checks[0]!.command, /tests\/value\.test\.cjs/);
+
+    const attempted: string[] = [];
+    const missing = await routingBaselinePreflight(
+      root,
+      profile,
+      ["tests/new.test.cjs"],
+      () => 5_000,
+      (check) => attempted.push(check.command),
+    );
+    assert.equal(missing.checks.length, 0);
+    assert.deepEqual(attempted, [],
+      "a candidate-only test path must not execute against the baseline");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

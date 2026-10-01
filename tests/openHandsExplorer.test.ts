@@ -84,6 +84,17 @@ test("exact existing path uses the conservative zero-call fast path", async (t) 
   assert.deepEqual(result?.readonlyFiles, []);
 });
 
+test("exact missing file path uses the zero-call fast path and remains exact scope", async (t) => {
+  const f = await fixture(t);
+  const path = "tests/newFocusedSelection.test.ts";
+  const task = `Create a new test file named ${path}. Make no unrelated changes.`;
+  const route = chooseExecutionStrategy(task, f.profile);
+  const result = fastPathExploration(task, f.profile, route);
+  assert.equal(route.preciseTarget, path);
+  assert.deepEqual(result?.editableCandidates.map(({ path }) => path), [path]);
+  assert.equal(result?.confidence, "high");
+});
+
 test("no-path behavior task uses OpenHands and forwards implementation evidence to Aider", async (t) => {
   const f = await fixture(t);
   let calls = 0;

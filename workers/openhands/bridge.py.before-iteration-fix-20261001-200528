@@ -460,8 +460,6 @@ evidence-backed implementation target.
         # control flow, not an infrastructure failure. OpenHands raises when
         # the bound is reached, so catch that specific condition and proceed
         # to the mandatory structured-finalization turn.
-        # Reaching the configured exploration iteration limit is normal
-        # bounded control flow, not an infrastructure failure.
         try:
             conversation.run()
         except Exception as exc:
@@ -471,26 +469,26 @@ evidence-backed implementation target.
                     True,
                 ) from exc
 
-        # If the explorer used all discovery iterations without submitting,
-        # force one final submit-only turn using the evidence already gathered.
+        # Exploration may consume its bounded iteration allowance without
+        # invoking the required structured submit tool. Give it exactly one
+        # finalization-only turn using evidence already in the conversation.
         if state["result"] is None:
             conversation.max_iteration_per_run = 1
-
             conversation.send_message(
-                "FINALIZATION ONLY. "
-                "Do not search, list, read files, or inspect imports. "
-                "Using only repository evidence already observed, "
+                "FINALIZATION ONLY. Do not search, list, read files, or inspect imports. "
+                "Using only repository evidence already observed in this conversation, "
                 "call koda_submit_repository_exploration exactly once now. "
-                "For a mutation task, put the smallest evidence-backed "
-                "implementation file set in editable_candidates. "
+                "For a mutation task, nominate the smallest evidence-backed implementation "
+                "file set in editable_candidates. Tests/context-only files belong elsewhere. "
                 "Do not answer with prose."
             )
 
             try:
                 conversation.run()
             except Exception as exc:
-                # OpenHands may raise its iteration-limit exception after
-                # the submit tool already executed. That is still success.
+                # OpenHands can raise the iteration-limit exception after the
+                # submit tool has already executed. That is success as long as
+                # the structured result was captured.
                 if (
                     state["result"] is None
                     or not _is_iteration_limit_error(exc)
@@ -499,7 +497,6 @@ evidence-backed implementation target.
                         f"{type(exc).__name__}: {exc}",
                         True,
                     ) from exc
-
         metrics = _metrics(conversation)
     finally:
         conversation.close()

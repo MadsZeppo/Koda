@@ -44,6 +44,7 @@ export interface RecoveryObservation {
 export interface FrozenExecutionPolicy<T extends ControlCandidate = ControlCandidate> {
   readonly id: string;
   readonly taskFingerprint: Readonly<TaskFingerprint>;
+  readonly routingMode?: "quality_safe" | "bounded_zero_eligible_fallback";
   readonly qualityClass: QualityClass;
   readonly requiredQuality: number;
   readonly verificationStrength: TaskFingerprint["verificationStrength"];
@@ -246,17 +247,16 @@ export function chooseAdaptiveRecovery<T extends ControlCandidate>(
 
   let candidates = policy.approvedCandidateSet.filter(
     (candidate) => {
+      // Every entry in approvedCandidateSet was frozen by the optimizer as a
+      // task-safe execution leg. An operational/provider failure supplies no
+      // coding-quality evidence, so do not re-qualify that approved set here.
+      if (failureMode === "operational")
+        return !attempted.has(candidate.model.id) && !candidate.hardRejection;
       const optimizerApprovedQualityLeg =
         qualityCascade?.has(candidate.model.id) === true;
-      const explicitSidewaysPeer =
-        failureMode === "operational" &&
-        operationalRecovery.has(candidate.model.id) &&
-        !!qualityCascade &&
-        !qualityCascade.has(candidate.model.id);
       return !attempted.has(candidate.model.id) &&
         !candidate.hardRejection &&
-        (explicitSidewaysPeer ||
-          candidate.conservativeQuality + 1e-9 >= policy.requiredQuality &&
+        (candidate.conservativeQuality + 1e-9 >= policy.requiredQuality &&
           (optimizerApprovedQualityLeg ||
             recoveryEvidenceSufficient(candidate, policy.taskFingerprint)));
     },

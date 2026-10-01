@@ -107,14 +107,14 @@ const exactEditResponse = (
   ],
 });
 
-test("DIRECT uses the coding-attempt timeout instead of silently shortening it to the generic model timeout", () => {
+test("DIRECT reserves half the attempt for one immediate protocol repair", () => {
   const request = input("/tmp/repo");
 
   assert.equal(request.timeoutMs, 45_000);
 
   assert.equal(request.requestTimeoutMs, 30_000);
 
-  assert.equal(directEditRequestTimeoutMs(request), 45_000);
+  assert.equal(directEditRequestTimeoutMs(request), 22_500);
 });
 
 test("DIRECT immediately returns an operational incompatibility when required tool choice is rejected", async () => {
@@ -463,7 +463,7 @@ test("DIRECT stops after one bounded protocol repair if the model still refuses 
 
     assert.equal(calls, 2);
 
-    assert.equal(result.exitStatus, "failed");
+    assert.equal(result.exitStatus, "infra_failure");
 
     assert.equal(result.terminationReason, "direct_edit_protocol_error");
 

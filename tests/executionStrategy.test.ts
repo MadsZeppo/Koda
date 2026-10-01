@@ -77,6 +77,23 @@ test("execution strategy: one explicit documentation or configuration path is di
     assert.deepEqual(result.likelyFiles, [path]);
   }
 });
+test("execution strategy preserves one explicit safe path that does not exist yet", () => {
+  const repository = profile([
+    "src/verifier/selection.ts",
+    "tests/existing.test.ts",
+    "package.json",
+  ]);
+  const path = "tests/newFocusedSelection.test.ts";
+  const result = chooseExecutionStrategy(
+    `Create a new test file named ${path}. Make no unrelated changes.`,
+    repository,
+  );
+  assert.equal(result.execution_strategy, "direct");
+  assert.equal(result.preciseTarget, path);
+  assert.deepEqual(result.likelyFiles, [path]);
+  assert.deepEqual(directWritePaths(result.likelyFiles, repository,
+    `Create a new test file named ${path}.`), [path]);
+});
 test("execution strategy: precise source target stays narrow while vague inference may expand", () => {
   const repository = profile([
     "src/foo.ts",

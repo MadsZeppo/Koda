@@ -42,19 +42,6 @@ class BridgeFailure(RuntimeError):
         self.provider_dispatched = provider_dispatched
 
 
-def _is_iteration_limit_error(exc: Exception) -> bool:
-    text = f"{type(exc).__name__}: {exc}".lower()
-    return (
-        "iteration" in text
-        and "limit" in text
-        and (
-            "maximum" in text
-            or "max iteration" in text
-            or "reached" in text
-        )
-    )
-
-
 def _safe_path(root: Path, value: str) -> Path:
     value = value.strip().replace("\\", "/")
     if not value or value.startswith("/") or "\0" in value:
@@ -456,50 +443,26 @@ evidence-backed implementation target.
         }
         conversation.send_message(json.dumps(prompt, separators=(",", ":")))
         provider_dispatched = True
-        # Hitting the configured exploration iteration bound is expected
-        # control flow, not an infrastructure failure. OpenHands raises when
-        # the bound is reached, so catch that specific condition and proceed
-        # to the mandatory structured-finalization turn.
-        # Reaching the configured exploration iteration limit is normal
-        # bounded control flow, not an infrastructure failure.
         try:
             conversation.run()
-        except Exception as exc:
-            if not _is_iteration_limit_error(exc):
-                raise BridgeFailure(
-                    f"{type(exc).__name__}: {exc}",
-                    True,
-                ) from exc
 
-        # If the explorer used all discovery iterations without submitting,
-        # force one final submit-only turn using the evidence already gathered.
-        if state["result"] is None:
-            conversation.max_iteration_per_run = 1
-
-            conversation.send_message(
-                "FINALIZATION ONLY. "
-                "Do not search, list, read files, or inspect imports. "
-                "Using only repository evidence already observed, "
-                "call koda_submit_repository_exploration exactly once now. "
-                "For a mutation task, put the smallest evidence-backed "
-                "implementation file set in editable_candidates. "
-                "Do not answer with prose."
-            )
-
-            try:
+            # Exploration may consume its bounded iteration allowance
+            # without invoking the required structured submit tool.
+            # Give it exactly one finalization-only turn using the
+            # evidence already present in the conversation.
+            if state["result"] is None:
+                conversation.max_iteration_per_run = 1
+                conversation.send_message(
+                    "FINALIZATION ONLY. Do not search, list, read files, or inspect imports. "
+                    "Using only repository evidence already observed in this conversation, "
+                    "call koda_submit_repository_exploration exactly once now. "
+                    "For a mutation task, nominate the smallest evidence-backed implementation "
+                    "file set in editable_candidates. Tests/context-only files belong elsewhere. "
+                    "Do not answer with prose."
+                )
                 conversation.run()
-            except Exception as exc:
-                # OpenHands may raise its iteration-limit exception after
-                # the submit tool already executed. That is still success.
-                if (
-                    state["result"] is None
-                    or not _is_iteration_limit_error(exc)
-                ):
-                    raise BridgeFailure(
-                        f"{type(exc).__name__}: {exc}",
-                        True,
-                    ) from exc
-
+        except Exception as exc:
+            raise BridgeFailure(f"{type(exc).__name__}: {exc}", True) from exc
         metrics = _metrics(conversation)
     finally:
         conversation.close()

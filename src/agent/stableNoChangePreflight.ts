@@ -55,10 +55,13 @@ export async function routingBaselinePreflight(
   onCheck?: Parameters<typeof verify>[3],
   task?: string,
 ): Promise<VerificationResult> {
-  const candidates = verificationPlan(profile, paths).filter(
+  // A requested new file exists only in the candidate. It cannot be an
+  // executable baseline check, so retain only repository-backed paths here.
+  const baselinePaths = paths.filter((path) => profile.files.includes(path));
+  const candidates = verificationPlan(profile, baselinePaths).filter(
     (candidate) => candidate.available && !optionalUnavailableCheck(candidate),
   );
-  const selected = focusedRoutingTest(profile, paths, candidates) ??
+  const selected = focusedRoutingTest(profile, baselinePaths, candidates) ??
     candidates.find((candidate) => candidate.kind !== "test") ??
     (task && isExplicitTestOnlyTask(task)
       ? candidates.find((candidate) => candidate.kind === "test")

@@ -287,13 +287,60 @@ export async function run(options: RunOptions) {
     const initialStrategy = chooseExecutionStrategy(options.task, profile);
     const repositoryExplorer = options.repositoryExplorerFactory?.(gateway) ??
       new OpenHandsExplorer(gateway);
-    const fastEvidence = fastPathExploration(options.task, profile, initialStrategy);
-    let exploration: RepositoryExploration = fastEvidence ??
-      await repositoryExplorer.explore({
-        repoPath: integration.path,
-        task: options.task,
-        profile,
-      });
+    const fastEvidence = fastPathExploration(
+      options.task,
+      profile,
+      initialStrategy,
+    );
+
+    let explorationDegraded = false;
+    let exploration: RepositoryExploration;
+
+    if (fastEvidence) {
+      exploration = fastEvidence;
+    } else {
+      try {
+        exploration = await repositoryExplorer.explore({
+          repoPath: integration.path,
+          task: options.task,
+          profile,
+        });
+      } catch (error) {
+        /*
+         * Repository exploration is an optimization, not a prerequisite
+         * for coding.
+         *
+         * If OpenHands times out, returns malformed evidence, hits an SDK
+         * problem, or otherwise cannot establish scope, continue through
+         * Koda's bounded root-discovery coding path instead of aborting the
+         * entire run before a coding worker starts.
+         */
+        explorationDegraded = true;
+
+        logger.log("repo_exploration_degraded", {
+          reason: String(error),
+          fallback: "stable_root_discovery",
+        });
+
+        exploration = {
+          confidence: "low",
+          editableCandidates: [
+            {
+              path: ".",
+              reason:
+                "Repository explorer unavailable; coding worker must discover concrete mutation targets before writing.",
+            },
+          ],
+          readonlyFiles: [],
+          relatedTests: [],
+          dependencies: [],
+          evidence: [],
+          unresolvedQuestions: [
+            `Repository exploration unavailable: ${String(error)}`,
+          ],
+        };
+      }
+    }
     if (fastEvidence)
       logger.log("repo_exploration_finish", {
         model: null,

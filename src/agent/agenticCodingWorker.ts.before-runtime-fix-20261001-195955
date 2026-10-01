@@ -1,14 +1,9 @@
-import { readFile, lstat } from "node:fs/promises";
-import { join } from "node:path";
-import { isTestPath } from "../context/compiler.js";
-import { discoveredTestGlobs, matchesDiscoveredTestGlob } from "../verifier/selection.js";
 import OpenAI from "openai";
 import type {
   ChatCompletionMessageParam,
   ChatCompletionTool,
 } from "openai/resources/chat/completions";
 
-import { supportsParameters } from "../router/pool.js";
 import type { Budget } from "../openrouter/usage.js";
 import {
   estimateUsageCost,
@@ -19,7 +14,6 @@ import type { Logger } from "../telemetry/logger.js";
 
 import {
   AgentTools,
-  safePath,
   toolDefinitions,
 } from "./tools.js";
 import { WriteScope } from "../repo/writeScope.js";
@@ -49,8 +43,6 @@ const DISCOVERY_TOOLS = new Set([
 const MUTATION_TOOLS = new Set(["apply_patch", "edit_file", "write_file"]);
 const MUTATION_TOOL_DEFINITIONS = toolDefinitions.filter((tool) =>
   "function" in tool && MUTATION_TOOLS.has(tool.function.name));
-const READ_TOOL_DEFINITIONS = toolDefinitions.filter((tool) =>
-  "function" in tool && tool.function.name === "read_file");
 
 export interface AgenticCodingResponse {
   model: string;
@@ -443,7 +435,7 @@ export class AgenticCodingWorker
           model: input.model,
           messages,
           tools,
-          tool_choice: "required",
+          tool_choice: "auto",
           max_tokens: maxOutputTokens,
           stream: false,
           ...({
@@ -496,36 +488,6 @@ export class AgenticCodingWorker
       input.context?.relevantFiles ?? [],
     );
 
-    let testGlobs: string[] = [];
-    try {
-      const manifest = JSON.parse(await readFile(join(input.repoPath, "package.json"), "utf8"));
-      testGlobs = discoveredTestGlobs(manifest.scripts?.test ?? "");
-    } catch {}
-    const inspectedFiles = new Map<string, string>();
-    const broadScope = input.writeScope.includes(".");
-    const needsContractReads = broadScope || input.writeScope.some(isTestPath) ||
-      /\b(?:tests?|regression)\b/i.test(input.task);
-    const hasRead = () => tools.progressEvidence.some((key) => key.startsWith("read_file:"));
-    const hasTargetRead = () => hasRead() && (broadScope || input.writeScope.some((path) =>
-      tools.progressEvidence.some((key) => key.startsWith(`read_file:${path}:`))));
-    const implementationExcerpts = () => {
-      let room = 8000;
-      return [...inspectedFiles].map(([path, content]) => {
-        const excerpt = content.slice(0, Math.max(0, room));
-        room -= excerpt.length;
-        return excerpt ? `READ FILE ${path}\n${excerpt}` : "";
-      }).filter(Boolean).join("\n\n");
-    };
-    if (input.context?.completionRepair) {
-      const paths = [...new Set([
-        ...(input.context.relevantFiles ?? []), ...input.writeScope.filter((path) => path !== "."),
-      ])];
-      for (const path of paths) {
-        try { await tools.execute("read_file", { path }); } catch {}
-        if (hasRead()) break;
-      }
-    }
-
     const messages: ChatCompletionMessageParam[] = [
       {
         role: "system",
@@ -538,8 +500,7 @@ export class AgenticCodingWorker
           "For new files, use write_file only when the task and repository evidence justify the path.",
           "Prefer edit_file or apply_patch for small changes to existing files.",
           "Do not stop at a plan: make the code change.",
-          "Follow LOCATE -> READ -> MUTATE -> RETURN TO KODA. Read relevant code before implementing. Never run tests; deterministic Koda verification owns all checks.",
-          testGlobs.length ? `Test files must match the discovered runner globs: ${testGlobs.join(", ")}.` : "",
+          "Use run_command only for focused checks or safe repository inspection.",
           "Koda performs authoritative verification after this worker finishes.",
           input.context?.completionRepair
             ? "This is a completion-repair continuation. The existing diff, compact excerpts, and reviewer diagnostics already establish the missing work. Mutate the authorized scope first. After a real mutation, normal tools reopen for at most two new evidence reads before another implementation mutation is required."
@@ -573,10 +534,6 @@ export class AgenticCodingWorker
     let providerDispatched = false;
     let timeToFirstMutationMs: number | undefined;
     let implementationNudgeSent = false;
-    let implementationContextRebuilt = false;
-    let minimalImplementationRebuilt = false;
-    let readNudgeSent = false;
-    let consecutiveTextTurns = 0;
 
     const settleKnown = () => {
       const usage = aggregateUsage(
@@ -652,66 +609,15 @@ export class AgenticCodingWorker
       ) {
         if (
           !mutationObserved &&
-          !hasTargetRead() &&
-          !readNudgeSent &&
-          tools.progressEvidence.length >= 2
-        ) {
-          const discoveryEvidence = evidencePacket();
-          const systemMessage = messages[0]!;
-          messages.splice(
-            0,
-            messages.length,
-            systemMessage,
-            {
-              role: "user",
-              content: [
-                `TASK\n${input.task}`,
-                `WRITE SCOPE\n${JSON.stringify(input.writeScope)}`,
-                compactSeed(input),
-                discoveryEvidence
-                  ? `DISCOVERY EVIDENCE\n${discoveryEvidence}`
-                  : "",
-                "READ PHASE: repository search has located candidate code. Read the most relevant implementation or test file now. When a search result gives a line number, request a narrow range around that line. Search output alone is not implementation evidence.",
-              ].filter(Boolean).join("\n\n"),
-            },
-          );
-          readNudgeSent = true;
-          this.logger.log("agentic_read_transition", {
-            subtaskId: input.attemptId,
-            useful_discovery_steps: tools.progressEvidence.length,
-          });
-        }
-
-        if (
-          !mutationObserved &&
           !implementationNudgeSent &&
-          hasTargetRead() &&
           tools.progressEvidence.length >= 2
         ) {
-          const discoveryEvidence = evidencePacket();
-          const systemMessage = messages[0]!;
-          messages.splice(
-            0,
-            messages.length,
-            systemMessage,
-            {
-              role: "user",
-              content: [
-                `TASK\n${input.task}`,
-                `WRITE SCOPE\n${JSON.stringify(input.writeScope)}`,
-                compactSeed(input),
-                discoveryEvidence
-                  ? `DISCOVERY EVIDENCE\n${discoveryEvidence}`
-                  : "",
-                implementationExcerpts(),
-                needsContractReads
-                  ? "IMPLEMENTATION PHASE: implement the smallest justified change. If a definition, API contract, or test setup is still missing, read that precise file/range before mutating. Never guess APIs or write from search results alone."
-                  : "IMPLEMENTATION PHASE: the assigned target has been read. Make the smallest justified mutation now using edit_file, apply_patch, or write_file.",
-              ].filter(Boolean).join("\n\n"),
-            },
-          );
+          messages.push({
+            role: "user",
+            content:
+              "You now have enough distinct repository evidence to implement. Make the smallest justified mutation in the allowed write scope now. Further reads are allowed only for a genuinely new symbol or line range required to construct that edit.",
+          });
           implementationNudgeSent = true;
-          implementationContextRebuilt = true;
           this.logger.log("agentic_implementation_transition", {
             subtaskId: input.attemptId,
             useful_discovery_steps: tools.progressEvidence.length,
@@ -782,44 +688,6 @@ export class AgenticCodingWorker
         );
 
         if (tokenRoom < MIN_NEXT_OUTPUT_TOKENS) {
-          const discoveryEvidence = evidencePacket();
-
-          if (
-            !mutationObserved &&
-            implementationContextRebuilt &&
-            !minimalImplementationRebuilt &&
-            discoveryEvidence
-          ) {
-            const systemMessage = messages[0]!;
-            messages.splice(
-              0,
-              messages.length,
-              systemMessage,
-              {
-                role: "user",
-                content: [
-                  `TASK\n${input.task}`,
-                  `WRITE SCOPE\n${JSON.stringify(input.writeScope)}`,
-                  `DISCOVERY EVIDENCE\n${discoveryEvidence}`,
-                  implementationExcerpts(),
-                  "TOKEN RECOVERY: use the retained file contents to make the smallest justified mutation. Never guess missing code or API contracts.",
-                ].join("\n\n"),
-              },
-            );
-
-            minimalImplementationRebuilt = true;
-
-            this.logger.log(
-              "agentic_token_preflight_compact_retry",
-              {
-                subtaskId: input.attemptId,
-                used_tokens: usedTokens,
-              },
-            );
-
-            continue;
-          }
-
           const changes =
             await currentChanges();
 
@@ -867,13 +735,9 @@ export class AgenticCodingWorker
           });
         }
 
-        const phaseOutputLimit =
-          implementationNudgeSent || mutationObserved
-            ? input.maxOutputTokens
-            : Math.min(input.maxOutputTokens, 1_200);
-
         let maxOutput = Math.min(
-          phaseOutputLimit,
+          input.maxOutputTokens,
+          1_200,
           tokenRoom,
         );
 
@@ -1024,22 +888,10 @@ export class AgenticCodingWorker
           },
         );
 
-        if (!supportsParameters(input.modelMetadata ?? {}, ["tools", "tool_choice"])) {
-          throw Error("INFRA_FAILURE: coding worker requires an endpoint supporting tools and tool_choice together");
-        }
-        const remainingWorkerMs = input.timeoutMs - (Date.now() - started);
-        if (remainingWorkerMs <= 0) {
-          const changes = await currentChanges();
-          return result({ exitStatus: changes.length ? "completed" : "infra_failure",
-            changedPaths: changes.map((change) => change.path),
-            terminationReason: changes.length ? "candidate_ready_for_verification" : "agentic_attempt_timeout",
-            limitKind: "timeout", progressPhase: changes.length ? "MUTATION_OBSERVED" : "DISCOVERY", steps: step });
-        }
         providerDispatched = true;
 
         const repairMutationRequired =
           !!input.context?.completionRepair?.mutationRequiredBeforeDiscovery &&
-          hasRead() &&
           (!mutationObserved || repairDiscoverySinceMutation >= 2);
 
         // Normal agentic execution must also leave discovery once enough
@@ -1051,7 +903,6 @@ export class AgenticCodingWorker
         // until the first real mutation. Normal discovery tools reopen after
         // that mutation so the worker can continue a multi-file implementation.
         const implementationMutationRequired =
-          !needsContractReads &&
           !mutationObserved &&
           implementationNudgeSent;
 
@@ -1059,18 +910,11 @@ export class AgenticCodingWorker
           repairMutationRequired ||
           implementationMutationRequired;
 
-        const readRequired =
-          readNudgeSent &&
-          !hasTargetRead();
-
-        const requestStarted = Date.now();
         const response = await this.request(
-          { ...input, requestTimeoutMs: Math.min(input.requestTimeoutMs, remainingWorkerMs) },
+          input,
           messages,
           mutationRequired
             ? MUTATION_TOOL_DEFINITIONS
-            : readRequired
-              ? READ_TOOL_DEFINITIONS
             : toolDefinitions,
           maxOutput,
         );
@@ -1106,7 +950,7 @@ export class AgenticCodingWorker
             costUsd:
               usage.costUsd,
             wallClockMs:
-              Date.now() - requestStarted,
+              Date.now() - started,
           },
         );
 
@@ -1143,13 +987,8 @@ export class AgenticCodingWorker
             });
           }
 
-          if (++consecutiveTextTurns >= 2) {
-            return result({ exitStatus: "failed", changedPaths: [], terminationReason: "agentic_no_tool_progress",
-              progressPhase: "DISCOVERY", steps: step + 1, discoveryEvidence: evidencePacket(),
-              discoveryProgress: tools.progressEvidence.length });
-          }
           const nudge =
-            "No tool action or mutation was made. Your next response must call a repository tool: read the missing relevant code or implement the justified change. Prose cannot complete this task.";
+            "No mutation has been made yet. Continue with repository tools and implement the requested change. Do not only explain.";
 
           const last =
             messages.at(-1) as {
@@ -1170,8 +1009,6 @@ export class AgenticCodingWorker
           continue;
         }
 
-        consecutiveTextTurns = 0;
-        let repairMutationAttempted = false;
         for (
           let callIndex = 0;
           callIndex < calls.length;
@@ -1191,22 +1028,8 @@ export class AgenticCodingWorker
                 call.function.arguments,
               );
 
-              const mutationPaths = MUTATION_TOOLS.has(call.function.name)
-                ? call.function.name === "apply_patch"
-                  ? (Array.isArray(parsedArgs.edits) ? parsedArgs.edits.map((edit: { path?: string }) => String(edit.path ?? "")) : [])
-                  : [String(parsedArgs.path ?? "")]
-                : [];
-              if (input.context?.completionRepair && mutationPaths.length)
-                repairMutationAttempted = true;
-              const unreadExistingMutation = !hasRead() && mutationPaths.length > 0 &&
-                !input.context?.sourceFiles?.some((file) => mutationPaths.includes(file.path) && file.snippet.trim()) &&
-                (await Promise.all(mutationPaths.map(async (path) => {
-                  try { return (await lstat(await safePath(input.repoPath, path))).isFile(); }
-                  catch { return false; }
-                }))).some(Boolean);
               const repairToolGate =
                 !!input.context?.completionRepair?.mutationRequiredBeforeDiscovery &&
-                hasRead() &&
                 (!mutationObserved || repairDiscoverySinceMutation >= 2);
               if (
                 repairToolGate &&
@@ -1220,10 +1043,8 @@ export class AgenticCodingWorker
                   tool: call.function.name,
                 });
               } else if (
-                !needsContractReads &&
                 !mutationObserved &&
                 DISCOVERY_TOOLS.has(call.function.name) &&
-                hasTargetRead() &&
                 tools.progressEvidence.length >=
                   MAX_USEFUL_DISCOVERY_BEFORE_MUTATION
               ) {
@@ -1239,16 +1060,6 @@ export class AgenticCodingWorker
                       tools.progressEvidence.length,
                   },
                 );
-              } else if (call.function.name === "run_command" &&
-                (!/^\s*(?:rg|grep|find|cat|head|tail|ls|pwd|sed\s+-n|git\s+(?:diff|status|log|show))\b/.test(String(parsedArgs.command)) ||
-                  /[;&|><`$\r\n]/.test(String(parsedArgs.command)))) {
-                content = "Tool error: coding workers only inspect repository files; Koda owns deterministic verification.";
-              } else if (unreadExistingMutation) {
-                content = "Tool error: read the relevant existing file before mutating it. Search results alone are not implementation evidence.";
-              } else if (MUTATION_TOOLS.has(call.function.name) && testGlobs.length &&
-                mutationPaths.some((path) =>
-                    isTestPath(path) && !matchesDiscoveredTestGlob(path, testGlobs))) {
-                content = `Tool error: test path must match the discovered runner globs: ${testGlobs.join(", ")}`;
               } else {
                 content = String(
                   await tools.execute(
@@ -1256,10 +1067,6 @@ export class AgenticCodingWorker
                     parsedArgs,
                   ),
                 );
-                if (call.function.name === "read_file" &&
-                  tools.progressEvidence.some((key) => key.startsWith(`read_file:${String(parsedArgs.path)}:`))) {
-                  inspectedFiles.set(String(parsedArgs.path), content);
-                }
                 if (
                   input.context?.completionRepair &&
                   mutationObserved &&
@@ -1269,9 +1076,7 @@ export class AgenticCodingWorker
                   input.context?.completionRepair &&
                   MUTATION_TOOLS.has(call.function.name) &&
                   !/^Tool error:/i.test(content)
-                ) {
-                  repairDiscoverySinceMutation = 0;
-                }
+                ) repairDiscoverySinceMutation = 0;
               }
             } catch (error) {
               content =
@@ -1300,16 +1105,6 @@ export class AgenticCodingWorker
             }
           }
 
-          // Stop within the batch: a queued command must never run after the edit.
-          if (input.returnOnMutation && MUTATION_TOOLS.has(call.function.name) && !/^Tool error:/i.test(content)) {
-            const changes = await currentChanges();
-            if (changes.length) {
-              timeToFirstMutationMs ??= Date.now() - started;
-              return result({ exitStatus: "completed", changedPaths: changes.map((change) => change.path),
-                terminationReason: "candidate_ready_for_verification", progressPhase: "MUTATION_OBSERVED",
-                steps: step + 1, discoveryEvidence: evidencePacket(), discoveryProgress: discoveryNotes.length });
-            }
-          }
           messages.push({
             role: "tool",
             tool_call_id: call.id,
@@ -1319,18 +1114,6 @@ export class AgenticCodingWorker
 
         const changes =
           await currentChanges();
-
-        if (input.context?.completionRepair && repairMutationAttempted && !changes.length) {
-          return result({
-            exitStatus: "failed",
-            changedPaths: [],
-            terminationReason: "repair_produced_no_mutation",
-            progressPhase: "MUTATION_OBSERVED",
-            steps: step + 1,
-            discoveryEvidence: evidencePacket(),
-            discoveryProgress: discoveryNotes.length,
-          });
-        }
 
         if (changes.length) {
           if (!mutationObserved) {

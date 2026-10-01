@@ -27,6 +27,26 @@ const safeTestArguments = (argumentsText: string) =>
       ),
     );
 
+/** Literal globs from a discovered direct runner, never a guessed test location. */
+export function discoveredTestGlobs(script: string): string[] {
+  if (!/^(?:node|tsx)\s+--test\s+/.test(script.trim()) || /[;&|`$]/.test(script)) return [];
+  return script.trim().split(/\s+/).slice(2)
+    .map((arg) => arg.replace(/^['"]|['"]$/g, ""))
+    .filter((arg) => !arg.startsWith("-") && /\.[cm]?[jt]s$/.test(arg));
+}
+
+export function matchesDiscoveredTestGlob(path: string, globs: readonly string[]): boolean {
+  return globs.some((glob) => {
+    // Shell-expanded runner globs do not include hidden files by default.
+    if (path.split("/").some((part) => part.startsWith(".")) &&
+      !glob.split("/").some((part) => part.startsWith("."))) return false;
+    const pattern = glob.split("**").map((part) => part.split("*")
+      .map((literal) => literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+      .join("[^/]*")).join(".*");
+    return new RegExp(`^${pattern}$`).test(path);
+  });
+}
+
 export interface VerificationImpactEvidence {
   /** Changed source path inspected by deterministic repository tooling. */
   source: string;
@@ -85,8 +105,11 @@ export function impactAwareVerificationSelection(options: {
       focused.some((command) => commandMentions(command, path)),
     );
   const sourcePaths = changed.filter((path) => !isTestPath(path));
+  const changedTestsCovered = changed.filter(isTestPath).every((path) =>
+    focused.some((command) => commandMentions(command, path)));
   const backed =
     sourcePaths.length > 0 &&
+    changedTestsCovered &&
     sourcePaths.every((source) => {
       const relation = relationships.find(
         (entry) => entry.source === source && entry.tests.length,
@@ -173,7 +196,7 @@ export function repoBackedVerificationCommands(
   });
 
   const nativeNodeTest =
-    /\bnode\s+--test\b/.test(profile.scripts.test ?? "") ||
+    /\bnode\s+--test\b/.test(profile.scripts?.test ?? "") ||
     profiledCommands.some((command) =>
       normalizeCommand(command).startsWith("node --test"),
     );
@@ -294,13 +317,16 @@ function targetedNativeCheck(
   context: WorkerContext,
 ) {
   if (
-    profile.scripts.pretest ||
-    profile.scripts.posttest ||
-    !/^node --test(?:\s+[\w./*'-]+)*$/.test(profile.scripts.test ?? "")
+    profile.scripts?.pretest ||
+    profile.scripts?.posttest ||
+    !/^node --test(?:\s+[\w./*'-]+)*$/.test(profile.scripts?.test ?? "")
   ) {
     return undefined;
   }
 
+  const globs = discoveredTestGlobs(profile.scripts?.test ?? "");
+  if (globs.length && subtask.likelyWritePaths.some((path) =>
+    isTestPath(path) && !matchesDiscoveredTestGlob(path, globs))) return undefined;
   const directTests = subtask.likelyWritePaths.filter(
     (path) => isTestPath(path) && /\.[cm]?[jt]s$/.test(path),
   );
@@ -311,20 +337,22 @@ function targetedNativeCheck(
     return "node --test " + directTests.map(quote).join(" ");
 
   const targets = subtask.likelyWritePaths.filter(isSourcePath);
-
+  const related = verificationImpactRelationships(targets, context);
   const tests = context.files.filter(
-    (file) => isTestPath(file.path) && /\.[cm]?js$/.test(file.path),
+    (file) => isTestPath(file.path) && /\.[cm]?js$/.test(file.path) &&
+      (!globs.length || matchesDiscoveredTestGlob(file.path, globs)),
   );
+  const provenTests = (target: string) => tests.filter((test) =>
+    related.some((relation) => relation.source === target && relation.tests.includes(test.path)));
 
   return targets.length &&
-    targets.every((target) => relevantTests(target, tests).length)
+    targets.every((target) => provenTests(target).length)
     ? "node --test " +
         [
-          ...new Set(
-            targets.flatMap((target) =>
-              relevantTests(target, tests).map((file) => file.path),
-            ),
-          ),
+          ...new Set([
+            ...directTests,
+            ...targets.flatMap((target) => provenTests(target).map((file) => file.path)),
+          ]),
         ]
           .map(quote)
           .join(" ")
@@ -337,15 +365,17 @@ function targetedTsxCheck(
   context: WorkerContext,
 ) {
   if (
-    profile.scripts.pretest ||
-    profile.scripts.posttest ||
-    !/^tsx --test tests\/\*\.test\.ts$/.test(profile.scripts.test ?? "") ||
+    profile.scripts?.pretest ||
+    profile.scripts?.posttest ||
+    !/^tsx --test\s+/.test(profile.scripts?.test ?? "") ||
     profile.packageManager !== "pnpm"
   )
     return undefined;
 
+  const globs = discoveredTestGlobs(profile.scripts?.test ?? "");
+  if (!subtask.likelyWritePaths.every((path) => !isTestPath(path) || matchesDiscoveredTestGlob(path, globs))) return undefined;
   const directTests = subtask.likelyWritePaths.filter(
-    (file) => /^tests\/[\w./-]+\.test\.ts$/.test(file),
+    (file) => isTestPath(file) && matchesDiscoveredTestGlob(file, globs),
   );
 
   const sourcePaths = subtask.likelyWritePaths.filter(isSourcePath);
@@ -375,7 +405,7 @@ function targetedTsxCheck(
       ),
     ]),
   ].filter(
-    (file) => /^tests\/[\w./-]+\.test\.ts$/.test(file),
+    (file) => matchesDiscoveredTestGlob(file, globs),
   );
 
   return tests.length

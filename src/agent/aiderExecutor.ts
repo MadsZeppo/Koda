@@ -470,6 +470,7 @@ export function buildAiderArgs(
     "--no-detect-urls",
     "--no-fancy-input",
     "--analytics-disable",
+    "--verbose",
 
     "--cache-keepalive-pings",
     "0",
