@@ -354,6 +354,110 @@ class GuardTests(unittest.TestCase):
             600,
         )
 
+    def test_total_attempt_budget_counts_prompt_and_completion(
+        self,
+    ):
+        request = dict(
+            self.request,
+            maxTokens=5000,
+            maxOutputTokens=1000,
+            budgetUsd=1,
+        )
+
+        state = dict(
+            steps=0,
+            tokens=0,
+            costUsd=0,
+            inputTokens=0,
+            outputTokens=0,
+        )
+
+        calls = []
+
+        def tokenizer(
+            *,
+            model,
+            messages,
+            **_kwargs,
+        ):
+            self.assertIn(
+                model,
+                (
+                    "openrouter/foo/bar",
+                    "foo/bar",
+                ),
+            )
+
+            return 4200
+
+        def complete(**kwargs):
+            calls.append(kwargs)
+
+            return types.SimpleNamespace(
+                usage={
+                    "prompt_tokens": 4100,
+                    "completion_tokens": 600,
+                    "cost": 0.01,
+                }
+            )
+
+        guard = CallGuard(
+            request,
+            state,
+            lambda: None,
+            complete,
+            tokenizer,
+        )
+
+        guard(
+            model=request["model"],
+            messages=[
+                {
+                    "role": "user",
+                    "content": "large prompt",
+                }
+            ],
+        )
+
+        # 5000 total - 4200 current prompt = at most 800 output.
+        self.assertEqual(
+            calls[0]["max_tokens"],
+            800,
+        )
+
+        # Provider truth replaces the reservation:
+        # 4100 prompt + 600 completion = 4700 consumed.
+        self.assertEqual(
+            state["tokens"],
+            4700,
+        )
+
+        # A second 4200-token prompt cannot fit in the same
+        # 5000-token whole-attempt allowance.
+        with self.assertRaises(
+            StopExecution
+        ) as error:
+            guard(
+                model=request["model"],
+                messages=[
+                    {
+                        "role": "user",
+                        "content": "second call",
+                    }
+                ],
+            )
+
+        self.assertEqual(
+            error.exception.kind,
+            "attempt_budget_exhausted",
+        )
+
+        self.assertEqual(
+            len(calls),
+            1,
+        )
+
+
     def test_unknown_tokenizer_uses_bounded_fallback(
         self,
     ):

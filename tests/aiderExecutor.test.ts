@@ -4,7 +4,14 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execa } from "execa";
-import { AiderExecutor, aiderOpenRouterModel, preferredAiderFormat, selectAiderFiles, type AiderInvocation } from "../src/agent/aiderExecutor.js";
+import {
+  AiderExecutor,
+  aiderOpenRouterModel,
+  estimateAiderPromptBytes,
+  preferredAiderFormat,
+  selectAiderFiles,
+  type AiderInvocation,
+} from "../src/agent/aiderExecutor.js";
 import { ensureAiderRuntime } from "../src/agent/aiderRuntime.js";
 import { Budget } from "../src/openrouter/usage.js";
 import { Logger } from "../src/telemetry/logger.js";
@@ -72,6 +79,57 @@ test("Aider file handoff keeps grounded source editable and tests/read context r
   assert.deepEqual(selected.readOnly, ["tests/value.test.cjs", "package.json"]);
 });
 
+test(
+  "Aider prompt forecast uses real attached files instead of duplicating source snippets",
+  async (t) => {
+    const root = await fixture(t);
+
+    const hugeDuplicatedSnippet =
+      "x".repeat(100_000);
+
+    const bytes =
+      await estimateAiderPromptBytes({
+        repoPath: root,
+        task: "Change both values to 3",
+        writeScope: ["src"],
+        context: {
+          relevantFiles: [
+            "src/value.cjs",
+            "src/other.cjs",
+          ],
+          sourceFiles: [
+            {
+              path: "src/value.cjs",
+              snippet:
+                hugeDuplicatedSnippet,
+            },
+            {
+              path: "src/other.cjs",
+              snippet:
+                hugeDuplicatedSnippet,
+            },
+          ],
+          completePaths: [
+            "src/value.cjs",
+            "src/other.cjs",
+          ],
+          evidence: {
+            relevantFiles: [
+              "src/value.cjs",
+              "src/other.cjs",
+            ],
+          },
+        },
+      });
+
+    assert.ok(
+      bytes < 20_000,
+      `duplicated source snippets leaked into Aider prompt estimate: ${bytes}`,
+    );
+  },
+);
+
+
 test("Aider invocation pre-attaches bounded editable and read-only files without interactive add", async (t) => {
   const root = await fixture(t);
   await mkdir(join(root, "tests"));
@@ -98,6 +156,37 @@ test("Aider invocation pre-attaches bounded editable and read-only files without
     assert.equal(i.args[readIndex + 1], "tests/value.test.cjs");
     assert.equal(i.args.includes("."), false);
     assert.equal(i.args.includes("../outside.cjs"), false);
+
+    const messageIndex =
+      i.args.indexOf("--message-file");
+
+    assert.ok(messageIndex >= 0);
+
+    const message = await readFile(
+      i.args[messageIndex + 1]!,
+      "utf8",
+    );
+
+    assert.match(
+      message,
+      /Fix the failing value test/,
+    );
+
+    assert.doesNotMatch(
+      message,
+      /Koda context:/,
+    );
+
+    assert.doesNotMatch(
+      message,
+      /"sourceFiles"\s*:/,
+    );
+
+    assert.doesNotMatch(
+      message,
+      /module\.exports = 1/,
+    );
+
     await writeFile(join(cwd, "src/value.cjs"), "module.exports = 3;\n");
     await report(i, "whole");
     return success;

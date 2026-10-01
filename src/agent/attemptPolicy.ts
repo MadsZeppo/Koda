@@ -19,7 +19,7 @@ export type AttemptProgressPhase =
   | "VERIFICATION_ATTEMPTED"
   | "REPAIR";
 
-export const AIDER_PROMPT_OVERHEAD_TOKENS = 2_048;
+export const AIDER_PROMPT_OVERHEAD_TOKENS = 4_096;
 
 export interface AttemptLimitPolicyInput {
   fingerprint: TaskFingerprint;

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -86,7 +86,47 @@ function broadTaskExplicitlyCreatesTests(task: string) {
   return /\b(?:add|create|write|introduce)\b[^\n]{0,80}\b(?:tests?|specs?)\b/i.test(task);
 }
 
-export function selectAiderFiles(input: CodingWorkerInput): { editable: string[]; readOnly: string[] } {
+export function selectAiderFiles<
+  T extends Pick<
+    CodingWorkerInput,
+    "task" | "writeScope" | "context" | "aiderFiles"
+  >,
+>(
+  input: T,
+): { editable: string[]; readOnly: string[] } {
+  if (input.aiderFiles) {
+    const editable = [
+      ...new Set(
+        input.aiderFiles.editable
+          .map(normalizeAiderPath)
+          .filter(
+            (value): value is string =>
+              !!value,
+          ),
+      ),
+    ];
+
+    const editableSet =
+      new Set(editable);
+
+    const readOnly = [
+      ...new Set(
+        input.aiderFiles.readOnly
+          .map(normalizeAiderPath)
+          .filter(
+            (value): value is string =>
+              !!value &&
+              !editableSet.has(value),
+          ),
+      ),
+    ];
+
+    return {
+      editable,
+      readOnly,
+    };
+  }
+
   const context = input.context;
   if (!context) return { editable: [], readOnly: [] };
   const normalizeList = (values: readonly string[]) => values.map(normalizeAiderPath).filter((value): value is string => !!value);
@@ -108,6 +148,144 @@ export function selectAiderFiles(input: CodingWorkerInput): { editable: string[]
   return { editable, readOnly };
 }
 
+function boundedAiderText(
+  value: unknown,
+  maxChars: number,
+) {
+  if (
+    value === undefined ||
+    value === null
+  ) {
+    return "";
+  }
+
+  let text: string;
+
+  if (typeof value === "string") {
+    text = value;
+  } else {
+    try {
+      const encoded = JSON.stringify(value);
+
+      if (typeof encoded !== "string") {
+        return "";
+      }
+
+      text = encoded;
+    } catch {
+      return "";
+    }
+  }
+
+  if (text.length <= maxChars) {
+    return text;
+  }
+
+  return (
+    text.slice(0, maxChars) +
+    "\n[truncated by Koda]"
+  );
+}
+
+
+/**
+ * Aider receives actual repository files separately.
+ *
+ * Never serialize CodingWorkerContext.sourceFiles into the message again:
+ * doing so duplicates the same source once in Koda's prompt and again in
+ * Aider's attached-file context.
+ *
+ * Keep only bounded non-file evidence that is useful for implementation
+ * and repair.
+ */
+function compactAiderContext(
+  context: CodingWorkerInput["context"],
+) {
+  if (!context) return "";
+
+  return [
+    context.localizationSummary
+      ? `Localization summary:\n${boundedAiderText(
+          context.localizationSummary,
+          2_000,
+        )}`
+      : "",
+
+    context.diagnostics
+      ? `Verification diagnostics:\n${boundedAiderText(
+          context.diagnostics,
+          4_000,
+        )}`
+      : "",
+
+    context.previousFailedDiff
+      ? `Previous failed diff:\n${boundedAiderText(
+          context.previousFailedDiff,
+          6_000,
+        )}`
+      : "",
+
+    context.evidence
+      ? `Repository evidence:\n${boundedAiderText(
+          context.evidence,
+          4_000,
+        )}`
+      : "",
+
+    context.repairPacket
+      ? `Repair evidence:\n${boundedAiderText(
+          context.repairPacket,
+          6_000,
+        )}`
+      : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+
+export function buildAiderPrompt(
+  input: Pick<
+    CodingWorkerInput,
+    "task" | "writeScope" | "context"
+  >,
+  files: {
+    editable: readonly string[];
+    readOnly: readonly string[];
+  },
+) {
+  const compactContext =
+    compactAiderContext(input.context);
+
+  return [
+    input.task,
+
+    [
+      "Use the attached repository files as the primary implementation context.",
+      "Implement the complete task with the smallest correct change.",
+      "Do not ask the user to add a file and do not merely explain the change.",
+      "Files marked read-only are evidence, not mutation targets.",
+    ].join(" "),
+
+    `Authorized write paths: ${JSON.stringify(
+      input.writeScope,
+    )}`,
+
+    `Attached editable files: ${JSON.stringify(
+      files.editable,
+    )}`,
+
+    `Attached read-only files: ${JSON.stringify(
+      files.readOnly,
+    )}`,
+
+    compactContext,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+
 async function existingAiderFiles(root: string, selected: ReturnType<typeof selectAiderFiles>) {
   const rootReal = await realpath(root);
   const keep = async (path: string) => {
@@ -126,6 +304,68 @@ async function existingAiderFiles(root: string, selected: ReturnType<typeof sele
     .filter(([, exists]) => exists).map(([path]) => path).filter((path) => !editableSet.has(path));
   return { editable, readOnly };
 }
+
+/**
+ * Estimate the provider input Aider will actually construct.
+ *
+ * Unlike the old estimate, this includes the real attached repository file
+ * sizes rather than only Koda's compiled JSON packet.
+ *
+ * Aider/system framing itself is accounted for separately by
+ * AIDER_PROMPT_OVERHEAD_TOKENS in attemptPolicy.ts.
+ */
+export async function estimateAiderPromptBytes(
+  input: Pick<
+    CodingWorkerInput,
+    "repoPath" | "task" | "writeScope" | "context"
+  >,
+) {
+  const selected =
+    await existingAiderFiles(
+      input.repoPath,
+      selectAiderFiles(input),
+    );
+
+  const attached = [
+    ...selected.editable,
+    ...selected.readOnly,
+  ];
+
+  const attachedBytes = (
+    await Promise.all(
+      attached.map(async (path) => {
+        try {
+          const info = await stat(
+            join(input.repoPath, path),
+          );
+
+          return (
+            info.size +
+            Buffer.byteLength(path) +
+            128
+          );
+        } catch {
+          return 0;
+        }
+      }),
+    )
+  ).reduce(
+    (sum, value) => sum + value,
+    0,
+  );
+
+  return (
+    Buffer.byteLength(
+      buildAiderPrompt(
+        input,
+        selected,
+      ),
+    ) +
+    attachedBytes +
+    1_024
+  );
+}
+
 
 export function aiderOpenRouterModel(model: string) {
   if (!/^[^\s/]+\/[^\s]+$/.test(model)) {
@@ -702,27 +942,10 @@ export class AiderExecutor implements CodingWorker {
 
       await writeFile(
         files.prompt,
-        [
-          input.task,
-
-          [
-            "Use the attached files as the primary implementation context.",
-            "Implement the complete task with the smallest correct change.",
-            "Do not ask the user to add a file and do not merely explain the change.",
-          ].join(" "),
-
-          `Authorized write paths: ${JSON.stringify(
-            input.writeScope,
-          )}`,
-
-          input.context
-            ? `Koda context:\n${JSON.stringify(
-                input.context,
-              )}`
-            : "",
-        ]
-          .filter(Boolean)
-          .join("\n\n"),
+        buildAiderPrompt(
+          input,
+          aiderFiles,
+        ),
       );
 
       await writeFile(

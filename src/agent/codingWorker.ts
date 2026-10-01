@@ -38,13 +38,21 @@ export interface CodingWorkerInput {
   returnOnMutation?: boolean;
   context?: CodingWorkerContext;
   aiderEditFormat?: "diff" | "whole";
+  /**
+   * Context-admission result for Aider.
+   * When present, Aider must attach exactly these already-budgeted files.
+   */
+  aiderFiles?: {
+    editable: string[];
+    readOnly: string[];
+  };
   modelMetadata?: import("../router/pool.js").Metadata;
 }
 
 export interface CodingWorkerResult {
   exitStatus: "completed" | "failed" | "infra_failure";
   model: string;
-  engine: "aider" | "direct-edit";
+  engine: "aider" | "direct-edit" | "agentic";
   engineVersion: string;
   trajectoryPath?: string;
   changedPaths: string[];

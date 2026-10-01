@@ -218,15 +218,27 @@ class CallGuard:
             )
         )
 
-        # maxTokens is the per-attempt token allowance.
-        # Aider's input context must be allowed to consume that
-        # allowance without making the first provider call impossible.
-        # The actual USD budget remains enforced below.
-        remaining_tokens = r["maxTokens"]
+        # maxTokens is Koda's TOTAL provider-token allowance for
+        # this attempt, not a completion-only allowance.
+        #
+        # Count:
+        #   previous provider usage
+        # + this provider prompt
+        # + this provider completion
+        #
+        # state["tokens"] contains usage from previous provider calls.
+        remaining_tokens = (
+            r["maxTokens"]
+            - state["tokens"]
+            - prompt
+        )
 
         output = min(
             r["maxOutputTokens"],
-            remaining_tokens,
+            max(
+                0,
+                remaining_tokens,
+            ),
         )
 
         requested_max_tokens = (

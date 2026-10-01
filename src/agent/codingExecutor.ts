@@ -51,7 +51,10 @@ import type { StableImplementationHandoff } from "./stable.js";
 import type { RepairPacket } from "./repairPacket.js";
 import type { CodingWorker } from "./codingWorker.js";
 import type { CodingWorkerContext } from "./codingWorker.js";
-import { AiderExecutor, preferredAiderFormat } from "./aiderExecutor.js";
+import {
+  AiderExecutor,
+  preferredAiderFormat,
+} from "./aiderExecutor.js";
 import { WriteScope } from "../repo/writeScope.js";
 import { AttemptCheckpoint } from "./attemptCheckpoint.js";
 import { currentDiff } from "./tools.js";
@@ -61,7 +64,13 @@ import { tierRank } from "../router/pool.js";
 import { testRequirementAlreadyCovered } from "./mutationInvariant.js";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { attemptLimitPolicy } from "./attemptPolicy.js";
+import {
+  attemptLimitPolicy,
+  usesDirectEditEngine,
+} from "./attemptPolicy.js";
+import { DirectEditWorker } from "./directEditWorker.js";
+import { AgenticCodingWorker } from "./agenticCodingWorker.js";
+import { planCodingHandoff } from "./handoffPlanner.js";
 
 export interface CodingImplementationOptions {
   initialRole?: Role;
@@ -766,9 +775,8 @@ export async function implement(
     return nextPlannedModel();
   };
 
-  const worker =
-    options.codingWorker ?? new AiderExecutor(gateway.budget, gateway.logger);
-  const workerEngine = "aider";
+  const injectedWorker =
+    options.codingWorker;
   let diagnostics = options.stableRepair?.failedChecks
     .map((check) => `${check.command}\n${check.stderr || check.stdout}`)
     .join("\n");
@@ -853,13 +861,94 @@ export async function implement(
       (!pool || adaptiveTier
         ? { inputPrice: gateway.config.maxInputPrice, outputPrice: gateway.config.maxOutputPrice }
         : (await pool.catalog?.get?.())?.get(model));
+    const handoff =
+      injectedWorker
+        ? undefined
+        : await planCodingHandoff({
+            repoPath: path,
+            task: workerTask,
+            writeScope: [...writeScope.paths],
+            context: workerContext,
+            attemptTokenCapacity: Math.min(
+              gateway.budget.remainingTokens(),
+              gateway.config.stageMaxTokens,
+            ),
+            modelContextTokens:
+              attemptMetadata?.contextLength,
+            maxOutputTokens:
+              gateway.config.maxOutputTokens,
+            costCapacityUsd: Math.min(
+              remaining,
+              gateway.config.stageMaxUsd,
+            ),
+            promptPricePerMillion:
+              attemptMetadata?.inputPrice,
+            completionPricePerMillion:
+              attemptMetadata?.outputPrice,
+            directEditEligible:
+              subtask.id !== "stable" &&
+              usesDirectEditEngine(fingerprint) &&
+              writeScope.paths.length === 1 &&
+              writeScope.paths[0] !== ".",
+          });
+
+    const worker: CodingWorker =
+      injectedWorker ??
+      (handoff!.mode === "direct"
+        ? new DirectEditWorker(
+            gateway.budget,
+            gateway.logger,
+          )
+        : handoff!.mode === "agentic"
+          ? new AgenticCodingWorker(
+              gateway.budget,
+              gateway.logger,
+            )
+          : new AiderExecutor(
+              gateway.budget,
+              gateway.logger,
+            ));
+
+    const workerMode =
+      injectedWorker
+        ? "custom"
+        : handoff!.mode;
+
+    const handoffPromptBytes =
+      injectedWorker
+        ? Buffer.byteLength(
+            JSON.stringify({
+              task: workerTask,
+              context: workerContext,
+            }),
+          ) + 1_024
+        : handoff!.estimatedPromptBytes;
+
+    gateway.logger.log(
+      "coding_handoff",
+      {
+        subtaskId: subtask.id,
+        mode: workerMode,
+        reason:
+          handoff?.reason ??
+          "injected worker",
+        estimated_prompt_bytes:
+          handoffPromptBytes,
+        editable_files:
+          handoff?.mode === "aider"
+            ? handoff.aiderFiles?.editable ?? []
+            : [],
+        readonly_files:
+          handoff?.mode === "aider"
+            ? handoff.aiderFiles?.readOnly ?? []
+            : [],
+      },
+    );
+
     const limits = attemptLimitPolicy({
       fingerprint,
       effort,
-      promptBytes:
-        Buffer.byteLength(
-          JSON.stringify({ task: workerTask, context: workerContext }),
-        ) + 1024,
+      promptBytes: handoffPromptBytes,
       maxIterations: gateway.config.maxIterations,
       maxOutputTokens: gateway.config.maxOutputTokens,
       learnedP90Tokens: finite(learnedTokenBound)
@@ -888,10 +977,7 @@ export async function implement(
       aiderWorker: worker instanceof AiderExecutor,
       modelContextTokens: attemptMetadata?.contextLength,
       directEditEligible:
-        !(worker instanceof AiderExecutor) &&
-        subtask.id !== "stable" &&
-        writeScope.paths.length === 1 &&
-        writeScope.paths[0] !== ".",
+        worker instanceof DirectEditWorker,
     });
     if (!limits.viable) {
       const skippedModel = model;
@@ -949,7 +1035,7 @@ export async function implement(
     const attemptTier = adaptiveTier;
     gateway.logger.log("coding_worker_start", {
       subtaskId: subtask.id,
-      worker_engine: workerEngine,
+      worker_engine: workerMode,
       model,
       worktree: path,
       assigned_write_scope: writeScope.paths,
@@ -958,6 +1044,8 @@ export async function implement(
       configured_token_limit: attemptTokenBound,
       attempt_step_limit: attemptSteps,
       attempt_timeout_ms: attemptTimeoutMs,
+      forecast_provider_prompt_bytes:
+        handoffPromptBytes,
       context_bytes_initial:
         attempt === 0 ? Buffer.byteLength(JSON.stringify(workerContext)) : 0,
       context_bytes_repeated:
@@ -1002,6 +1090,10 @@ export async function implement(
         writeScope.paths.length === 1 &&
         writeScope.paths[0] === ".",
       context: workerContext,
+      aiderFiles:
+        handoff?.mode === "aider"
+          ? handoff.aiderFiles
+          : undefined,
       aiderEditFormat: preferredAiderFormat(pool?.history?.readOperations?.() ?? [], model),
     });
     const candidateReadyHandoff =
@@ -1059,7 +1151,9 @@ export async function implement(
           : undefined,
       });
     } else if (
-      result.engine === "aider" && pool
+      (result.engine === "aider" ||
+        result.engine === "agentic") &&
+      pool
     ) {
       const operationalMessage = [result.terminationReason, result.fatalError]
         .filter(Boolean).join(": ");
