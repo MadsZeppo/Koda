@@ -59,6 +59,12 @@ export const toolDefinitions: ChatCompletionTool[] = [
     },
     ["path"],
   ],
+  [
+    "file_outline",
+    "Return a cheap line-numbered outline of declarations and symbols in one repository file",
+    { path: { type: "string" } },
+    ["path"],
+  ],
   ["list_files", "List files from the bounded workspace inventory", {}, []],
   [
     "write_file",
@@ -162,6 +168,7 @@ export class AgentTools {
   readonly commandEvidence: unknown[] = [];
   readonly progressEvidence: string[] = [];
   readonly missingReadAttempts = new Map<string, number>();
+  private readonly completedReads = new Set<string>();
   constructor(
     readonly root: string,
     readonly readOnly: boolean,
@@ -244,11 +251,34 @@ export class AgentTools {
         const lines = (await readFile(p, "utf8")).split("\n");
         const start = Math.max(0, (args.startLine ?? 1) - 1);
         const end = Math.min(args.endLine ?? start + 250, start + 400);
+        const readKey = `${args.path}:${start + 1}:${end}`;
+        if (this.completedReads.has(readKey)) {
+          navigationUseful = false;
+          result = `Already read ${args.path} lines ${start + 1}-${end}; use file_outline, search_code, or request a genuinely new range.`;
+          progressKey = `read_file:${readKey}`;
+          break;
+        }
+        this.completedReads.add(readKey);
         result = lines
           .slice(start, end)
           .map((l, i) => `${start + i + 1}: ${l}`)
           .join("\n");
         progressKey = `read_file:${args.path}:${start + 1}:${end}`;
+        break;
+      }
+      case "file_outline": {
+        const p = await safePath(this.root, args.path);
+        const info = await lstat(p);
+        if (!info.isFile() || info.size > 1024 * 1024)
+          throw Error("Outline requires regular file under 1MB");
+        const lines = (await readFile(p, "utf8")).split("\n");
+        const declarations = lines.flatMap((line, index) => {
+          const trimmed = line.trim();
+          const declaration = /^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|class|interface|type|enum|const|let|var|def|class|func|fn|struct|trait|impl|public\s+(?:class|interface|record|enum))\b/.test(trimmed);
+          return declaration ? [`${index + 1}: ${trimmed.slice(0, 240)}`] : [];
+        }).slice(0, 160);
+        result = declarations.length ? declarations.join("\n") : "No declaration outline found";
+        progressKey = `file_outline:${args.path}:${createHash("sha256").update(String(result)).digest("hex")}`;
         break;
       }
       case "list_files":
@@ -510,7 +540,7 @@ export class AgentTools {
     }
     const text = typeof result === "string" ? result : JSON.stringify(result);
     const nonempty = text.trim() && text !== "No files";
-    if (name === "read_file" && nonempty && navigationUseful)
+    if ((name === "read_file" || name === "file_outline") && nonempty && navigationUseful)
       this.progressEvidence.push(progressKey!);
     else if (name === "search_code" && searchMatched)
       this.progressEvidence.push(

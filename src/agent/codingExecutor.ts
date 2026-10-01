@@ -17,8 +17,12 @@ import type { WorkerContext } from "../context/compiler.js";
 import {
   compileContext,
   isSourcePath,
+  isTestPath,
+  resolveImports,
+  taskTerms,
   workerReadPaths,
 } from "../context/compiler.js";
+import { requestsTestMutation } from "../router/executionStrategy.js";
 import { extractFeatures } from "../router/features.js";
 import {
   preserveCanonicalTaskEvidence,
@@ -63,7 +67,7 @@ import { taskBucket } from "../router/features.js";
 import { tierRank } from "../router/pool.js";
 import { testRequirementAlreadyCovered } from "./mutationInvariant.js";
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 import {
   attemptLimitPolicy,
   usesDirectEditEngine,
@@ -71,6 +75,14 @@ import {
 import { DirectEditWorker } from "./directEditWorker.js";
 import { AgenticCodingWorker } from "./agenticCodingWorker.js";
 import { planCodingHandoff } from "./handoffPlanner.js";
+import {
+  completionReviewMessages,
+  missingRequirementDiagnostics,
+  parseCompletionReview,
+  taskRequirementChecklist,
+  type CompletionReview,
+  type CompletionReviewInput,
+} from "./completionReview.js";
 
 export interface CodingImplementationOptions {
   initialRole?: Role;
@@ -103,6 +115,8 @@ export interface CodingImplementationOptions {
   executionPlan?: FrozenExecutionPlan;
   /** Tests inject a deterministic worker; production never supplies this. */
   codingWorker?: CodingWorker;
+  /** Tests and embedders may provide an isolated semantic completion reviewer. */
+  completionReviewer?: (input: CompletionReviewInput) => Promise<CompletionReview>;
 }
 
 const infrastructureOnly = (result: VerificationResult) =>
@@ -144,6 +158,7 @@ export function codingContextPacket(input: {
   previousFailedDiff?: string;
   localizationSummary?: string;
   repairPacket?: RepairPacket;
+  completionRepair?: CodingWorkerContext["completionRepair"];
   repair: boolean;
 }): CodingWorkerContext {
   const paths = new Set([
@@ -191,7 +206,88 @@ export function codingContextPacket(input: {
     previousFailedDiff: input.previousFailedDiff,
     evidence: input.repair ? undefined : compactEvidence,
     repairPacket: input.repair ? undefined : input.repairPacket,
+    completionRepair: input.completionRepair,
   };
+}
+
+export function completionRepairWriteScope(input: {
+  currentWriteScope: readonly string[];
+  authorizedReadPaths: readonly string[];
+  repositoryPaths: readonly string[];
+  reviewerDiagnostics: string;
+  testsAuthorized: boolean;
+}) {
+  const repository = new Set(input.repositoryPaths);
+  const additions = input.authorizedReadPaths.filter((path) =>
+    repository.has(path) &&
+    input.reviewerDiagnostics.includes(path) &&
+    (input.testsAuthorized || !isTestPath(path)));
+  return [...new Set([...input.currentWriteScope, ...additions])];
+}
+
+export async function evidenceBasedCompletionRepairScope(input: {
+  root: string;
+  task: string;
+  currentWriteScope: readonly string[];
+  authorizedReadPaths: readonly string[];
+  repositoryPaths: readonly string[];
+  reviewerDiagnostics: string;
+}) {
+  const testsAuthorized = requestsTestMutation(input.task);
+  const expanded = completionRepairWriteScope({ ...input, testsAuthorized });
+  if (!testsAuthorized || expanded.some(isTestPath) ||
+      !/\b(?:test|tests|spec|specs|coverage)\b/i.test(input.reviewerDiagnostics))
+    return expanded;
+  const known = new Set(input.repositoryPaths);
+  const sources = new Set([
+    ...expanded,
+    ...input.authorizedReadPaths,
+  ].filter((path) => known.has(path) && isSourcePath(path) && !isTestPath(path)));
+  const terms = [...new Set([
+    ...taskTerms(input.task),
+    ...taskTerms(input.reviewerDiagnostics),
+  ])];
+  const candidates: { path: string; score: number }[] = [];
+  for (const path of input.repositoryPaths.filter(isTestPath).slice(0, 160)) {
+    let text = "";
+    try {
+      text = (await readFile(join(input.root, path), "utf8")).slice(0, 32_000);
+    } catch { continue; }
+    const name = posix.basename(path).toLowerCase();
+    const imports = resolveImports(path, text, known);
+    const score = (input.authorizedReadPaths.includes(path) ? 5 : 0) +
+      [...sources].reduce((total, source) => {
+      const stem = posix.basename(source).replace(/\.[^.]+$/, "").toLowerCase();
+      return total + (imports.includes(source) ? 6 : 0) +
+        (name.split(/[._-]/).includes(stem) ? 3 : 0);
+    }, 0) + terms.filter((term) =>
+      term.length >= 4 && (name.includes(term) || text.toLowerCase().includes(term))).length;
+    if (score > 0) candidates.push({ path, score });
+  }
+  candidates.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
+  if (candidates[0] && candidates[0].score >= 3 &&
+      (!candidates[1] || candidates[0].score > candidates[1].score))
+    return [...new Set([...expanded, candidates[0].path])];
+
+  // Creation is allowed only when one source target and a dominant existing
+  // repository test convention establish an unambiguous path.
+  const source = [...sources].filter((path) => expanded.includes(path));
+  const existingTests = input.repositoryPaths.filter(isTestPath);
+  if (source.length !== 1 || existingTests.length < 2) return expanded;
+  const conventions = new Map<string, number>();
+  for (const test of existingTests) {
+    const directory = posix.dirname(test);
+    const match = posix.basename(test).match(/(\.(?:test|spec)\.[cm]?[jt]sx?|_test\.py)$/i);
+    if (!match) continue;
+    const key = `${directory}\0${match[1]}`;
+    conventions.set(key, (conventions.get(key) ?? 0) + 1);
+  }
+  const ordered = [...conventions].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  if (!ordered[0] || ordered[0][1] < 2 || (ordered[1]?.[1] ?? 0) === ordered[0][1])
+    return expanded;
+  const [directory, suffix] = ordered[0][0].split("\0");
+  const stem = posix.basename(source[0]!).replace(/\.[^.]+$/, "");
+  return [...new Set([...expanded, posix.join(directory!, `${stem}${suffix}`)])];
 }
 
 /** Sole production coding executor. Koda routes/verifies; Aider mutates one isolated attempt. */
@@ -230,6 +326,16 @@ export async function implement(
     suggestedApproach: "Inspect, implement, and verify",
     evidence: [],
   };
+  const requirements = taskRequirementChecklist({
+    task,
+    objective: subtask.objective,
+    integrationContract: subtask.integrationContract,
+    acceptanceCriteria: plan.acceptanceCriteria,
+  });
+  gateway.logger.log("task_requirement_checklist", {
+    subtaskId: subtask.id,
+    requirements,
+  });
   gateway.logger.log("worker_context", {
     subtaskId: subtask.id,
     context_files: context.files.map((file) => file.path),
@@ -784,6 +890,9 @@ export async function implement(
   let tinyNoMutationAttempts = 0;
   let codingAttempts = 0;
   let operationalRetries = 0;
+  let completionContinuations = 0;
+  let completionRepair: CodingWorkerContext["completionRepair"];
+  const maxCompletionContinuations = 2;
   const maxOperationalRetries = 2;
   const resumedDiscoveryEvidence = new Set<string>();
   const configuredPlanAttempts = specialistPlan
@@ -850,6 +959,7 @@ export async function implement(
       previousFailedDiff,
       localizationSummary: options.stableHandoff?.requiredChange,
       repairPacket: options.repairPacket,
+      completionRepair,
       // Operational/no-mutation recovery starts a different worker and still
       // needs the grounded packet. Only a real failed candidate diff/check is
       // a compact repair handoff.
@@ -1165,6 +1275,7 @@ export async function implement(
       const operationalMessage = [result.terminationReason, result.fatalError]
         .filter(Boolean).join(": ");
       const operationalFailure = result.exitStatus === "infra_failure" ||
+        result.exitStatus === "failed" ||
         protocolIncompatibility(operationalMessage) ||
         result.limitKind === "timeout" || result.limitKind === "provider_limit";
       pool.history?.recordOperation({
@@ -1436,6 +1547,8 @@ export async function implement(
         !candidateMutation &&
         (result.limitKind === "token_limit" ||
           result.limitKind === "token_preflight");
+      const resumableDiscoveryLimit =
+        boundedDiscoveryLimit || discoveryTokenLimit;
       const failureMode =
           result.limitKind === "timeout" || result.limitKind === "provider_limit"
             ? "operational"
@@ -1453,9 +1566,9 @@ export async function implement(
               : "other";
       const operational = failureMode === "operational";
       if (operational) operationalRetries++;
-      else if (!boundedDiscoveryLimit) codingAttempts++;
+      else if (!resumableDiscoveryLimit) codingAttempts++;
       const moved =
-        (boundedDiscoveryLimit
+        (resumableDiscoveryLimit
           ? true
           : operational
           ? operationalRetries <= maxOperationalRetries
@@ -1486,7 +1599,7 @@ export async function implement(
         moved,
       });
       if (moved) {
-        if (operational) attempt--;
+        if (operational || resumableDiscoveryLimit) attempt--;
         continue;
       }
       gateway.logger.log("execution_plan_exhausted", {
@@ -1576,45 +1689,6 @@ export async function implement(
       });
       return { verification: verificationResult([]), role, evidence };
     }
-    if (result.engine !== "aider" && options.tinyDirect && options.finalVerificationOnly) {
-      gateway.logger.log("ready_for_final_verification", {
-        subtaskId: subtask.id,
-        diffBytes: Buffer.byteLength(diff),
-        reason: "tiny_mutation_complete",
-      });
-      if (pool) {
-        if (attemptTier && attemptTier !== "frontier")
-          pool.recordServed(
-            features,
-            subtask.id,
-            eventStart,
-            "VERIFIED_SUCCESS",
-            attempt > 0,
-            undefined,
-            fingerprint,
-          );
-        else
-          pool.record(
-            selected?.model ?? ({ id: model } as any),
-            features,
-            subtask.id,
-            eventStart,
-            "VERIFIED_SUCCESS",
-            attempt > 0,
-            undefined,
-            fingerprint,
-          );
-      }
-      gateway.logger.log("model_attempt", {
-        subtaskId: subtask.id,
-        modelRequested: model,
-        modelServed: result.model,
-        verification: "VERIFIED_SUCCESS",
-        escalated: attempt > 0,
-        reason: "tiny_mutation_complete",
-      });
-      return { verification: verificationResult([]), role, evidence };
-    }
     let postCommands = commands;
     if (tinyDocs)
       postCommands = [
@@ -1664,37 +1738,210 @@ export async function implement(
       candidateVerification,
       result.changedPaths,
     );
+    // Passing repository checks establish correctness only for a worker that
+    // actually completed its execution contract. A killed/failed worker may
+    // leave a useful partial mutation, but that partial candidate cannot be
+    // promoted to VERIFIED_SUCCESS merely because existing checks are green.
+    const attemptVerification =
+      result.exitStatus === "completed"
+        ? relative
+        : {
+            ...relative,
+            status: "NOT_FULLY_VERIFIED" as const,
+          };
     gateway.logger.log(
       "aider_attempt_verification",
       {
       subtaskId: subtask.id,
       worker_engine: result.engine,
       model,
-      outcome: relative.status,
+      outcome: attemptVerification.status,
       changed_paths: result.changedPaths,
       trajectory_path: result.trajectoryPath,
       edit_format: result.editFormat ?? null,
     });
-    recordAiderFormats(relative.status);
+    recordAiderFormats(attemptVerification.status);
     const candidateAccepted =
-      relative.status === "VERIFIED_SUCCESS" ||
-      relative.status === "CANDIDATE_NEUTRAL" ||
-      relative.status === "CANDIDATE_IMPROVEMENT";
+      attemptVerification.status === "VERIFIED_SUCCESS" ||
+      attemptVerification.status === "CANDIDATE_NEUTRAL" ||
+      attemptVerification.status === "CANDIDATE_IMPROVEMENT";
 
     const finalVerificationHandoff =
+      result.exitStatus === "completed" &&
       options.finalVerificationOnly &&
       (
         candidateVerification.checks.length === 0 ||
         candidateVerification.status === "VERIFIED_SUCCESS"
       );
 
+    const completionReviewInput: CompletionReviewInput = {
+      task,
+      requirements,
+      diff,
+      changedPaths: result.changedPaths,
+      changedSymbols: [...new Set([
+        ...evidence.symbols.filter((symbol) => diff.includes(symbol)),
+        ...diff.split("\n").flatMap((line) => {
+          const match = line.match(/^@@[^@]*@@\s*(.+)$/);
+          return match?.[1]?.trim() ? [match[1].trim()] : [];
+        }),
+      ])].slice(0, 24),
+      toolEvidence: result.discoveryEvidence ?? result.stdout,
+      workerExitStatus: result.exitStatus,
+      workerTerminationReason: result.terminationReason,
+      verification: attemptVerification,
+    };
+    let completionReview: CompletionReview | undefined;
     if (
+      result.exitStatus === "completed" &&
+      (candidateAccepted || finalVerificationHandoff) &&
+      requirements.length
+    ) {
+      try {
+        if (options.completionReviewer) {
+          completionReview = await options.completionReviewer(completionReviewInput);
+        } else if (options.codingWorker) {
+          // Deterministic injected workers cannot dispatch a real provider
+          // review. Their existing contract remains independently gated by
+          // worker completion and required focused verification.
+          completionReview = {
+            passed: true,
+            requirements: requirements.map((requirement) => ({
+              id: requirement.id,
+              satisfied: true,
+              evidence: "Injected worker completed and focused verification passed",
+            })),
+            summary: "Injected completion contract passed",
+          };
+        } else {
+          const reviewMessage = await gateway.call(
+            model!,
+            completionReviewMessages(completionReviewInput),
+            subtask.id,
+            "completion-review",
+            completionContinuations,
+            undefined,
+            {
+              maxOutputTokens: Math.min(1_000, gateway.config.maxOutputTokens),
+              ...(model === PARETO_CODE_MODEL && adaptiveTier && adaptiveTier !== "frontier"
+                ? { codingRoute: {
+                    tier: adaptiveTier,
+                    reason: "independent completion review",
+                    attempt: completionContinuations,
+                  } }
+                : {}),
+            },
+          );
+          completionReview = parseCompletionReview(
+            String(reviewMessage.content ?? ""),
+            requirements,
+          );
+        }
+      } catch (error) {
+        gateway.logger.log("completion_review_failure", {
+          subtaskId: subtask.id,
+          classification: "OPERATIONAL_FAILURE",
+          error: String(error),
+        });
+        return { verification: verificationResult([]), role, evidence };
+      }
+      gateway.logger.log("completion_review", {
+        subtaskId: subtask.id,
+        passed: completionReview.passed,
+        requirements: completionReview.requirements,
+        summary: completionReview.summary,
+      });
+      if (!completionReview.passed) {
+        const missing = missingRequirementDiagnostics(requirements, completionReview);
+        const unresolvedRequirementIds = completionReview.requirements
+          .filter((item) => !item.satisfied)
+          .map((item) => item.id);
+        codingAttempts++;
+        const reviewedModel = model!;
+        const moved = await nextPlannedModel({
+          failureMode: "verification_failure",
+          failurePhase: "COMPLETION_REVIEW",
+          mutationObserved: true,
+          inputTokens: result.inputTokens,
+          outputTokens: result.outputTokens,
+          wallClockMs: result.wallClockMs,
+          terminationReason: "completion_review_rejected",
+          codingAttempts,
+        });
+        if (completionContinuations < maxCompletionContinuations) {
+          completionContinuations++;
+          diagnostics = [
+            diagnostics,
+            "Independent completion review found unresolved requirements. Continue in the current worktree and preserve completed work:\n" + missing,
+          ].filter(Boolean).join("\n\n");
+          previousFailedDiff = diff;
+          completionRepair = {
+            unresolvedRequirementIds,
+            mutationRequiredBeforeDiscovery: true,
+          };
+          const repairWritePaths = await evidenceBasedCompletionRepairScope({
+            root: path,
+            task,
+            currentWriteScope: writeScope.paths,
+            authorizedReadPaths: subtask.likelyReadPaths,
+            repositoryPaths: profile.files,
+            reviewerDiagnostics: missing,
+          });
+          if (repairWritePaths.length > writeScope.paths.length) {
+            const added = repairWritePaths.filter((path) =>
+              !writeScope.paths.includes(path));
+            writeScope = new WriteScope(repairWritePaths, gateway.logger, subtask.id);
+            gateway.logger.log("completion_repair_scope_expanded", {
+              subtaskId: subtask.id,
+              added_paths: added,
+              write_scope: writeScope.paths,
+            });
+          }
+          context = await compileContext(
+            path,
+            `${subtask.objective}\n\n${missing}`,
+            [...new Set([
+              ...writeScope.paths,
+              ...context.repoMap,
+              ...context.files.map((file) => file.path),
+            ])],
+            profile,
+            gateway.config.context,
+            true,
+          );
+          gateway.logger.log("completion_continuation", {
+            subtaskId: subtask.id,
+            continuation: completionContinuations,
+            from_model: reviewedModel,
+            to_model: moved ? model : reviewedModel,
+            escalated: moved,
+            unresolved: unresolvedRequirementIds,
+            write_scope: writeScope.paths,
+          });
+          attempt--;
+          continue;
+        }
+        gateway.logger.log("completion_review_exhausted", {
+          subtaskId: subtask.id,
+          unresolved: completionReview.requirements
+            .filter((item) => !item.satisfied)
+            .map((item) => item.id),
+        });
+        return { verification: verificationResult([]), role, evidence };
+      }
+      completionRepair = undefined;
+    }
+
+    if (
+      completionReview?.passed === true && (
       candidateAccepted ||
       finalVerificationHandoff ||
-      advisoryInfrastructureOnly(relative) ||
-      (options.tinyDirect &&
+      (result.exitStatus === "completed" &&
+        advisoryInfrastructureOnly(attemptVerification)) ||
+      (result.exitStatus === "completed" &&
+        options.tinyDirect &&
         options.finalVerificationOnly &&
-        candidateVerification.status !== "FAILED")
+        candidateVerification.status !== "FAILED"))
     ) {
       if (pool) {
         if (attemptTier && attemptTier !== "frontier")
@@ -1702,7 +1949,7 @@ export async function implement(
             features,
             subtask.id,
             eventStart,
-            relative.status,
+            attemptVerification.status,
             attempt > 0,
             undefined,
             fingerprint,
@@ -1713,7 +1960,7 @@ export async function implement(
             features,
             subtask.id,
             eventStart,
-            relative.status,
+            attemptVerification.status,
             attempt > 0,
             undefined,
             fingerprint,
@@ -1724,11 +1971,11 @@ export async function implement(
           subtaskId: subtask.id,
           modelRequested: model,
           modelServed: result.model,
-          verification: relative.status,
+          verification: attemptVerification.status,
           escalated: attempt > 0,
-          reason: relative.status === "CANDIDATE_NEUTRAL"
+          reason: attemptVerification.status === "CANDIDATE_NEUTRAL"
             ? "baseline_equivalent_no_regression"
-            : relative.status === "CANDIDATE_IMPROVEMENT"
+            : attemptVerification.status === "CANDIDATE_IMPROVEMENT"
               ? "baseline_failures_reduced"
             : options.tinyDirect
             ? "tiny_mutation_complete"
@@ -1746,13 +1993,33 @@ export async function implement(
           ? options.stableRepair
             ? candidateVerification
             : verificationResult([])
-          : relative,
+          : attemptVerification,
         role,
         evidence,
       };
     }
-    if (infrastructureOnly(relative))
-      return { verification: relative, role, evidence };
+    if (
+      result.exitStatus === "failed" &&
+      candidateMutation &&
+      operationalRetries < maxOperationalRetries
+    ) {
+      operationalRetries++;
+      diagnostics = [
+        diagnostics,
+        `Continue from the preserved partial mutation after ${result.terminationReason ?? "an operational interruption"}. Complete the remaining task requirements; do not restart finished edits.`,
+      ].filter(Boolean).join("\n\n");
+      gateway.logger.log("partial_candidate_continuation", {
+        subtaskId: subtask.id,
+        model,
+        changed_paths: result.changedPaths,
+        termination_reason: result.terminationReason ?? null,
+        continuation: operationalRetries,
+      });
+      attempt--;
+      continue;
+    }
+    if (infrastructureOnly(attemptVerification))
+      return { verification: attemptVerification, role, evidence };
     previousFailedDiff = diff;
     diagnostics = relative.checks
       .filter((check) => check.outcome === "CHECK_FAIL")
@@ -1787,7 +2054,17 @@ export async function implement(
       writeScope.paths.includes(".")
         ? [...new Set(result.changedPaths)]
         : [];
-    await checkpoint.restore(path, writeScope);
+    if (result.exitStatus === "completed") {
+      await checkpoint.restore(path, writeScope);
+    } else {
+      gateway.logger.log("incomplete_candidate_preserved", {
+        subtaskId: subtask.id,
+        model,
+        exit_status: result.exitStatus,
+        termination_reason: result.terminationReason ?? null,
+        changed_paths: result.changedPaths,
+      });
+    }
     if (discoveredRepairPaths.length) {
       writeScope = new WriteScope(
         discoveredRepairPaths,
@@ -1876,7 +2153,8 @@ export async function implement(
         : "candidate_not_verified",
       moved,
     });
-    if (!moved) return { verification: relative, role, evidence };
+    if (!moved)
+      return { verification: attemptVerification, role, evidence };
   }
   gateway.logger.log("execution_plan_exhausted", {
     subtaskId: subtask.id,

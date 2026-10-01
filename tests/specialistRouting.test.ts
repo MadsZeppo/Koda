@@ -8,7 +8,11 @@ import { modelSchema, routingSchema } from "../src/router/pool.js";
 import { Catalog } from "../src/openrouter/catalog.js";
 import { CapabilityRegistry } from "../src/router/capabilityRegistry.js";
 import { config } from "../src/config.js";
-import { PoolRouter } from "../src/router/modelRouter.js";
+import {
+  PoolRouter,
+  selectQualitySafeJointPlan,
+  zeroEligibleCodingFallback,
+} from "../src/router/modelRouter.js";
 import { Gateway } from "../src/openrouter/client.js";
 import { Budget } from "../src/openrouter/usage.js";
 import { Logger } from "../src/telemetry/logger.js";
@@ -109,6 +113,91 @@ const route = (
   operations: OperationalCall[] = [],
 ) =>
   optimizeSpecialists(models, fp, features, history, settings, 10, operations);
+
+test("zero-eligible fallback softens latency and quality filters but preserves compatibility and budget", () => {
+  const s = scenario("Implement a coupled change and verify it", ["src/Dashboard.tsx"], ["pnpm test"]);
+  const estimates = route(s.fingerprint, s.features).considered;
+  assert.ok(estimates.length >= 2);
+  const affordable = {
+    ...estimates[0]!,
+    rejected: "quality parity",
+    rejection: "quality parity",
+    hardRejection: undefined,
+    reservationCost: 0.02,
+    quality: 0.82,
+    conservativeQuality: 0.78,
+  };
+  const slowStronger = {
+    ...estimates[1]!,
+    rejected: "predicted model latency exceeds implementation request deadline",
+    rejection: "predicted model latency exceeds implementation request deadline",
+    hardRejection: "predicted model latency exceeds implementation request deadline",
+    reservationCost: 0.03,
+    quality: 0.90,
+    conservativeQuality: 0.84,
+    deadlineFeasible: false,
+    latencyP90Ms: 120_000,
+  };
+  const unavailable = {
+    ...slowStronger,
+    model: { ...slowStronger.model, id: "unavailable" },
+    metadata: { ...slowStronger.metadata, available: false },
+    hardRejection: "unavailable",
+  };
+  const overBudget = {
+    ...slowStronger,
+    model: { ...slowStronger.model, id: "over-budget" },
+    reservationCost: 2,
+    hardRejection: "completion budget",
+  };
+  const selected = zeroEligibleCodingFallback(
+    [affordable, slowStronger, unavailable, overBudget],
+    0.1,
+    2,
+  );
+  assert.ok(selected.length >= 1);
+  assert.equal(selected[0]!.model.id, affordable.model.id);
+  assert.equal(selected[1]!.model.id, slowStronger.model.id,
+    "a stronger bounded recovery remains available after first-attempt rejection");
+  assert.ok(selected.some((candidate) => candidate.model.id === slowStronger.model.id),
+    "predicted latency must rank rather than eliminate a usable model");
+  assert.ok(selected.every((candidate) => candidate.metadata.available !== false));
+  assert.ok(selected.every((candidate) => candidate.reservationCost <= 0.1));
+  assert.ok(selected.every((candidate) => candidate.hardRejection === undefined));
+});
+
+test("zero-eligible fallback remains bounded and returns no model when every candidate is technically invalid", () => {
+  const s = scenario("Implement a change", ["src/Dashboard.tsx"]);
+  const estimate = route(s.fingerprint, s.features).considered[0]!;
+  const invalid = ["unavailable", "context limit", "batch endpoint unsupported for interactive worker"]
+    .map((reason, index) => ({
+      ...estimate,
+      model: { ...estimate.model, id: `invalid-${index}` },
+      rejected: reason,
+      rejection: reason,
+      hardRejection: reason,
+      reservationCost: 0.001,
+    }));
+  assert.deepEqual(zeroEligibleCodingFallback(invalid, 1, 2), []);
+  assert.deepEqual(zeroEligibleCodingFallback([{ ...estimate, reservationCost: 2 }], 1, 2), []);
+});
+
+test("joint routing can execute a finite zero-eligible fallback plan", () => {
+  const fallbackPlan = {
+    initialModel: "fallback",
+    conservativeQuality: 0.78,
+    allowedQualityRegret: 0.2,
+    optimizerScore: 0.01,
+    expectedLatencyMs: 20_000,
+    expectedCostPerVerifiedSolve: 0.02,
+    evaluatedPlans: [{ conservativeFinalSuccess: Number.NaN, hardRejection: "quality" }],
+  } as any;
+  const selected = selectQualitySafeJointPlan([{
+    executionStrategy: "stable" as const,
+    plan: fallbackPlan,
+  }]);
+  assert.equal(selected?.plan.initialModel, "fallback");
+});
 const observed = (
   model: string,
   fp: TaskFingerprint,

@@ -1464,17 +1464,20 @@ export class AiderExecutor implements CodingWorker {
         }
 
         /**
-         * Any actual mutation is handed back to Koda verification,
-         * regardless of Aider's exit code.
-         *
-         * Aider output is never considered proof of correctness.
+         * Any mutation is handed back to Koda, but a non-zero Aider exit is
+         * still an incomplete attempt. The orchestrator may preserve and
+         * recover that candidate; it must not mistake it for completed work.
          */
         if (
           changedPaths.length
         ) {
           return await finish(
-            "completed",
-            "candidate_ready_for_verification",
+            result.exitCode === 0
+              ? "completed"
+              : "failed",
+            result.exitCode === 0
+              ? "candidate_ready_for_verification"
+              : failure ?? "aider_execution_failure",
             changedPaths,
             actualFormat,
           );
@@ -1551,7 +1554,7 @@ export class AiderExecutor implements CodingWorker {
 
       return await finish(
         changedPaths.length
-          ? "completed"
+          ? "failed"
           : "infra_failure",
 
         message.includes(

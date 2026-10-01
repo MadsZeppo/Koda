@@ -37,6 +37,7 @@ import { bestExecutablePlanner } from "./planner/routing.js";
 import { schedule } from "./orchestrator/scheduler.js";
 import { inferRepositoryDependencies } from "./orchestrator/dag.js";
 import { implement } from "./agent/codingExecutor.js";
+import { completionReviewGate } from "./agent/completionReview.js";
 import { currentDiff, safePath } from "./agent/tools.js";
 import { truncateBytes } from "./context/bounds.js";
 import { AttemptCheckpoint } from "./agent/attemptCheckpoint.js";
@@ -589,13 +590,20 @@ export async function run(options: RunOptions) {
         options.config.context,
         true,
       );
+      const explicitTestMutation =
+        /\b(?:add|create|write|update|change|extend|adjust)\w*\b[\s\S]{0,48}\b(?:test|tests|spec|specs|coverage)\w*\b|\b(?:test|tests|spec|specs|coverage)\w*\b[\s\S]{0,48}\b(?:add|create|write|update|change|extend|adjust)\w*\b/i
+          .test(options.task);
+      const stableWritePaths = [...new Set([
+        ...exploration.editableCandidates.map(({ path }) => path),
+        ...(explicitTestMutation ? exploration.relatedTests : []),
+      ])];
       const subtask: Subtask = {
         id: "stable",
         title: options.task,
         objective: options.task,
         dependsOn: [],
         likelyReadPaths: exploredPaths,
-        likelyWritePaths: exploration.editableCandidates.map(({ path }) => path),
+        likelyWritePaths: stableWritePaths,
         readOnly: false,
         integrationContract:
           "Implement the smallest correct change in the evidence-backed files and preserve existing public interfaces",
@@ -2072,7 +2080,21 @@ export async function run(options: RunOptions) {
           break;
       }
     }
-    status = verification.status;
+    const completionGate = completionReviewGate(verification.status, logger.events);
+    if (completionGate.unresolved.length) {
+      status = completionGate.status;
+      logger.log("completion_requirements_unresolved", {
+        subtasks: completionGate.unresolved,
+        finalVerificationStatus: verification.status,
+      });
+      throw Error(
+        `Completion requirements remain unresolved: ${completionGate.unresolved
+          .map(({ subtaskId, requirementIds }) =>
+            `${subtaskId} (${requirementIds.join(", ")})`)
+          .join("; ")}`,
+      );
+    }
+    status = completionGate.status;
     const unavailable = verification.checks.find(
       (check) =>
         (check.requirement ?? "required") === "required" &&

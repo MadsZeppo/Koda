@@ -9,6 +9,11 @@ export interface CodingWorkerContext {
   evidence?: unknown;
   /** Stable's bounded repair packet, supplied as implementation context. */
   repairPacket?: unknown;
+  /** A rejected completion review must be repaired before any new discovery. */
+  completionRepair?: {
+    unresolvedRequirementIds: string[];
+    mutationRequiredBeforeDiscovery: true;
+  };
 }
 
 export interface CodingWorkerInput {

@@ -274,6 +274,21 @@ test("discovery recovery cannot jump to an expensive model on a low-cost task", 
   assert.equal(selected?.model.id, cheapRecovery.model.id);
 });
 
+test("discovery budget exhaustion can use an approved recovery without consuming a coding attempt", () => {
+  const initial = candidate("initial", "cheap", .91, .002);
+  const recovery = candidate("recovery", "strong", .95, .006);
+  const frozen = policy([initial, recovery], 1);
+  const selected = chooseAdaptiveRecovery(frozen, {
+    failureMode: "discovery_limit",
+    failurePhase: "DISCOVERY",
+    previousModel: initial.model.id,
+    mutationObserved: false,
+    codingAttempts: 0,
+    terminationReason: "attempt_budget_exhausted",
+  }, new Set([initial.model.id]));
+  assert.equal(selected?.model.id, recovery.model.id);
+});
+
 test("operational recovery follows the frozen economic order before semantic escalation", () => {
   const initial = candidate("initial", "cheap", 0.91, 0.002);
   const economicalPeer = candidate("economical-peer", "fast", 0.91, 0.003);

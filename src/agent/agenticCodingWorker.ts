@@ -29,7 +29,20 @@ export const AGENTIC_CODING_VERSION = "1";
 
 const MIN_NEXT_OUTPUT_TOKENS = 256;
 const MAX_TOOL_CALLS_PER_TURN = 8;
+const MAX_USEFUL_DISCOVERY_BEFORE_MUTATION = 2;
 const DISCOVERY_EVIDENCE_BYTES = 3_000;
+
+const DISCOVERY_TOOLS = new Set([
+  "list_files",
+  "search_code",
+  "read_file",
+  "file_outline",
+  "git_diff",
+  "git_status",
+]);
+const MUTATION_TOOLS = new Set(["apply_patch", "edit_file", "write_file"]);
+const MUTATION_TOOL_DEFINITIONS = toolDefinitions.filter((tool) =>
+  "function" in tool && MUTATION_TOOLS.has(tool.function.name));
 
 export interface AgenticCodingResponse {
   model: string;
@@ -75,6 +88,14 @@ function estimatedPromptTokens(
 function compactSeed(
   input: CodingWorkerInput,
 ) {
+  let excerptBytes = 0;
+  const excerpts = (input.context?.sourceFiles ?? []).flatMap((file) => {
+    if (excerptBytes >= 8_000) return [];
+    const remaining = 8_000 - excerptBytes;
+    const snippet = file.snippet.slice(0, remaining);
+    excerptBytes += Buffer.byteLength(snippet);
+    return [`FILE EXCERPT ${file.path}\n${snippet}`];
+  });
   return [
     input.context?.localizationSummary
       ? `LOCALIZATION\n${input.context.localizationSummary.slice(0, 2_000)}`
@@ -85,9 +106,15 @@ function compactSeed(
     input.context?.previousFailedDiff
       ? `PREVIOUS FAILED DIFF\n${input.context.previousFailedDiff.slice(0, 3_000)}`
       : "",
+    input.context?.completionRepair
+      ? `UNRESOLVED REQUIREMENT IDS\n${JSON.stringify(input.context.completionRepair.unresolvedRequirementIds)}`
+      : "",
     `KNOWN RELEVANT PATHS\n${JSON.stringify(
       input.context?.relevantFiles ?? [],
     )}`,
+    excerpts.length
+      ? `BOUNDED IMPLEMENTATION EXCERPTS\n${excerpts.join("\n\n")}`
+      : "",
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -322,13 +349,7 @@ function discoveryNote(
   content: string,
 ) {
   if (
-    ![
-      "list_files",
-      "search_code",
-      "read_file",
-      "git_diff",
-      "git_status",
-    ].includes(name)
+    !DISCOVERY_TOOLS.has(name)
   ) {
     return undefined;
   }
@@ -359,13 +380,14 @@ export class AgenticCodingWorker
   private async request(
     input: CodingWorkerInput,
     messages: ChatCompletionMessageParam[],
+    tools: ChatCompletionTool[],
     maxOutputTokens: number,
   ): Promise<AgenticCodingResponse> {
     if (this.requester) {
       return this.requester(
         input,
         messages,
-        toolDefinitions,
+        tools,
         maxOutputTokens,
       );
     }
@@ -412,7 +434,7 @@ export class AgenticCodingWorker
         {
           model: input.model,
           messages,
-          tools: toolDefinitions,
+          tools,
           tool_choice: "auto",
           max_tokens: maxOutputTokens,
           stream: false,
@@ -480,6 +502,9 @@ export class AgenticCodingWorker
           "Do not stop at a plan: make the code change.",
           "Use run_command only for focused checks or safe repository inspection.",
           "Koda performs authoritative verification after this worker finishes.",
+          input.context?.completionRepair
+            ? "This is a completion-repair continuation. The existing diff, compact excerpts, and reviewer diagnostics already establish the missing work. Mutate the authorized scope first. After a real mutation, normal tools reopen for at most two new evidence reads before another implementation mutation is required."
+            : "",
         ].join(" "),
       },
       {
@@ -505,8 +530,10 @@ export class AgenticCodingWorker
     const discoveryNotes: string[] = [];
     let modelServed = input.model;
     let mutationObserved = false;
+    let repairDiscoverySinceMutation = 0;
     let providerDispatched = false;
     let timeToFirstMutationMs: number | undefined;
+    let implementationNudgeSent = false;
 
     const settleKnown = () => {
       const usage = aggregateUsage(
@@ -580,6 +607,22 @@ export class AgenticCodingWorker
         step < input.maxSteps;
         step++
       ) {
+        if (
+          !mutationObserved &&
+          !implementationNudgeSent &&
+          tools.progressEvidence.length >= 2
+        ) {
+          messages.push({
+            role: "user",
+            content:
+              "You now have enough distinct repository evidence to implement. Make the smallest justified mutation in the allowed write scope now. Further reads are allowed only for a genuinely new symbol or line range required to construct that edit.",
+          });
+          implementationNudgeSent = true;
+          this.logger.log("agentic_implementation_transition", {
+            subtaskId: input.attemptId,
+            useful_discovery_steps: tools.progressEvidence.length,
+          });
+        }
         const usedTokens = usages.reduce(
           (sum, usage) =>
             sum +
@@ -847,9 +890,15 @@ export class AgenticCodingWorker
 
         providerDispatched = true;
 
+        const repairMutationRequired =
+          !!input.context?.completionRepair?.mutationRequiredBeforeDiscovery &&
+          (!mutationObserved || repairDiscoverySinceMutation >= 2);
         const response = await this.request(
           input,
           messages,
+          repairMutationRequired
+            ? MUTATION_TOOL_DEFINITIONS
+            : toolDefinitions,
           maxOutput,
         );
 
@@ -951,6 +1000,7 @@ export class AgenticCodingWorker
           const call = calls[callIndex]!;
           let content: string;
           let parsedArgs: Record<string, unknown> = {};
+          let discoveryDeferred = false;
 
           if (callIndex >= MAX_TOOL_CALLS_PER_TURN) {
             content =
@@ -961,23 +1011,69 @@ export class AgenticCodingWorker
                 call.function.arguments,
               );
 
-              content = String(
-                await tools.execute(
-                  call.function.name,
-                  parsedArgs,
-                ),
-              );
+              const repairToolGate =
+                !!input.context?.completionRepair?.mutationRequiredBeforeDiscovery &&
+                (!mutationObserved || repairDiscoverySinceMutation >= 2);
+              if (
+                repairToolGate &&
+                !MUTATION_TOOLS.has(call.function.name)
+              ) {
+                discoveryDeferred = true;
+                content =
+                  "Completion repair is mutation-gated. Use apply_patch, edit_file, or write_file before any read, search, listing, outline, command, or diff tool.";
+                this.logger.log("completion_repair_tool_deferred", {
+                  subtaskId: input.attemptId,
+                  tool: call.function.name,
+                });
+              } else if (
+                !mutationObserved &&
+                DISCOVERY_TOOLS.has(call.function.name) &&
+                tools.progressEvidence.length >=
+                  MAX_USEFUL_DISCOVERY_BEFORE_MUTATION
+              ) {
+                discoveryDeferred = true;
+                content =
+                  "Discovery phase complete: Koda already has two useful repository observations and no mutation. Use edit_file, apply_patch, or write_file now. A later verification failure can provide concrete evidence for a bounded repair.";
+                this.logger.log(
+                  "agentic_discovery_call_deferred",
+                  {
+                    subtaskId: input.attemptId,
+                    tool: call.function.name,
+                    useful_discovery_steps:
+                      tools.progressEvidence.length,
+                  },
+                );
+              } else {
+                content = String(
+                  await tools.execute(
+                    call.function.name,
+                    parsedArgs,
+                  ),
+                );
+                if (
+                  input.context?.completionRepair &&
+                  mutationObserved &&
+                  !MUTATION_TOOLS.has(call.function.name)
+                ) repairDiscoverySinceMutation++;
+                if (
+                  input.context?.completionRepair &&
+                  MUTATION_TOOLS.has(call.function.name) &&
+                  !/^Tool error:/i.test(content)
+                ) repairDiscoverySinceMutation = 0;
+              }
             } catch (error) {
               content =
                 `Tool error: ${String(error)}`;
             }
           }
 
-          const note = discoveryNote(
-            call.function.name,
-            parsedArgs,
-            content,
-          );
+          const note = discoveryDeferred
+            ? undefined
+            : discoveryNote(
+                call.function.name,
+                parsedArgs,
+                content,
+              );
 
           if (note) {
             discoveryNotes.push(note);

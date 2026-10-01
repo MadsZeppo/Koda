@@ -16,10 +16,11 @@ import { ensureAiderRuntime } from "../src/agent/aiderRuntime.js";
 import { Budget } from "../src/openrouter/usage.js";
 import { Logger } from "../src/telemetry/logger.js";
 import { config } from "../src/config.js";
-import { implement } from "../src/agent/codingExecutor.js";
+import { completionRepairWriteScope, implement } from "../src/agent/codingExecutor.js";
 import { History } from "../src/router/history.js";
 import { modelSchema } from "../src/router/pool.js";
 import type { CodingWorkerInput } from "../src/agent/codingWorker.js";
+import type { CodingWorker } from "../src/agent/codingWorker.js";
 
 async function fixture(t: any) {
   const root = await mkdtemp(join(tmpdir(), "koda-aider-test-"));
@@ -36,6 +37,16 @@ async function fixture(t: any) {
   await execa("git", ["-c", "user.name=Koda", "-c", "user.email=koda@localhost", "commit", "-qm", "baseline"], { cwd: root });
   return root;
 }
+
+test("completion repair expands only to reviewer-named repository-backed read paths", () => {
+  assert.deepEqual(completionRepairWriteScope({
+    currentWriteScope: ["src/summary.ts"],
+    authorizedReadPaths: ["src/executor.ts", "tests/executor.test.ts", "src/unrelated.ts"],
+    repositoryPaths: ["src/summary.ts", "src/executor.ts", "tests/executor.test.ts", "src/unrelated.ts"],
+    reviewerDiagnostics: "R2: wire src/executor.ts and cover tests/executor.test.ts; ignore invented.ts",
+    testsAuthorized: false,
+  }), ["src/summary.ts", "src/executor.ts"]);
+});
 const input = (root: string): CodingWorkerInput => ({ repoPath: root, attemptId: "test",
   task: "Change both values to 3", model: "foo/bar", budgetUsd: .1,
   maxTokens: 10000, maxSteps: 4, timeoutMs: 30000, requestTimeoutMs: 5000,
@@ -323,7 +334,7 @@ test("partial edits survive provider failures and exceptions; prior mutations ar
     await writeFile(join(cwd, "src/value.cjs"), "module.exports = 3;\n");
     throw Error("provider timed out");
   }).run(input(root));
-  assert.equal(result.exitStatus, "completed");
+  assert.equal(result.exitStatus, "failed");
   assert.deepEqual(result.changedPaths, ["src/value.cjs"]);
   assert.equal(await readFile(join(root, "src/other.cjs"), "utf8"), "prior accepted mutation\n");
 });
@@ -397,6 +408,132 @@ test("Aider fixture reaches VERIFIED_SUCCESS only through Koda's real checks", a
         localDependencies: [], completePaths: ["src/value.cjs"], repoMap: ["src/value.cjs"],
       } as any });
   assert.equal(roleResult.verification.status, "VERIFIED_SUCCESS");
+});
+
+test("completion review keeps the full write scope and continues partial work in the same worktree", async (t) => {
+  const root = await fixture(t);
+  await mkdir(join(root, "tests"));
+  await writeFile(join(root, "src/wiring.cjs"), "module.exports = null;\n");
+  await writeFile(join(root, "tests/outcome.test.cjs"),
+    "const {test}=require('node:test');test('placeholder',()=>{});\n");
+  await execa("git", ["add", "."], { cwd: root });
+  await execa("git", ["-c", "user.name=Koda", "-c", "user.email=koda@localhost", "commit", "-qm", "completion fixture"], { cwd: root });
+  const cfg = await config(undefined, { maxIterations: 1 });
+  const logger = new Logger(join(root, ".koda"), "completion-loop", true);
+  let calls = 0;
+  const codingWorker: CodingWorker = {
+    engine: "agentic",
+    async run(workerInput) {
+      calls++;
+      if (calls === 1) {
+        assert.deepEqual(workerInput.writeScope,
+          ["src/outcome.cjs", "src/wiring.cjs"]);
+        await writeFile(join(root, "src/outcome.cjs"), "module.exports = 3;\n");
+        return { exitStatus: "completed", model: workerInput.model, engine: "agentic", engineVersion: "test",
+          changedPaths: ["src/outcome.cjs"], wallClockMs: 1 };
+      }
+      assert.deepEqual(workerInput.writeScope,
+        ["src/outcome.cjs", "src/wiring.cjs", "tests/outcome.test.cjs"]);
+      assert.match(workerInput.context?.diagnostics ?? "", /unresolved requirements/);
+      assert.equal(workerInput.context?.completionRepair?.mutationRequiredBeforeDiscovery, true);
+      assert.ok(workerInput.context?.completionRepair?.unresolvedRequirementIds.includes("R2"));
+      assert.equal(workerInput.context?.completionRepair?.unresolvedRequirementIds.includes("R1"), false);
+      assert.match(workerInput.context?.previousFailedDiff ?? "", /outcome\.cjs/);
+      await writeFile(join(root, "src/wiring.cjs"), "module.exports = require('./outcome.cjs');\n");
+      await writeFile(join(root, "tests/outcome.test.cjs"),
+        "const {test}=require('node:test');const a=require('node:assert/strict');test('wired',()=>a.equal(require('../src/wiring.cjs'),3));\n");
+      return { exitStatus: "completed", model: workerInput.model, engine: "agentic", engineVersion: "test",
+        changedPaths: ["src/outcome.cjs", "src/wiring.cjs", "tests/outcome.test.cjs"], wallClockMs: 1 };
+    },
+  };
+  let reviews = 0;
+  const output = await implement(
+    { config: cfg, logger, budget: new Budget(1, 100_000, 60_000) } as any,
+    root,
+    "Create outcome module\nWire it into telemetry\nAdd a focused regression test",
+    { id: "stable", title: "Outcome", objective: "Implement and wire outcome with tests", likelyReadPaths: ["src/wiring.cjs", "tests/outcome.test.cjs"],
+      likelyWritePaths: ["src/outcome.cjs", "src/wiring.cjs"], dependsOn: [], integrationContract: "Wiring uses outcome and focused test passes",
+      verificationCommands: ["node --test tests/outcome.test.cjs"], estimatedDifficulty: "normal", parallelSafe: false } as any,
+    { acceptanceCriteria: ["Module exists", "Wiring uses it", "Focused test covers it"] },
+    { files: ["src/wiring.cjs", "tests/outcome.test.cjs"], verificationCommands: ["node --test tests/outcome.test.cjs"] } as any,
+    { model: "foo/bar", codingWorker, completionReviewer: async (reviewInput) => {
+      reviews++;
+      return { passed: reviews > 1,
+        requirements: reviewInput.requirements.map((requirement, index) => ({
+          id: requirement.id, satisfied: reviews > 1 || index === 0,
+          evidence: reviews > 1 ? "full diff and focused test" : index === 0 ? "module created" : "missing from first diff",
+        })), summary: reviews > 1 ? "complete" : "partial" };
+    } },
+  );
+  assert.equal(calls, 2);
+  assert.equal(reviews, 2);
+  assert.equal(output.verification.status, "VERIFIED_SUCCESS");
+  assert.ok(logger.events.some((event) => event.type === "completion_continuation"));
+  assert.ok(logger.events.some((event) => event.type === "completion_review" && event.passed === true));
+});
+
+test("a killed Aider attempt with a passing partial mutation is never verified", async (t) => {
+  const root = await fixture(t);
+  await mkdir(join(root, "tests"));
+  await writeFile(join(root, "src/wiring.cjs"), "module.exports = require('./value.cjs');\n");
+  await writeFile(join(root, "tests/value.test.cjs"),
+    "const {test}=require('node:test');const a=require('node:assert/strict');test('value',()=>a.equal(require('../src/value.cjs'),3));\n");
+  await execa("git", ["add", "."], { cwd: root });
+  await execa("git", ["-c", "user.name=Koda", "-c", "user.email=koda@localhost", "commit", "-qm", "add wiring fixture"], { cwd: root });
+
+  const cfg = await config(undefined, { maxIterations: 1 });
+  const logger = new Logger(join(root, ".koda"), "killed-partial", true);
+  let interruptedCalls = 0;
+  const codingWorker = worker(root, async (cwd, invocation) => {
+    interruptedCalls++;
+    await writeFile(join(cwd, "src/value.cjs"), "module.exports = 3;\n");
+    await report(invocation, "diff");
+    return { ...success, exitCode: 1, stderr: "Terminated by SIGKILL" };
+  });
+  const subtask: any = {
+    id: "wire-value",
+    title: "Implement and wire value",
+    objective: "Change the value implementation and wire it through the existing module",
+    likelyReadPaths: ["src/value.cjs", "src/wiring.cjs", "tests/value.test.cjs"],
+    likelyWritePaths: ["src/value.cjs", "src/wiring.cjs"],
+    dependsOn: [],
+    integrationContract: "the implementation is wired and the value test passes",
+    verificationCommands: ["node --test tests/value.test.cjs"],
+    estimatedDifficulty: "normal",
+    parallelSafe: false,
+  };
+
+  const output = await implement(
+    { config: cfg, logger, budget: new Budget(1, 100_000, 60_000) } as any,
+    root,
+    subtask.objective,
+    subtask,
+    { acceptanceCriteria: [subtask.integrationContract] },
+    { files: subtask.likelyReadPaths, verificationCommands: subtask.verificationCommands } as any,
+    {
+      model: "foo/bar",
+      codingWorker,
+      compiledContext: {
+        files: [],
+        localDependencies: [],
+        completePaths: ["src/value.cjs", "src/wiring.cjs"],
+        repoMap: subtask.likelyReadPaths,
+      },
+    },
+  );
+
+  assert.equal(output.verification.status, "NOT_FULLY_VERIFIED");
+  assert.equal(interruptedCalls, 1);
+  assert.equal(await readFile(join(root, "src/value.cjs"), "utf8"), "module.exports = 3;\n",
+    "the partial mutation remains inspectable for recovery");
+  assert.ok(logger.events.some((event) =>
+    event.type === "aider_attempt_verification" &&
+    event.outcome === "NOT_FULLY_VERIFIED"));
+  assert.ok(logger.events.some((event) =>
+    event.type === "partial_candidate_continuation"));
+  assert.equal(logger.events.filter((event) =>
+    event.type === "partial_candidate_continuation").length, 1,
+  "partial operational recovery remains bounded");
 });
 
 test("OpenHands-localized work reaches Aider once with a bounded focused budget", async (t) => {

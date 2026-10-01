@@ -55,6 +55,29 @@ export interface FrozenExecutionPlan extends FrozenExecutionPolicy<SpecialistEst
   readonly verificationStrength: TaskFingerprint["verificationStrength"];
   readonly stopConditions: readonly string[];
 }
+
+export function selectQualitySafeJointPlan<T extends {
+  executionStrategy: TaskFingerprint["executionStrategy"];
+  plan: FrozenExecutionPlan;
+}>(evaluated: readonly T[]) {
+  const comparisonQualities = evaluated.flatMap(({ plan }) => [
+    ...(plan.evaluatedPlans ?? [])
+      .filter((candidate) => !candidate.hardRejection)
+      .map((candidate) => candidate.conservativeFinalSuccess),
+    plan.conservativeQuality,
+  ]).filter(Number.isFinite);
+  if (!comparisonQualities.length) return undefined;
+  const reference = Math.max(...comparisonQualities);
+  return evaluated.filter(({ plan }) =>
+    Number.isFinite(plan.conservativeQuality) &&
+    reference - plan.conservativeQuality <= (plan.allowedQualityRegret ?? 0) + 1e-9)
+    .sort((a, b) =>
+      (a.plan.optimizerScore ?? Infinity) - (b.plan.optimizerScore ?? Infinity) ||
+      (a.plan.expectedLatencyP90Ms ?? a.plan.expectedLatencyMs) -
+        (b.plan.expectedLatencyP90Ms ?? b.plan.expectedLatencyMs) ||
+      a.plan.expectedCostPerVerifiedSolve - b.plan.expectedCostPerVerifiedSolve ||
+      a.plan.initialModel.localeCompare(b.plan.initialModel))[0];
+}
 export interface Candidate {
   model: PoolModel;
   metadata: Metadata;
@@ -67,6 +90,62 @@ export interface Candidate {
   softPenalties?: string[];
   qualityTargetMet?: boolean;
   rejected?: string;
+}
+
+const latencyOnlyRejection = (reason?: string) =>
+  reason === "predicted model latency exceeds implementation request deadline";
+
+/**
+ * Last-resort coding route used only when the normal quality policy has no
+ * executable plan. Technical compatibility and the run budget remain hard;
+ * latency becomes a bounded ranking penalty and never the sole veto.
+ */
+export function zeroEligibleCodingFallback(
+  candidates: readonly SpecialistEstimate[],
+  budgetUsd: number,
+  maxAttempts: number,
+) {
+  const viable = candidates
+    .filter((candidate) =>
+      (!candidate.hardRejection || latencyOnlyRejection(candidate.hardRejection)) &&
+      candidate.metadata.available !== false &&
+      Number.isFinite(candidate.reservationCost) &&
+      candidate.reservationCost <= budgetUsd)
+    .map((candidate) => ({
+      ...candidate,
+      rejected: undefined,
+      rejection: undefined,
+      hardRejection: undefined,
+      softPenalties: [...new Set([
+        ...(candidate.softPenalties ?? []),
+        ...(candidate.deadlineFeasible ? [] : ["predicted latency fallback penalty"]),
+        "zero-eligible bounded fallback",
+      ])],
+    }));
+  if (!viable.length || maxAttempts <= 0) return [];
+  const maxLatency = Math.max(1, ...viable.map((candidate) =>
+    candidate.latencyP90Ms ?? candidate.expectedAttemptLatencyMs));
+  const maxCost = Math.max(1e-9, ...viable.map((candidate) => candidate.reservationCost));
+  const ranked = viable.sort((a, b) => {
+    const score = (candidate: SpecialistEstimate) =>
+      candidate.quality * 0.7 + candidate.conservativeQuality * 0.3 -
+      0.08 * ((candidate.latencyP90Ms ?? candidate.expectedAttemptLatencyMs) / maxLatency) -
+      0.02 * (candidate.reservationCost / maxCost);
+    return score(b) - score(a) ||
+      b.conservativeQuality - a.conservativeQuality ||
+      a.reservationCost - b.reservationCost ||
+      a.model.id.localeCompare(b.model.id);
+  });
+  const initial = ranked[0]!;
+  const stronger = ranked
+    .filter((candidate) => candidate.model.id !== initial.model.id &&
+      (candidate.quality > initial.quality + 1e-9 ||
+        candidate.conservativeQuality > initial.conservativeQuality + 1e-9))
+    .sort((a, b) =>
+      b.quality - a.quality ||
+      b.conservativeQuality - a.conservativeQuality ||
+      a.reservationCost - b.reservationCost)[0];
+  return [initial, ...(stronger ? [stronger] : [])].slice(0, maxAttempts);
 }
 export function rankCandidates(
   models: PoolModel[],
@@ -280,18 +359,18 @@ export class PoolRouter {
         : plan;
       evaluated.push({ executionStrategy: variant.executionStrategy, plan: adjusted });
     }
-    const reference = Math.max(...evaluated.flatMap(({ plan }) =>
-      (plan.evaluatedPlans ?? [])
-        .filter((candidate) => !candidate.hardRejection)
-        .map((candidate) => candidate.conservativeFinalSuccess)));
-    const safe = evaluated.filter(({ plan }) =>
-      reference - plan.conservativeQuality <= (plan.allowedQualityRegret ?? 0) + 1e-9);
-    const selected = safe.sort((a, b) =>
-      (a.plan.optimizerScore ?? Infinity) - (b.plan.optimizerScore ?? Infinity) ||
-      (a.plan.expectedLatencyP90Ms ?? a.plan.expectedLatencyMs) -
-        (b.plan.expectedLatencyP90Ms ?? b.plan.expectedLatencyMs) ||
-      a.plan.initialModel.localeCompare(b.plan.initialModel))[0];
+    const selected = selectQualitySafeJointPlan(evaluated);
     if (!selected) throw Error("No quality-safe model + execution strategy plan");
+    const reference = Math.max(...evaluated.flatMap(({ plan }) => [
+      ...(plan.evaluatedPlans ?? [])
+        .filter((candidate) => !candidate.hardRejection)
+        .map((candidate) => candidate.conservativeFinalSuccess),
+      plan.conservativeQuality,
+    ]).filter(Number.isFinite));
+    const safe = evaluated.filter(({ plan }) =>
+      Number.isFinite(plan.conservativeQuality) &&
+      reference - plan.conservativeQuality <=
+        (plan.allowedQualityRegret ?? 0) + 1e-9);
     const selectedCandidate = selected.plan.evaluatedCandidates?.find((candidate) =>
       candidate.model.id === selected.plan.initialModel);
     const planRows = evaluated.flatMap(({ executionStrategy, plan }) =>
@@ -438,6 +517,29 @@ export class PoolRouter {
       this.history.readEfficiency(),
     );
     const cascade = result.cascade;
+    let zeroEligibleFallback = false;
+    if (!cascade.length) {
+      const fallback = zeroEligibleCodingFallback(
+        result.considered,
+        Math.min(budgetUsd, this.remainingBudget()),
+        Math.max(1, Math.min(2, this.config.maxIterations)),
+      );
+      if (fallback.length) {
+        cascade.push(...fallback);
+        (result as { reference?: SpecialistEstimate }).reference =
+          [...fallback].sort((a, b) =>
+            b.conservativeQuality - a.conservativeQuality ||
+            b.quality - a.quality)[0];
+        zeroEligibleFallback = true;
+        this.logger.log("zero_eligible_model_fallback", {
+          subtaskId,
+          selected_model: fallback[0]!.model.id,
+          recovery_models: fallback.slice(1).map((candidate) => candidate.model.id),
+          remaining_budget_usd: Math.min(budgetUsd, this.remainingBudget()),
+          latency_policy: "ranking_penalty",
+        });
+      }
+    }
     if (!cascade.length || !result.reference) {
       const diagnostic = {
         reference: result.reference?.model.id ?? null,
@@ -494,7 +596,9 @@ export class PoolRouter {
     // bounded, quality-safe alternative first leg for provider/protocol
     // failure. Its own optimizer-approved cascade preserves the same final
     // quality floor; it is never eligible for coding-quality de-escalation.
-    const selectedOptimizerPlan = result.selectedPlan;
+    const selectedOptimizerPlan = zeroEligibleFallback
+      ? undefined
+      : result.selectedPlan;
     const qualitySafePlans = result.plans
       .filter((candidate) => candidate.eligible && !candidate.hardRejection)
       .sort((a, b) => a.score - b.score ||
@@ -577,28 +681,36 @@ export class PoolRouter {
       evidenceClass: cascade[0]!.evidenceLevel,
       conservativeQuality: Number(
         (
-          result.selectedPlan?.conservativeFinalSuccess ??
+          selectedOptimizerPlan?.conservativeFinalSuccess ??
           cascade[0]!.conservativeQuality
         ).toFixed(3),
       ),
       expectedCostPerVerifiedSolve:
-        result.selectedPlan?.costPerVerifiedCompletion ??
+        selectedOptimizerPlan?.costPerVerifiedCompletion ??
         cascade[0]!.expectedCompletionCost /
           Math.max(0.05, cascade[0]!.conservativeQuality),
       expectedLatencyMs:
-        result.selectedPlan?.expectedCompletionLatencyMs ??
+        selectedOptimizerPlan?.expectedCompletionLatencyMs ??
         cascade[0]!.expectedCompletionLatencyMs,
       expectedLatencyP50Ms:
-        result.selectedPlan?.completionLatencyP50Ms ?? undefined,
+        selectedOptimizerPlan?.completionLatencyP50Ms ??
+        cascade[0]!.latencyP50Ms ??
+        cascade[0]!.expectedAttemptLatencyMs,
       expectedLatencyP90Ms:
-        result.selectedPlan?.completionLatencyP90Ms ?? undefined,
-      expectedTotalCostUsd: result.selectedPlan?.expectedCompletionCost,
-      optimizerScore: result.selectedPlan?.score,
+        selectedOptimizerPlan?.completionLatencyP90Ms ??
+        cascade[0]!.latencyP90Ms ??
+        cascade[0]!.expectedAttemptLatencyMs,
+      expectedTotalCostUsd: selectedOptimizerPlan?.expectedCompletionCost ??
+        cascade[0]!.expectedCompletionCost,
+      optimizerScore: selectedOptimizerPlan?.score ??
+        cascade[0]!.score,
       allowedQualityRegret: result.allowedRegret,
       discoveredModelCount: result.considered.length,
       evaluatedCandidates: result.considered,
       evaluatedPlans: result.plans,
-      whySelected: result.selectedPlan?.reason ?? result.reason,
+      whySelected: zeroEligibleFallback
+        ? "bounded zero-eligible fallback; completion review and verification remain authoritative"
+        : result.selectedPlan?.reason ?? result.reason,
       totalBudgetUsd: budgetUsd,
       latencyBudgetMs: this.config.stageMaxMinutes * 60_000,
       maxCodingAttempts: Math.min(
@@ -630,7 +742,9 @@ export class PoolRouter {
     this.logger.log("specialist_route", {
       subtaskId,
       fingerprint,
-      reason: result.reason,
+      reason: zeroEligibleFallback
+        ? "bounded zero-eligible fallback"
+        : result.reason,
       selected_plan_id: plan.id,
       selected_plan_type: plan.type,
       execution_engine: plan.executionEngine,
@@ -693,7 +807,9 @@ export class PoolRouter {
         : null,
       estimated_cost_per_verified_solve:
         result.selectedPlan?.costPerVerifiedCompletion ?? null,
-      why_selected: result.selectedPlan?.reason ?? result.reason,
+      why_selected: zeroEligibleFallback
+        ? "bounded zero-eligible fallback; completion review and verification remain authoritative"
+        : result.selectedPlan?.reason ?? result.reason,
       expected_completion_cost_usd:
         result.selectedPlan?.expectedCompletionCost ?? null,
       expected_completion_cost_p50_usd:

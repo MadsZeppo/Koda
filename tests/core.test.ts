@@ -270,8 +270,8 @@ test("read progress distinguishes new ranges but deduplicates identical ranges",
       startLine: 3,
       endLine: 4,
     });
-    assert.equal(tools.progressEvidence[0], tools.progressEvidence[1]);
-    assert.notEqual(tools.progressEvidence[1], tools.progressEvidence[2]);
+    assert.equal(tools.progressEvidence.length, 2);
+    assert.notEqual(tools.progressEvidence[0], tools.progressEvidence[1]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
