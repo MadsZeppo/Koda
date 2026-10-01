@@ -90,5 +90,7 @@ export interface CodingWorkerResult {
 }
 
 export interface CodingWorker {
+  /** Stable engine identity for telemetry before the first result exists. */
+  readonly engine?: CodingWorkerResult["engine"];
   run(input: CodingWorkerInput): Promise<CodingWorkerResult>;
 }

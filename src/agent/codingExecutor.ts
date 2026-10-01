@@ -911,7 +911,14 @@ export async function implement(
 
     const workerMode =
       injectedWorker
-        ? "custom"
+        ? injectedWorker.engine ??
+          (injectedWorker instanceof AiderExecutor
+            ? "aider"
+            : injectedWorker instanceof AgenticCodingWorker
+              ? "agentic"
+              : injectedWorker instanceof DirectEditWorker
+                ? "direct-edit"
+                : "custom")
         : handoff!.mode;
 
     const handoffPromptBytes =
@@ -1424,6 +1431,11 @@ export async function implement(
         boundedDiscoveryFirstPass &&
         ["cost_limit", "context_limit"]
           .includes(result.limitKind);
+      const discoveryTokenLimit =
+        result.progressPhase === "DISCOVERY" &&
+        !candidateMutation &&
+        (result.limitKind === "token_limit" ||
+          result.limitKind === "token_preflight");
       const failureMode =
           result.limitKind === "timeout" || result.limitKind === "provider_limit"
             ? "operational"
@@ -1432,6 +1444,8 @@ export async function implement(
             : result.limitKind === "context_limit"
             ? "context_limit"
             : result.limitKind === "discovery_limit"
+              ? "discovery_limit"
+            : discoveryTokenLimit
               ? "discovery_limit"
             : result.limitKind === "token_limit" ||
                 result.limitKind === "token_preflight"
@@ -1729,7 +1743,9 @@ export async function implement(
       }
       return {
         verification: options.finalVerificationOnly
-          ? verificationResult([])
+          ? options.stableRepair
+            ? candidateVerification
+            : verificationResult([])
           : relative,
         role,
         evidence,

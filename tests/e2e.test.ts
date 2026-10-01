@@ -525,8 +525,13 @@ test("dependent task already satisfied by integration completes as a verified no
     );
     assert.equal(result.verification.status, "VERIFIED_SUCCESS");
     assert.ok(
-      result.verification.checks.some(
-        (c) => c.command === "npm run test" && c.exitCode === 0,
+      ["add", "multiply"].every((name) =>
+        result.verification.checks.some(
+          (check) =>
+            check.command === `node --test tests/${name}.test.cjs` &&
+            check.exitCode === 0 &&
+            check.requirement === "required",
+        ),
       ),
     );
     assert.equal(result.escalations, 0);

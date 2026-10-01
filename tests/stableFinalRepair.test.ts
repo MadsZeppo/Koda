@@ -235,11 +235,11 @@ for (const mode of [
       } else if (mode === "stuck") {
         assert.equal(result.status, "FAILED");
         assert.ok(f.repairCalls >= 1);
-        assert.ok(events.some((event) => event.type === "attempt_rollback"));
+        assert.ok(events.some((event) => event.type === "stable_final_repair_start"));
       } else {
         assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
         assert.ok(f.repairCalls >= 1);
-        assert.ok(events.some((event) => event.type === "attempt_rollback"));
+        assert.ok(events.some((event) => event.type === "stable_final_repair_start"));
         const lock = events.find((event) => event.type === "stable_discovery_scope_locked");
         assert.deepEqual(lock.repair_write_scope, lock.actual_changed_paths);
         assert.equal(await readFile(join(result.integration!.path, "tests/calc.test.cjs"), "utf8"), goodTest);
@@ -326,10 +326,15 @@ test(`Stable repair physically preserves verified integration and applied target
           strengths: ["coding", "tool_use", "structured_output"],
         })) }, routing: { stateDirectory: join(root, "routing") }, budgetUsd: 0.1 }) });
     assert.equal(result.execution_strategy, "stable");
-    if (outcome === "baseline-return") {
+    if (outcome === "baseline-return" || outcome === "lost-at-promotion") {
       assert.equal(result.status, "FAILED");
       assert.notEqual(result.applyResult, "applied");
-      assert.match(result.error ?? "", /without a candidate diff|produced no changes/i);
+      assert.match(
+        result.error ?? "",
+        outcome === "lost-at-promotion"
+          ? /repair state disappeared|changed during promotion/i
+          : /without a candidate diff|produced no changes|final repair .* failed/i,
+      );
       assert.equal(await readFile(join(repo, "src/calc.cjs"), "utf8"), baselineSource);
       return;
     }
@@ -342,7 +347,7 @@ test(`Stable repair physically preserves verified integration and applied target
     assert.ok(repairModels.length >= 2, JSON.stringify(repairModels));
     const events = (await readFile(join(output, "events.jsonl"), "utf8")).trim()
       .split("\n").map((line) => JSON.parse(line));
-    assert.ok(events.some((event) => event.type === "attempt_rollback"));
+    assert.ok(events.some((event) => event.type === "stable_final_repair_start"));
     const scope = events.find((event) => event.type === "stable_discovery_scope_locked");
     assert.deepEqual(scope.repair_write_scope, ["src/calc.cjs"]);
     assert.ok(events.some((event) =>

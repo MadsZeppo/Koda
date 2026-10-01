@@ -27,6 +27,10 @@ import type {
 
 export const AGENTIC_CODING_VERSION = "1";
 
+const MIN_NEXT_OUTPUT_TOKENS = 256;
+const MAX_TOOL_CALLS_PER_TURN = 8;
+const DISCOVERY_EVIDENCE_BYTES = 3_000;
+
 export interface AgenticCodingResponse {
   model: string;
   usage: unknown;
@@ -53,13 +57,12 @@ export type AgenticCodingRequester = (
 function estimatedPromptTokens(
   messages: ChatCompletionMessageParam[],
 ) {
-  const bytes =
-    Buffer.byteLength(
-      JSON.stringify({
-        messages,
-        tools: toolDefinitions,
-      }),
-    );
+  const bytes = Buffer.byteLength(
+    JSON.stringify({
+      messages,
+      tools: toolDefinitions,
+    }),
+  );
 
   return Math.ceil(
     Math.max(
@@ -94,46 +97,39 @@ function aggregateUsage(
   values: readonly Usage[],
   input: CodingWorkerInput,
 ): Usage {
-  const promptTokens =
-    values.reduce(
-      (sum, usage) =>
-        sum + usage.promptTokens,
-      0,
-    );
+  const promptTokens = values.reduce(
+    (sum, usage) =>
+      sum + usage.promptTokens,
+    0,
+  );
 
-  const completionTokens =
-    values.reduce(
-      (sum, usage) =>
-        sum + usage.completionTokens,
-      0,
-    );
+  const completionTokens = values.reduce(
+    (sum, usage) =>
+      sum + usage.completionTokens,
+    0,
+  );
 
-  const reasoningTokens =
-    values.reduce(
-      (sum, usage) =>
-        sum + usage.reasoningTokens,
-      0,
-    );
+  const reasoningTokens = values.reduce(
+    (sum, usage) =>
+      sum + usage.reasoningTokens,
+    0,
+  );
 
-  const cachedTokens =
-    values.reduce(
-      (sum, usage) =>
-        sum + usage.cachedTokens,
-      0,
-    );
+  const cachedTokens = values.reduce(
+    (sum, usage) =>
+      sum + usage.cachedTokens,
+    0,
+  );
 
-  const cacheWriteTokens =
-    values.reduce(
-      (sum, usage) =>
-        sum + usage.cacheWriteTokens,
-      0,
-    );
+  const cacheWriteTokens = values.reduce(
+    (sum, usage) =>
+      sum + usage.cacheWriteTokens,
+    0,
+  );
 
-  const directCosts =
-    values.map(
-      (usage) =>
-        usage.costUsd,
-    );
+  const directCosts = values.map(
+    (usage) => usage.costUsd,
+  );
 
   let costUsd: number | null = null;
 
@@ -144,12 +140,10 @@ function aggregateUsage(
         Number.isFinite(value),
     )
   ) {
-    costUsd =
-      directCosts.reduce(
-        (sum, value) =>
-          sum + value,
-        0,
-      );
+    costUsd = directCosts.reduce(
+      (sum, value) => sum + value,
+      0,
+    );
   } else if (
     input.promptPricePerMillion !== undefined &&
     input.completionPricePerMillion !== undefined
@@ -163,10 +157,8 @@ function aggregateUsage(
         cacheWriteTokens,
         costUsd: null,
         raw: {
-          prompt_tokens:
-            promptTokens,
-          completion_tokens:
-            completionTokens,
+          prompt_tokens: promptTokens,
+          completion_tokens: completionTokens,
         },
       },
       input.promptPricePerMillion,
@@ -182,12 +174,177 @@ function aggregateUsage(
     cacheWriteTokens,
     costUsd,
     raw: {
-      prompt_tokens:
-        promptTokens,
-      completion_tokens:
-        completionTokens,
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
     },
   };
+}
+
+function compactToolText(
+  value: string,
+  maxChars: number,
+) {
+  if (value.length <= maxChars) {
+    return value;
+  }
+
+  const marker =
+    "\n...[Koda compacted older tool output; call the tool again if exact omitted text is needed]...\n";
+
+  if (maxChars <= marker.length + 32) {
+    return (
+      value.slice(0, Math.max(0, maxChars - 1)) +
+      "…"
+    );
+  }
+
+  const room = maxChars - marker.length;
+  const head = Math.ceil(room * 0.7);
+  const tail = Math.max(0, room - head);
+
+  return (
+    value.slice(0, head) +
+    marker +
+    (tail ? value.slice(-tail) : "")
+  );
+}
+
+/**
+ * Keep tool-call protocol structure intact while bounding repeated history.
+ *
+ * Every assistant tool_call still keeps its corresponding tool response. We
+ * only compact the textual payload of older tool responses. This avoids the
+ * invalid-history bug caused by dropping tool messages, while preventing a
+ * few 4KB read/search results from being resent in full on every later turn.
+ */
+function compactToolHistoryToBudget(
+  messages: ChatCompletionMessageParam[],
+  promptBudgetTokens: number,
+) {
+  let promptTokens =
+    estimatedPromptTokens(messages);
+
+  if (
+    !Number.isFinite(promptBudgetTokens) ||
+    promptTokens <= promptBudgetTokens
+  ) {
+    return {
+      promptTokens,
+      compactedMessages: 0,
+    };
+  }
+
+  const toolIndexes = messages
+    .map((message, index) =>
+      (message as { role?: string }).role === "tool"
+        ? index
+        : -1,
+    )
+    .filter((index) => index >= 0);
+
+  let compactedMessages = 0;
+
+  const passes = [
+    { keepRecent: 2, maxChars: 1_200 },
+    { keepRecent: 1, maxChars: 700 },
+    { keepRecent: 0, maxChars: 384 },
+    { keepRecent: 0, maxChars: 192 },
+  ];
+
+  for (const pass of passes) {
+    const protectedFrom = Math.max(
+      0,
+      toolIndexes.length - pass.keepRecent,
+    );
+
+    for (
+      let position = 0;
+      position < protectedFrom;
+      position++
+    ) {
+      const index = toolIndexes[position]!;
+      const message = messages[index] as {
+        role?: string;
+        content?: unknown;
+      };
+
+      if (typeof message.content !== "string") {
+        continue;
+      }
+
+      const compacted = compactToolText(
+        message.content,
+        pass.maxChars,
+      );
+
+      if (compacted !== message.content) {
+        message.content = compacted;
+        compactedMessages++;
+      }
+    }
+
+    promptTokens =
+      estimatedPromptTokens(messages);
+
+    if (promptTokens <= promptBudgetTokens) {
+      break;
+    }
+  }
+
+  return {
+    promptTokens,
+    compactedMessages,
+  };
+}
+
+function boundedDiscoveryEvidence(
+  notes: readonly string[],
+) {
+  if (!notes.length) return undefined;
+
+  const joined = notes.join("\n");
+  const bytes = Buffer.from(joined);
+
+  if (bytes.length <= DISCOVERY_EVIDENCE_BYTES) {
+    return joined;
+  }
+
+  return bytes
+    .subarray(
+      bytes.length - DISCOVERY_EVIDENCE_BYTES,
+    )
+    .toString("utf8");
+}
+
+function discoveryNote(
+  name: string,
+  args: Record<string, unknown>,
+  content: string,
+) {
+  if (
+    ![
+      "list_files",
+      "search_code",
+      "read_file",
+      "git_diff",
+      "git_status",
+    ].includes(name)
+  ) {
+    return undefined;
+  }
+
+  const subject =
+    args.path ??
+    args.query ??
+    args.command ??
+    "";
+
+  const excerpt = content
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 650);
+
+  return `${name}${subject ? ` ${String(subject)}` : ""}: ${excerpt}`;
 }
 
 export class AgenticCodingWorker
@@ -213,11 +370,10 @@ export class AgenticCodingWorker
       );
     }
 
-    const apiKey =
-      (
-        process.env.OPENROUTER_API_KEY ??
-        ""
-      ).trim();
+    const apiKey = (
+      process.env.OPENROUTER_API_KEY ??
+      ""
+    ).trim();
 
     if (!apiKey) {
       throw Error(
@@ -232,10 +388,7 @@ export class AgenticCodingWorker
       timeout: input.requestTimeoutMs,
     });
 
-    const provider: Record<
-      string,
-      unknown
-    > = {
+    const provider: Record<string, unknown> = {
       require_parameters: true,
       allow_fallbacks: true,
       sort: {
@@ -249,10 +402,8 @@ export class AgenticCodingWorker
       input.completionPricePerMillion !== undefined
     ) {
       provider.max_price = {
-        prompt:
-          input.promptPricePerMillion,
-        completion:
-          input.completionPricePerMillion,
+        prompt: input.promptPricePerMillion,
+        completion: input.completionPricePerMillion,
       };
     }
 
@@ -263,22 +414,18 @@ export class AgenticCodingWorker
           messages,
           tools: toolDefinitions,
           tool_choice: "auto",
-          max_tokens:
-            maxOutputTokens,
+          max_tokens: maxOutputTokens,
           stream: false,
           ...({
-            session_id:
-              input.sessionId,
+            session_id: input.sessionId,
             provider,
           } as any),
         },
         {
-          timeout:
+          timeout: input.requestTimeoutMs,
+          signal: AbortSignal.timeout(
             input.requestTimeoutMs,
-          signal:
-            AbortSignal.timeout(
-              input.requestTimeoutMs,
-            ),
+          ),
         },
       );
 
@@ -296,12 +443,11 @@ export class AgenticCodingWorker
   ): Promise<CodingWorkerResult> {
     const started = Date.now();
 
-    const scope =
-      new WriteScope(
-        input.writeScope,
-        this.logger,
-        input.attemptId,
-      );
+    const scope = new WriteScope(
+      input.writeScope,
+      this.logger,
+      input.attemptId,
+    );
 
     const checkpoint =
       await AttemptCheckpoint.capture(
@@ -309,23 +455,18 @@ export class AgenticCodingWorker
         scope,
       );
 
-    const tools =
-      new AgentTools(
-        input.repoPath,
-        false,
-        input.commandTimeoutMs,
-        this.logger,
-        input.attemptId,
-        input.maxToolOutputBytes ??
-          4_000,
-        scope,
-        input.context
-          ?.relevantFiles ??
-          [],
-      );
+    const tools = new AgentTools(
+      input.repoPath,
+      false,
+      input.commandTimeoutMs,
+      this.logger,
+      input.attemptId,
+      input.maxToolOutputBytes ?? 4_000,
+      scope,
+      input.context?.relevantFiles ?? [],
+    );
 
-    const messages:
-      ChatCompletionMessageParam[] = [
+    const messages: ChatCompletionMessageParam[] = [
       {
         role: "system",
         content: [
@@ -355,38 +496,38 @@ export class AgenticCodingWorker
       },
     ];
 
-    const reservation =
-      this.budget.reserve(
-        input.budgetUsd,
-        input.maxTokens,
-      );
+    const reservation = this.budget.reserve(
+      input.budgetUsd,
+      input.maxTokens,
+    );
 
     const usages: Usage[] = [];
-    let modelServed =
-      input.model;
+    const discoveryNotes: string[] = [];
+    let modelServed = input.model;
     let mutationObserved = false;
     let providerDispatched = false;
+    let timeToFirstMutationMs: number | undefined;
 
     const settleKnown = () => {
-      const usage =
-        aggregateUsage(
-          usages,
-          input,
-        );
-
-      reservation.settle(
-        usage,
+      const usage = aggregateUsage(
+        usages,
+        input,
       );
 
+      reservation.settle(usage);
       return usage;
     };
 
-    const currentChanges =
-      async () =>
-        checkpoint.changed(
-          input.repoPath,
-          scope,
-        );
+    const currentChanges = async () =>
+      checkpoint.changed(
+        input.repoPath,
+        scope,
+      );
+
+    const evidencePacket = () =>
+      boundedDiscoveryEvidence(
+        discoveryNotes,
+      );
 
     const result = async (
       partial: Omit<
@@ -408,8 +549,7 @@ export class AgenticCodingWorker
         wallClockMs:
           Date.now() - started,
         costUsd:
-          usage.costUsd ??
-          undefined,
+          usage.costUsd ?? undefined,
         inputTokens:
           usage.promptTokens,
         outputTokens:
@@ -418,6 +558,7 @@ export class AgenticCodingWorker
           usage.cachedTokens,
         cacheWriteTokens:
           usage.cacheWriteTokens,
+        timeToFirstMutationMs,
         configuredTokenLimit:
           input.maxTokens,
         consumedTokens:
@@ -439,19 +580,55 @@ export class AgenticCodingWorker
         step < input.maxSteps;
         step++
       ) {
-        const usedTokens =
-          usages.reduce(
-            (sum, usage) =>
-              sum +
-              usage.promptTokens +
-              usage.completionTokens,
-            0,
+        const usedTokens = usages.reduce(
+          (sum, usage) =>
+            sum +
+            usage.promptTokens +
+            usage.completionTokens,
+          0,
+        );
+
+        const maxPromptByAttempt =
+          input.maxTokens -
+          usedTokens -
+          MIN_NEXT_OUTPUT_TOKENS;
+
+        const maxPromptByProvider =
+          (input.contextWindowTokens ?? Infinity) -
+          MIN_NEXT_OUTPUT_TOKENS;
+
+        const promptBudgetTokens = Math.max(
+          0,
+          Math.min(
+            maxPromptByAttempt,
+            maxPromptByProvider,
+          ),
+        );
+
+        const compacted =
+          compactToolHistoryToBudget(
+            messages,
+            promptBudgetTokens,
           );
 
-        const promptTokens =
-          estimatedPromptTokens(
-            messages,
+        if (compacted.compactedMessages > 0) {
+          this.logger.log(
+            "agentic_history_compaction",
+            {
+              subtaskId:
+                input.attemptId,
+              compacted_messages:
+                compacted.compactedMessages,
+              estimated_prompt_tokens:
+                compacted.promptTokens,
+              prompt_budget_tokens:
+                promptBudgetTokens,
+            },
           );
+        }
+
+        const promptTokens =
+          compacted.promptTokens;
 
         const attemptRoom =
           input.maxTokens -
@@ -462,13 +639,12 @@ export class AgenticCodingWorker
           (input.contextWindowTokens ?? Infinity) -
           promptTokens;
 
-        const tokenRoom =
-          Math.min(
-            attemptRoom,
-            providerRoom,
-          );
+        const tokenRoom = Math.min(
+          attemptRoom,
+          providerRoom,
+        );
 
-        if (tokenRoom < 256) {
+        if (tokenRoom < MIN_NEXT_OUTPUT_TOKENS) {
           const changes =
             await currentChanges();
 
@@ -476,12 +652,10 @@ export class AgenticCodingWorker
             mutationObserved = true;
 
             return result({
-              exitStatus:
-                "completed",
+              exitStatus: "completed",
               changedPaths:
                 changes.map(
-                  (change) =>
-                    change.path,
+                  (change) => change.path,
                 ),
               terminationReason:
                 "candidate_ready_for_verification",
@@ -492,6 +666,10 @@ export class AgenticCodingWorker
               exactLimitFired:
                 "agentic_token_preflight_after_mutation",
               steps: step,
+              discoveryEvidence:
+                evidencePacket(),
+              discoveryProgress:
+                discoveryNotes.length,
             });
           }
 
@@ -507,33 +685,35 @@ export class AgenticCodingWorker
             progressPhase:
               "DISCOVERY",
             steps: step,
+            discoveryEvidence:
+              evidencePacket(),
+            discoveryProgress:
+              discoveryNotes.length,
           });
         }
 
-        let maxOutput =
-          Math.min(
-            input.maxOutputTokens,
-            1_200,
-            tokenRoom,
-          );
+        let maxOutput = Math.min(
+          input.maxOutputTokens,
+          1_200,
+          tokenRoom,
+        );
 
         if (
           input.promptPricePerMillion !== undefined &&
           input.completionPricePerMillion !== undefined
         ) {
-          const spent =
-            usages.reduce(
-              (sum, usage) =>
-                sum +
-                (usage.costUsd ??
-                  estimateUsageCost(
-                    usage,
-                    input.promptPricePerMillion!,
-                    input.completionPricePerMillion!,
-                  ) ??
-                  0),
-              0,
-            );
+          const spent = usages.reduce(
+            (sum, usage) =>
+              sum +
+              (usage.costUsd ??
+                estimateUsageCost(
+                  usage,
+                  input.promptPricePerMillion!,
+                  input.completionPricePerMillion!,
+                ) ??
+                0),
+            0,
+          );
 
           const promptCost =
             promptTokens *
@@ -545,21 +725,16 @@ export class AgenticCodingWorker
             spent -
             promptCost;
 
-          if (
-            availableForOutput <=
-            0
-          ) {
+          if (availableForOutput <= 0) {
             const changes =
               await currentChanges();
 
             if (changes.length) {
               return result({
-                exitStatus:
-                  "completed",
+                exitStatus: "completed",
                 changedPaths:
                   changes.map(
-                    (change) =>
-                      change.path,
+                    (change) => change.path,
                   ),
                 terminationReason:
                   "candidate_ready_for_verification",
@@ -570,12 +745,15 @@ export class AgenticCodingWorker
                 exactLimitFired:
                   "agentic_cost_preflight_after_mutation",
                 steps: step,
+                discoveryEvidence:
+                  evidencePacket(),
+                discoveryProgress:
+                  discoveryNotes.length,
               });
             }
 
             return result({
-              exitStatus:
-                "failed",
+              exitStatus: "failed",
               changedPaths: [],
               terminationReason:
                 "attempt_budget_exhausted",
@@ -586,22 +764,24 @@ export class AgenticCodingWorker
               progressPhase:
                 "DISCOVERY",
               steps: step,
+              discoveryEvidence:
+                evidencePacket(),
+              discoveryProgress:
+                discoveryNotes.length,
             });
           }
 
           if (
-            input.completionPricePerMillion >
-            0
+            input.completionPricePerMillion > 0
           ) {
-            maxOutput =
-              Math.min(
-                maxOutput,
-                Math.floor(
-                  availableForOutput *
-                    1e6 /
-                    input.completionPricePerMillion,
-                ),
-              );
+            maxOutput = Math.min(
+              maxOutput,
+              Math.floor(
+                availableForOutput *
+                  1e6 /
+                  input.completionPricePerMillion,
+              ),
+            );
           }
         }
 
@@ -611,12 +791,10 @@ export class AgenticCodingWorker
 
           if (changes.length) {
             return result({
-              exitStatus:
-                "completed",
+              exitStatus: "completed",
               changedPaths:
                 changes.map(
-                  (change) =>
-                    change.path,
+                  (change) => change.path,
                 ),
               terminationReason:
                 "candidate_ready_for_verification",
@@ -627,6 +805,10 @@ export class AgenticCodingWorker
               exactLimitFired:
                 "agentic_output_reserve_after_mutation",
               steps: step,
+              discoveryEvidence:
+                evidencePacket(),
+              discoveryProgress:
+                discoveryNotes.length,
             });
           }
 
@@ -642,6 +824,10 @@ export class AgenticCodingWorker
             progressPhase:
               "DISCOVERY",
             steps: step,
+            discoveryEvidence:
+              evidencePacket(),
+            discoveryProgress:
+              discoveryNotes.length,
           });
         }
 
@@ -661,21 +847,19 @@ export class AgenticCodingWorker
 
         providerDispatched = true;
 
-        const response =
-          await this.request(
-            input,
-            messages,
-            maxOutput,
-          );
+        const response = await this.request(
+          input,
+          messages,
+          maxOutput,
+        );
 
         modelServed =
           response.model ||
           input.model;
 
-        const usage =
-          parseUsage(
-            response.usage,
-          );
+        const usage = parseUsage(
+          response.usage,
+        );
 
         usages.push(usage);
 
@@ -700,21 +884,17 @@ export class AgenticCodingWorker
             costUsd:
               usage.costUsd,
             wallClockMs:
-              Date.now() -
-              started,
+              Date.now() - started,
           },
         );
 
         const assistant =
           response.message as any;
 
-        messages.push(
-          assistant,
-        );
+        messages.push(assistant);
 
         const calls =
-          assistant.tool_calls ??
-          [];
+          assistant.tool_calls ?? [];
 
         if (!calls.length) {
           const changes =
@@ -724,60 +904,97 @@ export class AgenticCodingWorker
             mutationObserved = true;
 
             return result({
-              exitStatus:
-                "completed",
+              exitStatus: "completed",
               changedPaths:
                 changes.map(
-                  (change) =>
-                    change.path,
+                  (change) => change.path,
                 ),
               terminationReason:
                 "agentic_completed",
               progressPhase:
                 "MUTATION_OBSERVED",
               steps: step + 1,
+              discoveryEvidence:
+                evidencePacket(),
+              discoveryProgress:
+                discoveryNotes.length,
             });
           }
 
-          messages.push({
-            role: "user",
-            content:
-              "No mutation has been made yet. Continue with repository tools and implement the requested change. Do not only explain.",
-          });
+          const nudge =
+            "No mutation has been made yet. Continue with repository tools and implement the requested change. Do not only explain.";
+
+          const last =
+            messages.at(-1) as {
+              role?: string;
+              content?: unknown;
+            } | undefined;
+
+          if (
+            last?.role !== "user" ||
+            last.content !== nudge
+          ) {
+            messages.push({
+              role: "user",
+              content: nudge,
+            });
+          }
 
           continue;
         }
 
         for (
-          const call
-          of calls.slice(0, 8)
+          let callIndex = 0;
+          callIndex < calls.length;
+          callIndex++
         ) {
+          const call = calls[callIndex]!;
           let content: string;
+          let parsedArgs: Record<string, unknown> = {};
 
-          try {
-            const args =
-              JSON.parse(
+          if (callIndex >= MAX_TOOL_CALLS_PER_TURN) {
+            content =
+              "Tool call skipped by Koda because this provider turn exceeded the per-turn tool-call bound. Request the tool again on the next turn if it is still needed.";
+          } else {
+            try {
+              parsedArgs = JSON.parse(
                 call.function.arguments,
               );
 
-            content =
-              String(
+              content = String(
                 await tools.execute(
                   call.function.name,
-                  args,
+                  parsedArgs,
                 ),
               );
-          } catch (error) {
-            content =
-              `Tool error: ${String(
-                error,
-              )}`;
+            } catch (error) {
+              content =
+                `Tool error: ${String(error)}`;
+            }
+          }
+
+          const note = discoveryNote(
+            call.function.name,
+            parsedArgs,
+            content,
+          );
+
+          if (note) {
+            discoveryNotes.push(note);
+
+            while (
+              discoveryNotes.length > 1 &&
+              Buffer.byteLength(
+                discoveryNotes.join("\n"),
+              ) > DISCOVERY_EVIDENCE_BYTES
+            ) {
+              discoveryNotes.shift();
+            }
           }
 
           messages.push({
             role: "tool",
-            tool_call_id:
-              call.id,
+            tool_call_id: call.id,
             content,
           } as any);
         }
@@ -786,7 +1003,31 @@ export class AgenticCodingWorker
           await currentChanges();
 
         if (changes.length) {
+          if (!mutationObserved) {
+            timeToFirstMutationMs =
+              Date.now() - started;
+          }
+
           mutationObserved = true;
+
+          if (input.returnOnMutation) {
+            return result({
+              exitStatus: "completed",
+              changedPaths:
+                changes.map(
+                  (change) => change.path,
+                ),
+              terminationReason:
+                "candidate_ready_for_verification",
+              progressPhase:
+                "MUTATION_OBSERVED",
+              steps: step + 1,
+              discoveryEvidence:
+                evidencePacket(),
+              discoveryProgress:
+                discoveryNotes.length,
+            });
+          }
         }
       }
 
@@ -800,8 +1041,7 @@ export class AgenticCodingWorker
             : "failed",
         changedPaths:
           changes.map(
-            (change) =>
-              change.path,
+            (change) => change.path,
           ),
         terminationReason:
           changes.length
@@ -816,6 +1056,10 @@ export class AgenticCodingWorker
             ? "MUTATION_OBSERVED"
             : "DISCOVERY",
         steps: input.maxSteps,
+        discoveryEvidence:
+          evidencePacket(),
+        discoveryProgress:
+          discoveryNotes.length,
       });
     } catch (error) {
       if (providerDispatched) {
@@ -829,16 +1073,14 @@ export class AgenticCodingWorker
           .catch(() => []);
 
       return {
-        exitStatus:
-          "infra_failure",
+        exitStatus: "infra_failure",
         model: modelServed,
         engine: "agentic",
         engineVersion:
           AGENTIC_CODING_VERSION,
         changedPaths:
           changes.map(
-            (change) =>
-              change.path,
+            (change) => change.path,
           ),
         wallClockMs:
           Date.now() - started,
@@ -853,6 +1095,10 @@ export class AgenticCodingWorker
           String(error),
         configuredTokenLimit:
           input.maxTokens,
+        discoveryEvidence:
+          evidencePacket(),
+        discoveryProgress:
+          discoveryNotes.length,
       };
     }
   }

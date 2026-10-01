@@ -210,3 +210,56 @@ test("focused Aider attempts include framing overhead and remain stage bounded",
   assert.ok(policy.forecastProviderInputTokens >= 3_048);
   assert.ok(policy.maxTokens <= base.stageMaxTokens);
 });
+
+test("agentic multi-turn budgeting funds the cumulative trajectory instead of only the largest single turn", () => {
+  const policy = attemptLimitPolicy({
+    ...base,
+    fingerprint: fingerprint({
+      scope: "multi-file",
+      executionStrategy: "stable",
+      localizationConfidence: "high",
+      expectedFiles: 2,
+      repoReasoningHeavy: true,
+    }),
+    promptBytes: 4_744,
+    plannedBudgetUsd: 0.16,
+    remainingUsd: 1,
+    stageMaxUsd: 1,
+    modelContextTokens: 128_000,
+  });
+
+  // Regression for the failing smoke run: the old code made 8,758 both the
+  // largest single-turn requirement AND the whole attempt budget.
+  assert.equal(policy.viableCalls, 6);
+  assert.equal(policy.minimumViableTokens, 8_758);
+  assert.equal(policy.providerContextRequired, 8_758);
+  assert.equal(policy.desiredTrajectoryTokens, 31_368);
+
+  // The configured stage cap is 30k, so the agent now receives the whole
+  // available stage instead of dying after one or two discovery turns.
+  assert.equal(policy.maxTokens, 30_000);
+  assert.equal(policy.viable, true);
+});
+
+test("provider context checks use the largest single turn, not cumulative repeated prompt billing", () => {
+  const policy = attemptLimitPolicy({
+    ...base,
+    fingerprint: fingerprint({
+      scope: "multi-file",
+      executionStrategy: "stable",
+      localizationConfidence: "high",
+      expectedFiles: 2,
+      repoReasoningHeavy: true,
+    }),
+    promptBytes: 4_744,
+    plannedBudgetUsd: 0.16,
+    remainingUsd: 1,
+    stageMaxUsd: 1,
+    modelContextTokens: 9_000,
+  });
+
+  assert.equal(policy.providerContextRequired, 8_758);
+  assert.ok(policy.desiredTrajectoryTokens > 30_000);
+  assert.equal(policy.nonViableLimitKind, undefined);
+  assert.equal(policy.viable, true);
+});

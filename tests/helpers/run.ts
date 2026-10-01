@@ -12,6 +12,7 @@ import type { RepositoryExplorer } from "../../src/agent/openHandsExplorer.js";
 /** Adapts historical mocked OpenRouter responses to the coding-worker seam.
  * It is test-only; production always constructs AiderExecutor. */
 class MockCodingWorker implements CodingWorker {
+  readonly engine = "aider" as const;
   constructor(private readonly gateway: Gateway) {}
   async run(input: CodingWorkerInput) {
     const before = await snapshotTree(input.repoPath);

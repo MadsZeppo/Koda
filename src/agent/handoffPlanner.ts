@@ -45,6 +45,7 @@ export interface CodingHandoffInput {
 const AIDER_FRAMING_RESERVE_TOKENS = 4_096;
 const TOKEN_ESTIMATE_SAFETY = 1.4;
 const PER_FILE_FRAMING_BYTES = 512;
+const SOURCE_BYTES_PER_TOKEN = 4;
 
 function normalized(path: string) {
   const value = path.trim().replaceAll("\\", "/");
@@ -157,10 +158,16 @@ function filePromptTokens(
   path: string,
   size: number,
 ) {
-  return safeTokenEstimate(
-    size +
-      Buffer.byteLength(path) +
-      PER_FILE_FRAMING_BYTES,
+  return Math.max(
+    1,
+    Math.ceil(
+      (
+        size +
+        Buffer.byteLength(path) +
+        PER_FILE_FRAMING_BYTES
+      ) /
+      SOURCE_BYTES_PER_TOKEN,
+    ),
   );
 }
 

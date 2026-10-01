@@ -138,6 +138,39 @@ test(
 );
 
 test(
+  "known source files fitting the real Aider attempt are handed to Aider",
+  async () => {
+    const root = await fixture();
+
+    await writeFile(
+      join(root, "src/planner.ts"),
+      "p".repeat(10_000),
+    );
+
+    await writeFile(
+      join(root, "src/executor.ts"),
+      "e".repeat(66_000),
+    );
+
+    const plan = await planCodingHandoff({
+      ...base,
+      repoPath: root,
+      attemptTokenCapacity: 30_000,
+      writeScope: [
+        "src/planner.ts",
+        "src/executor.ts",
+      ],
+    });
+
+    assert.equal(plan.mode, "aider");
+    assert.deepEqual(plan.aiderFiles?.editable, [
+      "src/planner.ts",
+      "src/executor.ts",
+    ]);
+  },
+);
+
+test(
   "one localized oversized file can use bounded DirectEdit",
   async () => {
     const root = await fixture();

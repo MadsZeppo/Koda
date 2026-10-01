@@ -162,6 +162,12 @@ export function attemptLimitPolicy(
       ? 0
       : 900;
 
+  /**
+   * Cumulative provider input over the whole attempt.
+   *
+   * A multi-turn agent pays for the repeated conversation prefix on every
+   * provider call, so this is intentionally larger than a single request.
+   */
   const trajectoryPromptTokens =
     directEdit || input.boundedDiscovery
       ? Math.ceil(
@@ -201,17 +207,45 @@ export function attemptLimitPolicy(
       : 0,
   );
 
-  const trajectoryMinimumTokens =
+  /**
+   * Minimum capacity needed for the largest single provider turn.
+   *
+   * This is deliberately NOT the cumulative trajectory. The previous code
+   * accidentally used this single-turn quantity as the whole attempt budget,
+   * which is why a six-turn agentic trajectory could be capped at 8,758
+   * tokens even though the policy had already forecast ~31k cumulative tokens.
+   */
+  const peakProviderPromptTokens =
     directEdit ||
     input.boundedDiscovery ||
     input.aiderWorker
-      ? viablePromptTokens + viableOutputTokens
-      : promptTokens +
-        trajectoryOutputTokens +
-        toolObservationTokens *
-          Math.max(0, viableCalls - 1);
+      ? viablePromptTokens
+      : Math.ceil(
+          promptTokens +
+            (perTurnOutput + toolObservationTokens) *
+              Math.max(0, viableCalls - 1),
+        );
 
-  const minimumViableTokens = trajectoryMinimumTokens;
+  const peakProviderOutputTokens =
+    directEdit ||
+    input.boundedDiscovery ||
+    input.aiderWorker
+      ? viableOutputTokens
+      : perTurnOutput;
+
+  const minimumViableTokens =
+    peakProviderPromptTokens +
+    peakProviderOutputTokens;
+
+  /**
+   * Desired cumulative budget for the whole provider trajectory.
+   *
+   * This is what maxTokens should try to fund. It is still bounded by the
+   * remaining run/stage capacity below.
+   */
+  const desiredTrajectoryTokens =
+    viablePromptTokens +
+    viableOutputTokens;
 
   /**
    * Whole-attempt capacity.
@@ -224,10 +258,14 @@ export function attemptLimitPolicy(
   );
 
   /**
-   * One provider request must fit inside the model context.
+   * ONE provider request must fit inside the model context.
+   *
+   * Do not compare the model context window with cumulative trajectory input;
+   * repeated prompts count against Koda's attempt budget, not simultaneously
+   * against one provider request's context window.
    */
   const providerContextRequired =
-    viablePromptTokens + viableOutputTokens;
+    minimumViableTokens;
 
   const providerContextCapacity =
     input.modelContextTokens ?? Infinity;
@@ -240,7 +278,7 @@ export function attemptLimitPolicy(
   const maxTokens = Math.min(
     attemptTokenCapacity,
     Math.max(
-      minimumViableTokens,
+      desiredTrajectoryTokens,
       input.maxOutputTokens * 2,
       boundedDiscoveryTokens,
       input.learnedP90Tokens ?? 0,
@@ -341,6 +379,7 @@ export function attemptLimitPolicy(
     timeoutMs,
 
     minimumViableTokens,
+    desiredTrajectoryTokens,
 
     attemptTokenCapacity,
     providerContextRequired,
