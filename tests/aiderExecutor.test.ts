@@ -196,6 +196,28 @@ test("Aider invocation pre-attaches bounded editable and read-only files without
   assert.deepEqual(result.changedPaths, ["src/value.cjs"]);
 });
 
+test("Aider keeps an authorized missing path and can create the new file", async (t) => {
+  const root = await fixture(t);
+  const runInput: CodingWorkerInput = {
+    ...input(root),
+    writeScope: ["src/newModule.cjs"],
+    aiderFiles: {
+      editable: ["src/newModule.cjs"],
+      readOnly: [],
+    },
+  };
+  const w = worker(root, async (cwd, invocation) => {
+    assert.equal(invocation.args[3], "src/newModule.cjs");
+    await writeFile(join(cwd, "src/newModule.cjs"), "module.exports = 1;\n");
+    await report(invocation, "diff");
+    return success;
+  });
+
+  const result = await w.run(runInput);
+  assert.equal(result.exitStatus, "completed");
+  assert.deepEqual(result.changedPaths, ["src/newModule.cjs"]);
+});
+
 test("Aider refuses to dispatch until repository exploration supplies an editable file", async (t) => {
   const root = await fixture(t);
   let dispatched = false;

@@ -130,6 +130,44 @@ test("multiple implementation candidates remain in the authorized scope", async 
   assert.deepEqual(result.editableCandidates.map(({ path }) => path), ["src/budget.ts", "src/router.ts"]);
 });
 
+test("OpenHands may authorize a safe missing path as a new editable file", async (t) => {
+  const f = await fixture(t);
+  const result = await new OpenHandsExplorer(f.gateway, {
+    runner: async () => report(exploration({
+      editableCandidates: [{
+        path: "src/executionOutcome.ts",
+        reason: "A new reusable module is the smallest design",
+      }],
+      readonlyFiles: [{ path: "src/router.ts", reason: "integration context" }],
+      dependencies: [{
+        from: "src/router.ts",
+        to: "src/executionOutcome.ts",
+        kind: "will import",
+      }],
+      evidence: [{
+        path: "src/executionOutcome.ts",
+        detail: "authorized new module",
+      }],
+    })),
+  }).explore({ repoPath: f.root, task: "Create a reusable execution outcome module", profile: f.profile });
+
+  assert.deepEqual(result.editableCandidates.map(({ path }) => path), [
+    "src/executionOutcome.ts",
+  ]);
+});
+
+test("missing read-only and evidence paths remain invalid", async (t) => {
+  const f = await fixture(t);
+  await assert.rejects(
+    new OpenHandsExplorer(f.gateway, {
+      runner: async () => report(exploration({
+        readonlyFiles: [{ path: "src/missing.ts", reason: "not inspected" }],
+      })),
+    }).explore({ repoPath: f.root, task: "Inspect budgeting", profile: f.profile }),
+    /unknown repository path/,
+  );
+});
+
 test("readonly dependencies and tests never become editable", async (t) => {
   const f = await fixture(t);
   const result = await new OpenHandsExplorer(f.gateway, { runner: async () => report() }).explore({

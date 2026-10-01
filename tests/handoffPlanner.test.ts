@@ -171,6 +171,40 @@ test(
 );
 
 test(
+  "focused mixed existing and new scope near the 30k boundary stays on Aider",
+  async () => {
+    const root = await fixture();
+    await writeFile(join(root, "src/worker.ts"), "w".repeat(3_100));
+    await writeFile(join(root, "src/executor.ts"), "e".repeat(67_000));
+    await writeFile(join(root, "src/summary.ts"), "s".repeat(12_800));
+
+    const plan = await planCodingHandoff({
+      ...base,
+      repoPath: root,
+      attemptTokenCapacity: 30_000,
+      writeScope: [
+        "src/worker.ts",
+        "src/executor.ts",
+        "src/summary.ts",
+        "src/executionOutcome.ts",
+      ],
+    });
+
+    assert.equal(plan.mode, "aider");
+    assert.deepEqual(plan.aiderFiles?.editable, [
+      "src/worker.ts",
+      "src/executor.ts",
+      "src/summary.ts",
+      "src/executionOutcome.ts",
+    ]);
+    assert.ok(
+      Math.ceil(plan.estimatedPromptBytes / 4) + 4_096 + 4_096 <= 30_000,
+      "planner admission must remain viable under attemptPolicy's byte conversion",
+    );
+  },
+);
+
+test(
   "one localized oversized file can use bounded DirectEdit",
   async () => {
     const root = await fixture();
@@ -196,6 +230,26 @@ test(
       plan.mode,
       "direct",
     );
+  },
+);
+
+test(
+  "concrete missing files remain editable Aider creation targets",
+  async () => {
+    const root = await fixture();
+    await writeFile(join(root, "src/existing.ts"), "export const value = 1;\n");
+
+    const plan = await planCodingHandoff({
+      ...base,
+      repoPath: root,
+      writeScope: ["src/existing.ts", "src/newModule.ts"],
+    });
+
+    assert.equal(plan.mode, "aider");
+    assert.deepEqual(plan.aiderFiles?.editable, [
+      "src/existing.ts",
+      "src/newModule.ts",
+    ]);
   },
 );
 

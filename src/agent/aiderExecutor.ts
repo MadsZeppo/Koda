@@ -288,16 +288,27 @@ export function buildAiderPrompt(
 
 async function existingAiderFiles(root: string, selected: ReturnType<typeof selectAiderFiles>) {
   const rootReal = await realpath(root);
-  const keep = async (path: string) => {
+  const keep = async (path: string, allowMissing = false) => {
     try {
       const candidateReal = await realpath(join(root, path));
       const rel = relative(rootReal, candidateReal);
       return !(rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel));
     } catch {
-      return false;
+      if (!allowMissing) return false;
+      let ancestor = dirname(join(root, path));
+      while (ancestor !== root) {
+        try {
+          const ancestorReal = await realpath(ancestor);
+          const rel = relative(rootReal, ancestorReal);
+          return !(rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel));
+        } catch {
+          ancestor = dirname(ancestor);
+        }
+      }
+      return true;
     }
   };
-  const editable = (await Promise.all(selected.editable.map(async (path) => [path, await keep(path)] as const)))
+  const editable = (await Promise.all(selected.editable.map(async (path) => [path, await keep(path, true)] as const)))
     .filter(([, exists]) => exists).map(([path]) => path);
   const editableSet = new Set(editable);
   const readOnly = (await Promise.all(selected.readOnly.map(async (path) => [path, await keep(path)] as const)))

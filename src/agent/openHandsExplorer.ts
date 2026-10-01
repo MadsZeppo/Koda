@@ -1,5 +1,5 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { execa } from "execa";
@@ -208,17 +208,38 @@ export function fastPathExploration(
   };
 }
 
-async function validatePath(root: string, known: ReadonlySet<string>, value: string) {
+async function validatePath(
+  root: string,
+  known: ReadonlySet<string>,
+  value: string,
+  allowMissing = false,
+) {
   if (!value || value.includes("\0") || value.startsWith("/") || /^[A-Za-z]:\//.test(value))
     throw new OpenHandsOperationalError(`OpenHands returned invalid repository path: ${value}`);
   const normalized = value.replaceAll("\\", "/").split("/").filter((part) => part && part !== ".");
   if (!normalized.length || normalized.some((part) => part === "..") || normalized[0] === ".git")
     throw new OpenHandsOperationalError(`OpenHands returned invalid repository path: ${value}`);
   const path = normalized.join("/");
-  if (!known.has(path))
+  if (!known.has(path) && !allowMissing)
     throw new OpenHandsOperationalError(`OpenHands returned unknown repository path: ${path}`);
-  const canonicalRoot = await import("node:fs/promises").then(({ realpath }) => realpath(root));
-  const canonical = await import("node:fs/promises").then(({ realpath }) => realpath(join(root, path)));
+  const canonicalRoot = await realpath(root);
+  let candidate = join(root, path);
+  try {
+    await realpath(candidate);
+  } catch {
+    if (!allowMissing)
+      throw new OpenHandsOperationalError(`OpenHands returned unknown repository path: ${path}`);
+    candidate = dirname(candidate);
+    while (candidate !== root) {
+      try {
+        await realpath(candidate);
+        break;
+      } catch {
+        candidate = dirname(candidate);
+      }
+    }
+  }
+  const canonical = await realpath(candidate);
   const rel = relative(canonicalRoot, canonical);
   if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel))
     throw new OpenHandsOperationalError(`OpenHands path escapes repository: ${path}`);
@@ -227,35 +248,61 @@ async function validatePath(root: string, known: ReadonlySet<string>, value: str
 
 async function validateExploration(root: string, profile: RepoProfile, raw: RepositoryExploration) {
   const known = new Set(profile.files);
-  const validateReasons = async (values: RepositoryExploration["editableCandidates"]) => {
+  const validateReasons = async (
+    values: RepositoryExploration["editableCandidates"],
+    allowMissing = false,
+  ) => {
     const result: typeof values = [];
     const seen = new Set<string>();
     for (const item of values) {
-      const path = await validatePath(root, known, item.path);
+      const path = await validatePath(root, known, item.path, allowMissing);
       if (!seen.has(path)) result.push({ path, reason: item.reason.slice(0, 600) });
       seen.add(path);
     }
     return result;
   };
-  const editableCandidates = await validateReasons(raw.editableCandidates);
+  const editableCandidates = await validateReasons(raw.editableCandidates, true);
+  const authorized = new Set([
+    ...known,
+    ...editableCandidates.map(({ path }) => path),
+  ]);
 
   // Do not infer write scope from files inspected by OpenHands.
   // OpenHands owns repository scope discovery; this layer only validates
   // the scope it explicitly submitted.
 
   const editable = new Set(editableCandidates.map(({ path }) => path));
-  const readonlyFiles = (await validateReasons(raw.readonlyFiles)).filter(({ path }) => !editable.has(path));
-  const relatedTests = [...new Set(await Promise.all(raw.relatedTests.map((path) => validatePath(root, known, path))))]
+  const validateAuthorizedPath = (path: string) => {
+    const normalized = path.replaceAll("\\", "/").split("/")
+      .filter((part) => part && part !== ".").join("/");
+    if (!authorized.has(normalized))
+      throw new OpenHandsOperationalError(`OpenHands returned unknown repository path: ${normalized}`);
+    return validatePath(root, authorized, path, true);
+  };
+  const validateAuthorizedReasons = async (
+    values: RepositoryExploration["editableCandidates"],
+  ) => {
+    const result: typeof values = [];
+    const seen = new Set<string>();
+    for (const item of values) {
+      const path = await validateAuthorizedPath(item.path);
+      if (!seen.has(path)) result.push({ path, reason: item.reason.slice(0, 600) });
+      seen.add(path);
+    }
+    return result;
+  };
+  const readonlyFiles = (await validateAuthorizedReasons(raw.readonlyFiles)).filter(({ path }) => !editable.has(path));
+  const relatedTests = [...new Set(await Promise.all(raw.relatedTests.map(validateAuthorizedPath)))]
     .filter((path) => !editable.has(path));
   const dependencies = [];
   for (const edge of raw.dependencies) dependencies.push({
-    from: await validatePath(root, known, edge.from),
-    to: await validatePath(root, known, edge.to),
+    from: await validateAuthorizedPath(edge.from),
+    to: await validateAuthorizedPath(edge.to),
     kind: edge.kind.slice(0, 120),
   });
   const evidence = [];
   for (const item of raw.evidence) evidence.push({
-    path: await validatePath(root, known, item.path),
+    path: await validateAuthorizedPath(item.path),
     detail: item.detail.slice(0, 800),
   });
   return repositoryExplorationSchema.parse({

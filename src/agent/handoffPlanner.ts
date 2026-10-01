@@ -2,6 +2,7 @@ import { lstat } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { CodingWorkerContext } from "./codingWorker.js";
+import { AIDER_PROMPT_OVERHEAD_TOKENS } from "./attemptPolicy.js";
 
 export type CodingHandoffMode = "direct" | "aider" | "agentic";
 
@@ -42,10 +43,26 @@ export interface CodingHandoffInput {
   directEditEligible: boolean;
 }
 
-const AIDER_FRAMING_RESERVE_TOKENS = 4_096;
+/**
+ * Aider is currently budgeted as one provider turn by attemptPolicy.
+ * Keep this reserve identical to its Aider output reservation:
+ *
+ *   Math.min(input.maxOutputTokens, 4_096)
+ *
+ * The handoff planner must be at least as conservative as the authoritative
+ * attempt preflight. Otherwise it can select Aider and have attemptPolicy
+ * reject the exact same packet a millisecond later.
+ */
+const AIDER_OUTPUT_RESERVE_TOKENS = 4_096;
+
 const TOKEN_ESTIMATE_SAFETY = 1.4;
 const PER_FILE_FRAMING_BYTES = 512;
-const SOURCE_BYTES_PER_TOKEN = 4;
+// Repository source is materially denser than prose/JSON framing. Keeping a
+// separate calibrated ratio avoids rejecting a focused Aider handoff at the
+// 30k boundary while framing and output reserves remain fully enforced.
+const SOURCE_BYTES_PER_TOKEN = 4.5;
+// attemptPolicy converts prompt bytes back to tokens with bytes / 4.
+const ATTEMPT_POLICY_BYTES_PER_TOKEN = 4;
 
 function normalized(path: string) {
   const value = path.trim().replaceAll("\\", "/");
@@ -65,18 +82,24 @@ function normalized(path: string) {
     return undefined;
   }
 
-  return value
-    .split("/")
-    .filter((part) => part && part !== ".")
-    .join("/") || ".";
+  return (
+    value
+      .split("/")
+      .filter((part) => part && part !== ".")
+      .join("/") || "."
+  );
 }
 
 function evidenceFiles(value: unknown): string[] {
-  if (!value || typeof value !== "object") return [];
+  if (!value || typeof value !== "object") {
+    return [];
+  }
 
-  const files = (value as {
-    relevantFiles?: unknown;
-  }).relevantFiles;
+  const files = (
+    value as {
+      relevantFiles?: unknown;
+    }
+  ).relevantFiles;
 
   return Array.isArray(files)
     ? files.filter(
@@ -105,17 +128,14 @@ function compactPromptBytes(
     }),
   ].join("\n");
 
-  return (
-    Buffer.byteLength(summary) +
-    1_024
-  );
+  return Buffer.byteLength(summary) + 1_024;
 }
 
 function safeTokenEstimate(bytes: number) {
   return Math.max(
     1,
     Math.ceil(
-      (bytes / 4) *
+      (bytes / SOURCE_BYTES_PER_TOKEN) *
         TOKEN_ESTIMATE_SAFETY,
     ),
   );
@@ -166,7 +186,7 @@ function filePromptTokens(
         Buffer.byteLength(path) +
         PER_FILE_FRAMING_BYTES
       ) /
-      SOURCE_BYTES_PER_TOKEN,
+        ATTEMPT_POLICY_BYTES_PER_TOKEN,
     ),
   );
 }
@@ -233,7 +253,9 @@ function maxPromptTokensByCost(
     input.costCapacityUsd -
     outputCost;
 
-  if (available <= 0) return 0;
+  if (available <= 0) {
+    return 0;
+  }
 
   if (inputPrice === 0) {
     return Infinity;
@@ -255,16 +277,29 @@ function maxPromptTokensByCost(
  * Key invariant:
  * repo size is never allowed to become provider prompt size by accident.
  *
- * - Aider gets complete existing editable files only when they fit.
+ * - Aider gets complete editable files only when the complete one-turn Aider
+ *   packet fits BOTH Koda's attempt budget and the provider context window.
+ * - The exact Aider framing/output reserves match attemptPolicy's one-turn
+ *   viability assumptions so planner admission cannot contradict preflight.
  * - Read-only files are admitted in relevance order while budget remains.
  * - A large localized single target may use DirectEdit, which sends bounded
  *   excerpts rather than the complete file.
- * - Broad, missing, directory-scoped or oversized work becomes agentic and
- *   retrieves context progressively through search/read tools.
+ * - Broad, directory-scoped or oversized work becomes agentic and retrieves
+ *   context progressively through search/read tools.
+ * - Validated missing editable paths remain authorized creation targets.
  */
 export async function planCodingHandoff(
   input: CodingHandoffInput,
 ): Promise<CodingHandoffPlan> {
+  /**
+   * Aider is a one-provider-turn worker for admission purposes.
+   *
+   * attemptTokenCapacity is the cumulative Koda capacity.
+   * modelContextTokens is one provider request's capacity.
+   *
+   * For Aider the same single turn must fit both, so the admissible capacity
+   * is the smaller value.
+   */
   const capacity = Math.max(
     0,
     Math.min(
@@ -274,17 +309,22 @@ export async function planCodingHandoff(
     ),
   );
 
+  /**
+   * IMPORTANT:
+   *
+   * attemptPolicy reserves up to 4,096 output tokens for Aider.
+   * The old planner used 20% of at most 16k (= 3,200 tokens at a 30k stage
+   * budget), which made it less conservative than attemptPolicy.
+   *
+   * That produced the contradiction:
+   *   planner => Aider fits
+   *   attemptPolicy => required_tokens 30,154 > 30,000
+   *
+   * Use the exact same Aider output reserve here.
+   */
   const outputReserve = Math.min(
     input.maxOutputTokens,
-    Math.max(
-      768,
-      Math.floor(
-        Math.min(
-          capacity,
-          16_000,
-        ) * 0.2,
-      ),
-    ),
+    AIDER_OUTPUT_RESERVE_TOKENS,
   );
 
   const costPromptCapacity =
@@ -293,15 +333,25 @@ export async function planCodingHandoff(
       outputReserve,
     );
 
+  /**
+   * This is the maximum provider INPUT packet we are allowed to hand to
+   * Aider after reserving:
+   *
+   * - Aider/system framing overhead
+   * - Aider completion/output capacity
+   *
+   * The same framing constant is imported from attemptPolicy so those two
+   * layers cannot silently drift on prompt overhead.
+   */
   const admittedPromptTokens =
     Math.max(
       0,
       Math.min(
         capacity -
           outputReserve -
-          AIDER_FRAMING_RESERVE_TOKENS,
+          AIDER_PROMPT_OVERHEAD_TOKENS,
         costPromptCapacity -
-          AIDER_FRAMING_RESERVE_TOKENS,
+          AIDER_PROMPT_OVERHEAD_TOKENS,
       ),
     );
 
@@ -327,7 +377,8 @@ export async function planCodingHandoff(
     return {
       mode: "agentic",
       estimatedPromptBytes:
-        compactTokens * 4,
+        compactTokens *
+        ATTEMPT_POLICY_BYTES_PER_TOKEN,
       reason:
         "broad or unresolved write scope requires progressive repository reads",
     };
@@ -355,7 +406,8 @@ export async function planCodingHandoff(
     return {
       mode: "agentic",
       estimatedPromptBytes:
-        compactTokens * 4,
+        compactTokens *
+        ATTEMPT_POLICY_BYTES_PER_TOKEN,
       reason:
         `target ${unsafeTarget.path} cannot be admitted as a normal full-file handoff`,
     };
@@ -371,7 +423,8 @@ export async function planCodingHandoff(
     return {
       mode: "agentic",
       estimatedPromptBytes:
-        compactTokens * 4,
+        compactTokens *
+        ATTEMPT_POLICY_BYTES_PER_TOKEN,
       reason:
         "directory-level write scope requires progressive file selection",
     };
@@ -391,24 +444,29 @@ export async function planCodingHandoff(
       return {
         mode: "direct",
         estimatedPromptBytes:
-          compactTokens * 4,
+          compactTokens *
+          ATTEMPT_POLICY_BYTES_PER_TOKEN,
         reason:
           "one localized missing target can be safely created by DirectEdit",
       };
     }
 
-    return {
-      mode: "agentic",
-      estimatedPromptBytes:
-        compactTokens * 4,
-      reason:
-        "new or unresolved multi-file targets require progressive create-capable execution",
-    };
+    /**
+     * A concrete, validated missing path is an authorized creation target.
+     *
+     * It contributes framing/path bytes but zero source bytes to Aider's
+     * initial packet. If the total one-turn packet still fits the authoritative
+     * budget, Aider may create it. Otherwise the normal size gate below sends
+     * the work to the progressive agentic worker.
+     */
   }
 
   const editableTokens =
     inspected.reduce(
-      (sum, { path, info }) =>
+      (
+        sum,
+        { path, info },
+      ) =>
         sum +
         filePromptTokens(
           path,
@@ -428,7 +486,8 @@ export async function planCodingHandoff(
       return {
         mode: "direct",
         estimatedPromptBytes:
-          compactTokens * 4,
+          compactTokens *
+          ATTEMPT_POLICY_BYTES_PER_TOKEN,
         reason:
           "localized target is too large for a complete Aider handoff; DirectEdit will use bounded excerpts",
       };
@@ -437,9 +496,10 @@ export async function planCodingHandoff(
     return {
       mode: "agentic",
       estimatedPromptBytes:
-        compactTokens * 4,
+        compactTokens *
+        ATTEMPT_POLICY_BYTES_PER_TOKEN,
       reason:
-        "complete editable scope exceeds the admitted provider input budget",
+        "complete editable scope exceeds the authoritative one-turn Aider budget",
     };
   }
 
@@ -496,14 +556,17 @@ export async function planCodingHandoff(
   return {
     mode: "aider",
     estimatedPromptBytes:
-      totalTokens * 4,
+      totalTokens *
+      ATTEMPT_POLICY_BYTES_PER_TOKEN,
     aiderFiles: {
       editable,
       readOnly,
     },
     reason:
-      readOnly.length
-        ? "complete editable scope plus highest-value read-only evidence fits the budget"
-        : "complete editable scope fits; secondary context will be retrieved only if needed",
+      missing.length
+        ? "complete editable scope fits the authoritative Aider budget and includes authorized new files"
+        : readOnly.length
+          ? "complete editable scope plus highest-value read-only evidence fits the authoritative Aider budget"
+          : "complete editable scope fits the authoritative Aider budget; secondary context will be retrieved only if needed",
   };
 }
