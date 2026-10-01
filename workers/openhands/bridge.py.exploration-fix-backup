@@ -136,10 +136,7 @@ class Evidence(BaseModel):
 
 class SubmitExplorationAction(Action):
     confidence: str = Field(pattern="^(high|medium|low)$")
-    editable_candidates: list[FileReason] = Field(
-        default_factory=list,
-        max_length=128,
-    )
+    editable_candidates: list[FileReason] = Field(default_factory=list, max_length=12)
     readonly_files: list[FileReason] = Field(default_factory=list, max_length=16)
     related_tests: list[str] = Field(default_factory=list, max_length=12)
     dependencies: list[Dependency] = Field(default_factory=list, max_length=24)
@@ -227,35 +224,7 @@ class RepositoryExecutor(ToolExecutor):
             if self.kind == "submit":
                 assert isinstance(action, SubmitExplorationAction)
                 self.state["tool_calls"] += 1
-                result = action.model_dump(by_alias=True)
-
-                # OpenHands owns repository write-scope discovery.
-                # Never infer editable files from files_inspected.
-                #
-                # If this is a mutation task and OpenHands submits no
-                # editable candidates, reject the submission so the model
-                # gets another observation and can identify the actual
-                # implementation target itself.
-                if (
-                    self.state.get("mutation_required", False)
-                    and not result.get("editable_candidates")
-                ):
-                    return _TextObservation.from_text(
-                        "SUBMISSION REJECTED: editable_candidates is empty "
-                        "for a repository mutation task. "
-                        "The exploration is incomplete. "
-                        "Review the implementation files and evidence you "
-                        "already inspected. Identify the actual implementation "
-                        "file(s) that the coding worker must modify and put "
-                        "those observed paths in editable_candidates. "
-                        "Do not submit every inspected file. "
-                        "Do not invent paths. "
-                        "Submit the exploration again with the corrected "
-                        "editable scope.",
-                        is_error=True,
-                    )
-
-                self.state["result"] = result
+                self.state["result"] = action.model_dump(by_alias=True)
                 return _TextObservation.from_text("Repository exploration accepted. Finish now.")
             raise ValueError("unknown tool")
         except Exception as exc:  # tool errors remain observations, not bridge failures
@@ -319,15 +288,6 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
         "tool_calls": 0,
         "files_inspected": set(),
         "max_files_read": request["max_files_read"],
-        "mutation_required": bool(
-            re.search(
-                r"\\b(?:add|change|modify|update|fix|refactor|rewrite|"
-                r"rename|remove|delete|replace|implement|migrate|"
-                r"introduce|create|adjust|patch)\\b",
-                str(request.get("task", "")),
-                re.IGNORECASE,
-            )
-        ),
     }
     tools: list[Tool] = []
     specs = [
@@ -369,56 +329,36 @@ Never invent a path.
 
 CRITICAL OUTPUT CONTRACT:
 
-1. Your final result is NOT complete merely because you inspected files.
+1. If the user's task requests a code mutation, refactor, bug fix,
+implementation change, rename, constant change, or other repository
+modification, you MUST nominate at least one editable_candidates entry
+whenever you have observed a relevant implementation file.
 
-2. For every task that requests a repository mutation, you MUST identify the
-   implementation file(s) that the coding worker should modify.
+2. editable_candidates must contain implementation files that are plausible
+mutation targets for the requested task.
 
-3. Put those implementation files in editable_candidates.
+3. Tests normally belong in related_tests, not editable_candidates, unless
+the task explicitly asks for a test change.
 
-4. editable_candidates may contain 1 file, 10 files, 60 files, or more when
-   the evidence genuinely requires that scope. There is no artificial
-   "small task" file-count assumption.
+4. Dependencies and contextual files belong in readonly_files or related_tests.
 
-5. Every editable candidate MUST have been observed through repository
-   inspection. Never invent paths.
+5. Every editable candidate must have been observed through repository
+inspection. Never invent paths.
 
-6. Do NOT put every inspected file into editable_candidates. Only include
-   files that the evidence indicates are actual mutation targets.
+6. Prefer the smallest possible editable set.
 
-7. Tests belong in related_tests unless the task explicitly requires changing
-   the tests.
+7. If you have already identified the implementation file that owns the
+requested behavior, submit it instead of continuing broad exploration.
 
-8. Dependencies and contextual files belong in readonly_files.
+8. For a mutation task, an empty editable_candidates list is NOT acceptable
+when a relevant implementation file has been observed.
 
-9. If you have already identified the implementation file responsible for the
-   requested behavior, STOP broad exploration and submit that file as an
-   editable candidate.
+9. Finish by calling koda_submit_repository_exploration exactly once.
 
-10. For a mutation task, returning editable_candidates=[] is only valid if
-    you genuinely have no observed implementation file that could be the
-    mutation target. If you have observed a plausible implementation target,
-    you MUST include it.
+10. If two or fewer iterations remain, submit the best evidence you have.
 
-11. Before submitting, explicitly review your own evidence and ask:
-    "Which files would the coding worker actually need permission to modify?"
-
-12. Finish by calling koda_submit_repository_exploration after you have identified the implementation write scope.
-
-13. If the submission tool rejects an empty editable_candidates result,
-    use the evidence already collected to identify the implementation
-    file(s) and submit the corrected scope.
-
-14. If two or fewer iterations remain, submit the best evidence already
-    collected rather than continuing broad repository exploration.
-
-The objective is accurate write-scope discovery, not maximum repository
-coverage.
-
-For tiny localized tasks, optimize for quickly identifying the smallest
-evidence-backed implementation target.
-
-"""
+For tiny localized tasks, optimize for quickly finding the smallest
+implementation target rather than performing broad repository archaeology."""
     agent = Agent(llm=llm, tools=tools, system_prompt=system)
     conversation = Conversation(
         agent,
@@ -435,7 +375,7 @@ evidence-backed implementation target.
             "continuation_reason": request.get("continuation_reason"),
             "previous_exploration": request.get("previous_exploration"),
             "limits": {
-                "editable_candidates": 128,
+                "editable_candidates": 12,
                 "readonly_files": 16,
                 "related_tests": 12,
                 "files_read": request["max_files_read"],
@@ -445,22 +385,6 @@ evidence-backed implementation target.
         provider_dispatched = True
         try:
             conversation.run()
-
-            # Exploration may consume its bounded iteration allowance
-            # without invoking the required structured submit tool.
-            # Give it exactly one finalization-only turn using the
-            # evidence already present in the conversation.
-            if state["result"] is None:
-                conversation.max_iteration_per_run = 1
-                conversation.send_message(
-                    "FINALIZATION ONLY. Do not search, list, read files, or inspect imports. "
-                    "Using only repository evidence already observed in this conversation, "
-                    "call koda_submit_repository_exploration exactly once now. "
-                    "For a mutation task, nominate the smallest evidence-backed implementation "
-                    "file set in editable_candidates. Tests/context-only files belong elsewhere. "
-                    "Do not answer with prose."
-                )
-                conversation.run()
         except Exception as exc:
             raise BridgeFailure(f"{type(exc).__name__}: {exc}", True) from exc
         metrics = _metrics(conversation)
@@ -478,21 +402,8 @@ evidence-backed implementation target.
         "related_tests": [],
         "dependencies": [],
         "evidence": [],
-        "unresolved_questions": [
-            "Exploration ended before structured evidence was submitted."
-        ],
+        "unresolved_questions": ["Exploration ended before structured evidence was submitted."],
     }
-
-    # An empty editable scope is not silently converted into a write scope.
-    # TypeScript can use this state to request a bounded continuation.
-    if (
-        state["result"] is not None
-        and not result.get("editable_candidates")
-        and not result.get("unresolved_questions")
-    ):
-        result["unresolved_questions"] = [
-            "Mutation task produced no editable_candidates."
-        ]
     return {
         "status": "completed",
         "sdk_version": SDK_VERSION,

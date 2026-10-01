@@ -227,35 +227,7 @@ class RepositoryExecutor(ToolExecutor):
             if self.kind == "submit":
                 assert isinstance(action, SubmitExplorationAction)
                 self.state["tool_calls"] += 1
-                result = action.model_dump(by_alias=True)
-
-                # OpenHands owns repository write-scope discovery.
-                # Never infer editable files from files_inspected.
-                #
-                # If this is a mutation task and OpenHands submits no
-                # editable candidates, reject the submission so the model
-                # gets another observation and can identify the actual
-                # implementation target itself.
-                if (
-                    self.state.get("mutation_required", False)
-                    and not result.get("editable_candidates")
-                ):
-                    return _TextObservation.from_text(
-                        "SUBMISSION REJECTED: editable_candidates is empty "
-                        "for a repository mutation task. "
-                        "The exploration is incomplete. "
-                        "Review the implementation files and evidence you "
-                        "already inspected. Identify the actual implementation "
-                        "file(s) that the coding worker must modify and put "
-                        "those observed paths in editable_candidates. "
-                        "Do not submit every inspected file. "
-                        "Do not invent paths. "
-                        "Submit the exploration again with the corrected "
-                        "editable scope.",
-                        is_error=True,
-                    )
-
-                self.state["result"] = result
+                self.state["result"] = action.model_dump(by_alias=True)
                 return _TextObservation.from_text("Repository exploration accepted. Finish now.")
             raise ValueError("unknown tool")
         except Exception as exc:  # tool errors remain observations, not bridge failures
@@ -319,15 +291,6 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
         "tool_calls": 0,
         "files_inspected": set(),
         "max_files_read": request["max_files_read"],
-        "mutation_required": bool(
-            re.search(
-                r"\\b(?:add|change|modify|update|fix|refactor|rewrite|"
-                r"rename|remove|delete|replace|implement|migrate|"
-                r"introduce|create|adjust|patch)\\b",
-                str(request.get("task", "")),
-                re.IGNORECASE,
-            )
-        ),
     }
     tools: list[Tool] = []
     specs = [
@@ -403,13 +366,9 @@ CRITICAL OUTPUT CONTRACT:
 11. Before submitting, explicitly review your own evidence and ask:
     "Which files would the coding worker actually need permission to modify?"
 
-12. Finish by calling koda_submit_repository_exploration after you have identified the implementation write scope.
+12. Finish by calling koda_submit_repository_exploration exactly once.
 
-13. If the submission tool rejects an empty editable_candidates result,
-    use the evidence already collected to identify the implementation
-    file(s) and submit the corrected scope.
-
-14. If two or fewer iterations remain, submit the best evidence already
+13. If two or fewer iterations remain, submit the best evidence already
     collected rather than continuing broad repository exploration.
 
 The objective is accurate write-scope discovery, not maximum repository
@@ -445,22 +404,6 @@ evidence-backed implementation target.
         provider_dispatched = True
         try:
             conversation.run()
-
-            # Exploration may consume its bounded iteration allowance
-            # without invoking the required structured submit tool.
-            # Give it exactly one finalization-only turn using the
-            # evidence already present in the conversation.
-            if state["result"] is None:
-                conversation.max_iteration_per_run = 1
-                conversation.send_message(
-                    "FINALIZATION ONLY. Do not search, list, read files, or inspect imports. "
-                    "Using only repository evidence already observed in this conversation, "
-                    "call koda_submit_repository_exploration exactly once now. "
-                    "For a mutation task, nominate the smallest evidence-backed implementation "
-                    "file set in editable_candidates. Tests/context-only files belong elsewhere. "
-                    "Do not answer with prose."
-                )
-                conversation.run()
         except Exception as exc:
             raise BridgeFailure(f"{type(exc).__name__}: {exc}", True) from exc
         metrics = _metrics(conversation)

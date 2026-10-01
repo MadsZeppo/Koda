@@ -218,11 +218,11 @@ class CallGuard:
             )
         )
 
-        # maxTokens is the per-attempt token allowance.
-        # Aider's input context must be allowed to consume that
-        # allowance without making the first provider call impossible.
-        # The actual USD budget remains enforced below.
-        remaining_tokens = r["maxTokens"]
+        remaining_tokens = (
+            r["maxTokens"]
+            - state["tokens"]
+            - prompt
+        )
 
         output = min(
             r["maxOutputTokens"],
@@ -281,21 +281,15 @@ class CallGuard:
                 affordable_output,
             )
 
-        context_limit = r.get("contextLength")
-
         if (
-            context_limit is not None
-            and prompt >= context_limit
-        ):
-            raise StopExecution(
-                "context_preflight_exhausted"
-            )
-
-        if (
-            output < 1
+            prompt
+            >= r["maxTokens"]
+            or output < 1
             or available < 0
         ):
-            # Actual attempt budget / economic budget exhausted.
+            # This is only this worker attempt's
+            # local budget. It must not masquerade
+            # as Koda's global run budget.
             raise StopExecution(
                 "attempt_budget_exhausted"
             )

@@ -238,11 +238,6 @@ async function validateExploration(root: string, profile: RepoProfile, raw: Repo
     return result;
   };
   const editableCandidates = await validateReasons(raw.editableCandidates);
-
-  // Do not infer write scope from files inspected by OpenHands.
-  // OpenHands owns repository scope discovery; this layer only validates
-  // the scope it explicitly submitted.
-
   const editable = new Set(editableCandidates.map(({ path }) => path));
   const readonlyFiles = (await validateReasons(raw.readonlyFiles)).filter(({ path }) => !editable.has(path));
   const relatedTests = [...new Set(await Promise.all(raw.relatedTests.map((path) => validatePath(root, known, path))))]
@@ -387,7 +382,7 @@ export class OpenHandsExplorer implements RepositoryExplorer {
       timeoutMs: Math.min(
         this.gateway.config.stageMaxMinutes * 60_000,
         this.gateway.budget.remainingMs(),
-        30_000,
+        8_000,
       ),
 
       requestTimeoutMs: this.gateway.config.modelTimeoutMs.inspection,

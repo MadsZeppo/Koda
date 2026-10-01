@@ -192,9 +192,8 @@ export function fastPathExploration(
   const exact = profile.files.filter((path) => exactTaskPath(task, path));
   const broad = /\b(?:across|multiple|multi[- ]component|throughout|entire|refactor|migrat|architecture|client and server|independent|parallel)\b/i.test(task);
   if (
-    broad ||
-    exact.length !== 1 ||
-    strategy.execution_strategy !== "direct"
+    broad || exact.length !== 1 || strategy.execution_strategy !== "direct" ||
+    strategy.preciseTarget !== exact[0]
   ) return undefined;
   const path = exact[0]!;
   return {
@@ -238,11 +237,6 @@ async function validateExploration(root: string, profile: RepoProfile, raw: Repo
     return result;
   };
   const editableCandidates = await validateReasons(raw.editableCandidates);
-
-  // Do not infer write scope from files inspected by OpenHands.
-  // OpenHands owns repository scope discovery; this layer only validates
-  // the scope it explicitly submitted.
-
   const editable = new Set(editableCandidates.map(({ path }) => path));
   const readonlyFiles = (await validateReasons(raw.readonlyFiles)).filter(({ path }) => !editable.has(path));
   const relatedTests = [...new Set(await Promise.all(raw.relatedTests.map((path) => validatePath(root, known, path))))]
@@ -378,18 +372,9 @@ export class OpenHandsExplorer implements RepositoryExplorer {
         Math.max(16_384, tokenCapacity - maxOutputTokens),
       ),
       maxOutputTokens,
-      // OpenHands is a fallback for genuinely uncertain work.
-      // Bound exploration so it cannot consume the whole run.
-      maxIterations: 6,
-
-      maxFilesRead: Math.min(24, this.gateway.config.context.scanFiles),
-
-      timeoutMs: Math.min(
-        this.gateway.config.stageMaxMinutes * 60_000,
-        this.gateway.budget.remainingMs(),
-        30_000,
-      ),
-
+      maxIterations: 16,
+      maxFilesRead: Math.min(32, this.gateway.config.context.scanFiles),
+      timeoutMs: Math.min(this.gateway.config.stageMaxMinutes * 60_000, this.gateway.budget.remainingMs()),
       requestTimeoutMs: this.gateway.config.modelTimeoutMs.inspection,
       inputCostPerToken: inputPrice / 1e6,
       outputCostPerToken: outputPrice / 1e6,

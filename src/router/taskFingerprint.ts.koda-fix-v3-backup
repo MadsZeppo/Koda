@@ -325,21 +325,7 @@ export function taskFingerprint(
     /(?:schema|migrations?|prisma|drizzle|typeorm|sequelize|alembic|django|sql(?:ite)?|postgres|database\.yml)/.test(
       repositoryBoundaryEvidence,
     );
-  // Do not classify every file named config.ts as high-risk.
-  // Configuration risk requires both an actual configuration mutation and
-  // evidence of a sensitive configuration boundary.
-  const configMutation =
-    high(
-      /\b(?:change|modify|add|remove|rename|replace|migrate|rewrite|rotate|expose|publish|update)\w*\b.{0,64}\b(?:config(?:uration)?|manifest|environment|env(?:ironment)?|settings?)\b|\b(?:config(?:uration)?|manifest|environment|env(?:ironment)?|settings?)\b.{0,64}\b(?:change|modify|add|remove|rename|replace|migrate|rewrite|rotate|expose|publish|update)\w*\b/i,
-    );
-
-  const sensitiveConfigBoundary =
-    /(?:^|[\/_.-])(?:\.env(?:\.[^\/]+)?|secrets?|credentials?|auth|security|deploy|deployment|terraform|kubernetes|docker|helm|github\/workflows)(?:[\/_.-]|$)/i.test(
-      repositoryBoundaryEvidence,
-    );
-
-  const configRisk = configMutation && sensitiveConfigBoundary;
-
+  const configRisk = repoRisk(/\b(?:config|configuration|manifest)\w*\b/);
   const securityRisk =
     high(/\b(?:security|auth|permission|credential|secret|crypto|payment)\w*\b/) &&
     /(?:oauth|openid|jwt|crypt|credentials?|secrets?|permissions?|polic(?:y|ies)|acl|security(?:\/|\.|$)|middleware)/.test(
@@ -351,27 +337,10 @@ export function taskFingerprint(
     ? "high" : scope === "cross-component" ? "medium" : "low";
   const observedExecutableCheck = checks.some((check) =>
     check.outcome === "CHECK_PASS" || check.outcome === "CHECK_FAIL");
-  const hasDeterministicVerification =
-    observedExecutableCheck ||
-    profile.verificationCommands.length > 0 ||
-    subtask.verificationCommands.length > 0;
-
-  const verifierFalseAcceptRisk: Difficulty =
-    subjective
-      ? (focusedCheck || hasDeterministicVerification ? "medium" : "high")
-      : hasDeterministicVerification
-        ? (observedExecutableCheck && focusedCheck ? "low" : "medium")
-        : "medium";
-
-  const recoveryDetectability =
-    verifierFalseAcceptRisk === "low"
-      ? "high" as const
-      : hasDeterministicVerification
-        ? "medium" as const
-        : focusedCheck
-          ? "medium" as const
-          : "low" as const;
-
+  const verifierFalseAcceptRisk: Difficulty = subjective || !focusedCheck ? "high"
+    : observedExecutableCheck && profile.verificationCommands.length > 0 ? "low" : "medium";
+  const recoveryDetectability = verifierFalseAcceptRisk === "low" ? "high" as const
+    : focusedCheck ? "medium" as const : "low" as const;
   const blastRadius = scope === "cross-component" ? "cross-component" as const
     : scope === "single" ? "single-file" as const : "package" as const;
   const localizationUncertainty: Difficulty = features.localizationConfidence === "low" ? "high"

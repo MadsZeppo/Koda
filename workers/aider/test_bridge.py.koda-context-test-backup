@@ -187,9 +187,8 @@ class GuardTests(unittest.TestCase):
             (
                 {
                     "maxTokens": 1,
-                    "contextLength": 1,
                 },
-                "context_preflight_exhausted",
+                "attempt_budget_exhausted",
             ),
             (
                 {
