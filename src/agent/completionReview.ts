@@ -57,13 +57,10 @@ export function taskRequirementChecklist(input: {
   return unique.map((text, index) => ({ id: `R${index + 1}`, text }));
 }
 
-export function parseCompletionReview(
-  raw: string,
+function normalizeAssessments(
+  parsed: Partial<CompletionReview>,
   requirements: readonly TaskRequirement[],
 ): CompletionReview {
-  const match = raw.match(/\{[\s\S]*\}/);
-  if (!match) throw Error("Completion review did not return JSON");
-  const parsed = JSON.parse(match[0]) as Partial<CompletionReview>;
   const assessments = Array.isArray(parsed.requirements)
     ? parsed.requirements.filter((item): item is RequirementAssessment =>
         !!item && typeof item.id === "string" &&
@@ -81,6 +78,85 @@ export function parseCompletionReview(
     passed,
     requirements: normalized,
     summary: typeof parsed.summary === "string" ? parsed.summary : "",
+  };
+}
+
+function parseJsonObject(raw: string): Partial<CompletionReview> | undefined {
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim();
+  for (const candidate of [fenced, raw.trim()]) {
+    if (!candidate) continue;
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object") return parsed;
+    } catch {}
+  }
+
+  // Provider wrappers sometimes prepend or append a short sentence around the
+  // JSON object. Keep this bounded and deliberately non-greedy across braces.
+  const firstBrace = raw.indexOf("{");
+  const lastBrace = raw.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    try {
+      const parsed = JSON.parse(raw.slice(firstBrace, lastBrace + 1));
+      if (parsed && typeof parsed === "object") return parsed;
+    } catch {}
+  }
+  return undefined;
+}
+
+function parseStructuredProse(
+  raw: string,
+  requirements: readonly TaskRequirement[],
+): CompletionReview | undefined {
+  const lines = raw.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+  const assessments: RequirementAssessment[] = [];
+
+  for (const requirement of requirements) {
+    const escaped = requirement.id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const line = lines.find((value) => new RegExp(`(?:^|\\b)${escaped}\\b`, "i").test(value));
+    if (!line) continue;
+    const negative = /\b(?:false|unsatisfied|not satisfied|missing|incomplete|failed|fail)\b/i.test(line);
+    const positive = /\b(?:true|satisfied|complete|completed|passed|pass)\b/i.test(line);
+    if (!negative && !positive) continue;
+    assessments.push({
+      id: requirement.id,
+      satisfied: positive && !negative,
+      evidence: line.slice(0, 1000),
+    });
+  }
+
+  if (assessments.length !== requirements.length) return undefined;
+  const allSatisfied = assessments.every((item) => item.satisfied);
+  const explicitOverallFailure = /\b(?:overall|result|passed?)\s*[:=-]\s*(?:false|fail(?:ed)?|no)\b/i.test(raw);
+  return {
+    passed: allSatisfied && !explicitOverallFailure,
+    requirements: assessments,
+    summary: "Recovered structured requirement assessments from non-JSON reviewer output.",
+  };
+}
+
+export function parseCompletionReview(
+  raw: string,
+  requirements: readonly TaskRequirement[],
+): CompletionReview {
+  const parsed = parseJsonObject(raw);
+  if (parsed) return normalizeAssessments(parsed, requirements);
+
+  const prose = parseStructuredProse(raw, requirements);
+  if (prose) return prose;
+
+  // A reviewer formatting failure is operational evidence, not proof that the
+  // candidate is wrong. Return an explicit unresolved review instead of
+  // throwing; the executor can then use its normal bounded continuation /
+  // recovery path without erasing deterministic verification evidence.
+  return {
+    passed: false,
+    requirements: requirements.map((requirement) => ({
+      id: requirement.id,
+      satisfied: false,
+      evidence: "Completion reviewer returned unstructured output; semantic assessment unavailable",
+    })),
+    summary: "Completion review output was not parseable as structured JSON or requirement-labelled prose.",
   };
 }
 
@@ -118,7 +194,7 @@ export function completionReviewMessages(input: CompletionReviewInput) {
     {
       role: "system" as const,
       content:
-        "Independently review task completion from fresh evidence. Passing tests alone never prove an untested requirement. Mark a requirement satisfied only when the diff, changed paths, or a directly relevant verification result proves it. The deterministic verifier is authoritative for regression attribution: entries in baselineKnownFailures were already failing before this candidate and were not made worse by it. Do not mark a requirement unsatisfied solely because baselineKnownFailures is non-empty, unless the original task explicitly requires fixing that exact pre-existing failure. Return JSON only: {passed:boolean,requirements:[{id:string,satisfied:boolean,evidence:string}],summary:string}.",
+        "Independently review task completion from fresh evidence. Passing tests alone never prove an untested requirement. Mark a requirement satisfied only when the diff, changed paths, or a directly relevant verification result proves it. The deterministic verifier is authoritative for regression attribution: entries in baselineKnownFailures were already failing before this candidate and were not made worse by it. Do not mark a requirement unsatisfied solely because baselineKnownFailures is non-empty, unless the original task explicitly requires fixing that exact pre-existing failure. Return exactly one JSON object and no markdown: {\"passed\":boolean,\"requirements\":[{\"id\":string,\"satisfied\":boolean,\"evidence\":string}],\"summary\":string}.",
     },
     {
       role: "user" as const,
