@@ -252,7 +252,30 @@ test("14 OpenHands read-only guard restores attempted mutations", async (t) => {
   assert.equal(await readFile(join(f.root, "src/planner/taskCompiler.ts"), "utf8"), original);
 });
 
-test("15 completion review accepts fenced JSON", () => {
+test("15 completed OpenHands with empty scope falls back to bounded local localization", async (t) => {
+  const f = await fixture(t);
+  const result = await new OpenHandsExplorer(f.gateway, {
+    runner: async () => ({
+      ...report(exploration({
+        confidence: "low",
+        editableCandidates: [],
+        readonlyFiles: [],
+        relatedTests: [],
+        evidence: [],
+        unresolvedQuestions: ["could not establish write scope"],
+      })),
+      filesInspected: ["src/planner/taskCompiler.ts", "src/agent/other.ts"],
+    }),
+  }).explore({
+    repoPath: f.root,
+    task: "Find where task summaries are compiled or normalized before planning.",
+    profile: f.profile,
+  });
+  assert.ok(result.editableCandidates.some((item) => item.path === "src/planner/taskCompiler.ts"));
+  assert.equal(result.editableCandidates.some((item) => item.path === "."), false);
+});
+
+test("16 completion review accepts fenced JSON", () => {
   const review = parseCompletionReview(
     "```json\n{\"passed\":true,\"requirements\":[{\"id\":\"R1\",\"satisfied\":true,\"evidence\":\"diff\"}],\"summary\":\"ok\"}\n```",
     [{ id: "R1", text: "Implement" }],
@@ -260,7 +283,7 @@ test("15 completion review accepts fenced JSON", () => {
   assert.equal(review.passed, true);
 });
 
-test("16 completion review accepts requirement-labelled prose", () => {
+test("17 completion review accepts requirement-labelled prose", () => {
   const review = parseCompletionReview(
     "R1: satisfied - diff proves it\nR2: satisfied - focused test proves it\nOverall: passed",
     [{ id: "R1", text: "Implement" }, { id: "R2", text: "Test" }],
@@ -268,13 +291,13 @@ test("16 completion review accepts requirement-labelled prose", () => {
   assert.equal(review.passed, true);
 });
 
-test("17 unstructured completion review becomes unresolved instead of throwing", () => {
+test("18 unstructured completion review becomes unresolved instead of throwing", () => {
   const review = parseCompletionReview("Looks fine.", [{ id: "R1", text: "Implement" }]);
   assert.equal(review.passed, false);
   assert.equal(review.requirements[0]?.satisfied, false);
 });
 
-test("18 unchanged baseline failure plus executable pass is accepted", () => {
+test("19 unchanged baseline failure plus executable pass is accepted", () => {
   const baseline = verificationResult([
     check("pnpm test", 1, "not ok 1 - old repository failure"),
     check("pnpm run typecheck", 0, "typecheck ok"),
@@ -287,7 +310,7 @@ test("18 unchanged baseline failure plus executable pass is accepted", () => {
   assert.equal(relative.status, "VERIFIED_SUCCESS");
 });
 
-test("19 newly introduced verification failure is rejected", () => {
+test("20 newly introduced verification failure is rejected", () => {
   const baseline = verificationResult([
     check("pnpm test", 0, "ok 1 - baseline"),
     check("pnpm run typecheck", 0, "typecheck ok"),
@@ -300,7 +323,7 @@ test("19 newly introduced verification failure is rejected", () => {
   assert.equal(relative.status, "FAILED");
 });
 
-test("20 bounded localized source plus test scope hands off to Aider, not agentic discovery", async (t) => {
+test("21 bounded localized source plus test scope hands off to Aider, not agentic discovery", async (t) => {
   const f = await fixture(t);
   const handoff = await planCodingHandoff({
     repoPath: f.root,
