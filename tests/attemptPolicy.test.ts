@@ -1,7 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { attemptLimitPolicy } from "../src/agent/attemptPolicy.js";
+import {
+  AIDER_PROMPT_OVERHEAD_TOKENS,
+  attemptLimitPolicy,
+} from "../src/agent/attemptPolicy.js";
 import type { TaskFingerprint } from "../src/router/taskFingerprint.js";
 
 function fingerprint(overrides: Partial<TaskFingerprint> = {}): TaskFingerprint {
@@ -56,11 +59,7 @@ const base = {
 };
 
 test("localized single-file DIRECT is budgeted as one structured model call", () => {
-  const policy = attemptLimitPolicy({
-    ...base,
-    fingerprint: fingerprint(),
-  });
-
+  const policy = attemptLimitPolicy({ ...base, fingerprint: fingerprint() });
   assert.equal(policy.localized, true);
   assert.equal(policy.directEdit, true);
   assert.equal(policy.viableCalls, 1);
@@ -74,7 +73,6 @@ test("localized single-file PLANNED worker uses the same one-call edit contract"
     ...base,
     fingerprint: fingerprint({ executionStrategy: "planned" }),
   });
-
   assert.equal(policy.localized, true);
   assert.equal(policy.directEdit, true);
   assert.equal(policy.viableCalls, 1);
@@ -86,7 +84,6 @@ test("localized STABLE keeps its bounded multi-turn viability policy", () => {
     ...base,
     fingerprint: fingerprint({ executionStrategy: "stable" }),
   });
-
   assert.equal(policy.localized, true);
   assert.equal(policy.directEdit, false);
   assert.equal(policy.viableCalls, 4);
@@ -98,12 +95,8 @@ test("localized STABLE keeps its bounded multi-turn viability policy", () => {
 test("multi-file DIRECT never receives the one-call direct-edit budget contract", () => {
   const policy = attemptLimitPolicy({
     ...base,
-    fingerprint: fingerprint({
-      scope: "multi-file",
-      expectedFiles: 2,
-    }),
+    fingerprint: fingerprint({ scope: "multi-file", expectedFiles: 2 }),
   });
-
   assert.equal(policy.directEdit, false);
   assert.ok(policy.viableCalls > 1);
 });
@@ -136,11 +129,7 @@ test("DIRECT uses routed p90 to bound a stalled provider without changing the ha
     fingerprint: fingerprint(),
     plannedLatencyP90Ms: 3_400,
   });
-  const unknown = attemptLimitPolicy({
-    ...base,
-    fingerprint: fingerprint(),
-  });
-
+  const unknown = attemptLimitPolicy({ ...base, fingerprint: fingerprint() });
   assert.equal(measured.timeoutMs, 10_000);
   assert.equal(unknown.timeoutMs, 45_000);
   assert.equal(measured.viable, true);
@@ -160,7 +149,6 @@ test("unknown localization can start from a bounded discovery packet", () => {
       expectedFiles: 4,
     }),
   });
-
   assert.equal(policy.directEdit, false);
   assert.equal(policy.viable, true);
   assert.ok(policy.minimumViableTokens < base.remainingTokens);
@@ -181,7 +169,6 @@ test("bounded discovery starts even when the unresolved task fingerprint is broa
       crossComponent: true,
     }),
   });
-
   assert.equal(policy.viableCalls, 1);
   assert.equal(policy.viable, true);
   assert.ok(policy.minimumViableTokens < 10_000);
@@ -190,25 +177,69 @@ test("bounded discovery starts even when the unresolved task fingerprint is broa
   assert.ok(policy.budgetUsd > base.plannedBudgetUsd);
 });
 
-test("focused Aider attempts include framing overhead and remain stage bounded", () => {
-  const broad = fingerprint({
-    scope: "multi-file",
-    executionStrategy: "planned",
-    localizationConfidence: "low",
-    expectedFiles: 4,
-  });
+test("Aider is budgeted as a multi-call coding session rather than a one-call editor", () => {
   const policy = attemptLimitPolicy({
     ...base,
-    promptBytes: 4_000,
-    remainingUsd: 0.2,
-    stageMaxUsd: 0.2,
+    fingerprint: fingerprint({
+      scope: "multi-file",
+      expectedFiles: 2,
+      localizationConfidence: "high",
+    }),
+    aiderWorker: true,
     directEditEligible: false,
-    modelContextTokens: 32_000,
-    fingerprint: broad,
+    promptBytes: 76_968,
+    remainingTokens: 120_000,
+    stageMaxTokens: 30_000,
+    remainingUsd: 1,
+    stageMaxUsd: 1,
+    modelContextTokens: 128_000,
   });
+
+  const promptTokens = Math.ceil(76_968 / 4);
+  const firstTurn = promptTokens + AIDER_PROMPT_OVERHEAD_TOKENS + 4_096;
+  assert.equal(policy.directEdit, false);
+  assert.equal(policy.viableCalls, 2);
+  assert.equal(policy.minimumViableTokens, firstTurn);
+  assert.equal(policy.providerContextRequired, firstTurn);
+  assert.ok(policy.desiredTrajectoryTokens > firstTurn);
+  assert.ok(policy.maxTokens > base.stageMaxTokens,
+    "Aider may exceed the historical 30k Mini-SWE stage cap when its grounded session requires it");
   assert.equal(policy.viable, true);
-  assert.ok(policy.forecastProviderInputTokens >= 3_048);
-  assert.ok(policy.maxTokens <= base.stageMaxTokens);
+});
+
+test("Aider context overflow rejects the model instead of switching coding engines", () => {
+  const policy = attemptLimitPolicy({
+    ...base,
+    fingerprint: fingerprint({ scope: "multi-file", expectedFiles: 2 }),
+    aiderWorker: true,
+    directEditEligible: false,
+    promptBytes: 76_968,
+    remainingTokens: 120_000,
+    stageMaxTokens: 30_000,
+    remainingUsd: 1,
+    stageMaxUsd: 1,
+    modelContextTokens: 20_000,
+  });
+  assert.equal(policy.viable, false);
+  assert.equal(policy.nonViableLimitKind, "context_limit");
+});
+
+test("Aider receives a longer subprocess deadline than the old 45 second Mini-SWE cap", () => {
+  const policy = attemptLimitPolicy({
+    ...base,
+    fingerprint: fingerprint({ scope: "multi-file", expectedFiles: 2 }),
+    aiderWorker: true,
+    promptBytes: 4_000,
+    remainingTokens: 100_000,
+    stageMaxTokens: 30_000,
+    remainingUsd: 1,
+    stageMaxUsd: 1,
+    remainingMs: 120_000,
+    configuredTimeoutMs: 120_000,
+    modelContextTokens: 128_000,
+  });
+  assert.equal(policy.timeoutMs, 90_000);
+  assert.equal(policy.viable, true);
 });
 
 test("agentic multi-turn budgeting funds the cumulative trajectory instead of only the largest single turn", () => {
@@ -227,16 +258,10 @@ test("agentic multi-turn budgeting funds the cumulative trajectory instead of on
     stageMaxUsd: 1,
     modelContextTokens: 128_000,
   });
-
-  // Regression for the failing smoke run: the old code made 8,758 both the
-  // largest single-turn requirement AND the whole attempt budget.
   assert.equal(policy.viableCalls, 6);
   assert.equal(policy.minimumViableTokens, 8_758);
   assert.equal(policy.providerContextRequired, 8_758);
   assert.equal(policy.desiredTrajectoryTokens, 31_368);
-
-  // The configured stage cap is 30k, so the agent now receives the whole
-  // available stage instead of dying after one or two discovery turns.
   assert.equal(policy.maxTokens, 30_000);
   assert.equal(policy.viable, true);
 });
@@ -257,7 +282,6 @@ test("provider context checks use the largest single turn, not cumulative repeat
     stageMaxUsd: 1,
     modelContextTokens: 9_000,
   });
-
   assert.equal(policy.providerContextRequired, 8_758);
   assert.ok(policy.desiredTrajectoryTokens > 30_000);
   assert.equal(policy.nonViableLimitKind, undefined);
