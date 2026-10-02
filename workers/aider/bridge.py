@@ -307,9 +307,12 @@ class CallGuard:
             output < 1
             or available < 0
         ):
-            # Actual attempt budget / economic budget exhausted.
+            # This is Koda's own attempt/economic budget rejecting the call
+            # before provider dispatch. Route it through the orchestrator's
+            # existing budget-exhaustion path rather than recording a provider
+            # or model execution failure.
             raise StopExecution(
-                "attempt_budget_exhausted"
+                "budget_exhausted"
             )
 
         reserved_cost = (
