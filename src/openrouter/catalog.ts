@@ -143,6 +143,7 @@ export class Catalog {
             inputPrice: price("prompt"),
             outputPrice: price("completion"),
             contextLength: raw.context_length,
+            maxOutputTokens: raw.top_provider?.max_completion_tokens,
             available: true,
             supportedParameters: raw.supported_parameters,
             routableParameterSets: embeddedSets(raw) ?? endpointSets.get(model.id),

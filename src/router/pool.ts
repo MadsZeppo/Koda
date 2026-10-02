@@ -3,6 +3,7 @@ export const metadataSchema = z.object({
   inputPrice: z.number().finite().nonnegative().optional(),
   outputPrice: z.number().finite().nonnegative().optional(),
   contextLength: z.number().positive().optional(),
+  maxOutputTokens: z.number().positive().optional(),
   available: z.boolean().optional(),
   supportedParameters: z.array(z.string()).optional(),
   /** Parameters supported together by each concrete provider endpoint. */

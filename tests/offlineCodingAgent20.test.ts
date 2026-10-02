@@ -202,11 +202,12 @@ test("09 related tests remain read-only when test mutation is not requested", as
   assert.ok(route.likelyFiles.includes("tests/planner.test.ts"));
 });
 
-test("10 related tests become writable when the task requests tests", async (t) => {
+test("10 generic test requests retain related tests as readonly context", async (t) => {
   const f = await fixture(t);
   const evidence = exploration();
   strategyWithExploration("Fix task summary normalization and add deterministic tests", chooseExecutionStrategy("Fix task summary normalization and add deterministic tests", f.profile), evidence);
-  assert.ok(evidence.editableCandidates.some((item) => item.path === "tests/planner.test.ts"));
+  assert.equal(evidence.editableCandidates.some((item) => item.path === "tests/planner.test.ts"), false);
+  assert.ok(evidence.relatedTests.includes("tests/planner.test.ts"));
 });
 
 test("11 OpenHands receives twelve iterations instead of the historical six", async (t) => {

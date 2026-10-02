@@ -499,6 +499,87 @@ test("a focused candidate regression gets one same-scope repair and can verify",
   }
 });
 
+for (const [taskPrefix, errorStream, repairSucceeds] of [
+  ["Create", "stdout", true],
+  ["Find the existing fixture. Add", "stderr", true],
+  ["Write", "stdout", false],
+] as const) {
+  test(`structural repair preserves both output streams (${taskPrefix}, ${errorStream}, ${repairSucceeds})`, async () => {
+    const { mkdtemp, mkdir, writeFile, rm } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const { tmpdir } = await import("node:os");
+    const { implement } = await import("../src/agent/codingExecutor.js");
+    const { profileRepo } = await import("../src/repo/profiler.js");
+    const { config } = await import("../src/config.js");
+    const { Logger } = await import("../src/telemetry/logger.js");
+    const { Budget } = await import("../src/openrouter/usage.js");
+    const { git } = await import("../src/repo/commands.js");
+    const root = await mkdtemp(join(tmpdir(), "koda-structural-repair-"));
+    const logs = await mkdtemp(join(tmpdir(), "koda-structural-repair-log-"));
+    const target = "tests/fixture.test.cjs";
+    try {
+      await mkdir(join(root, "src"));
+      await mkdir(join(root, "tests"));
+      await writeFile(join(root, "src/shape.cjs"), "exports.label='value';\n");
+      await writeFile(join(root, "package.json"), JSON.stringify({ scripts: {
+        test: "node --test tests/*.test.cjs", typecheck: "node check.cjs",
+      } }));
+      // An authoritative structural check enforces the fixture contract independently
+      // of its runtime test, which intentionally exercises just the label behavior.
+      await writeFile(join(root, "check.cjs"),
+        `const fs=require('node:fs');const path=${JSON.stringify(target)};` +
+        `if(fs.existsSync(path)&&!fs.readFileSync(path,'utf8').includes('count: 2')){` +
+        `process.${errorStream}.write(path+': required fixture field count is missing\\n');` +
+        `process.${errorStream === "stdout" ? "stderr" : "stdout"}.write('Running structural checker\\n');process.exit(1);}`);
+      await writeFile(join(root, "tests/existing.test.cjs"),
+        "const {test}=require('node:test');test('existing',()=>{});\n");
+      await git(root, "init", "-q");
+      await git(root, "config", "user.name", "Test");
+      await git(root, "config", "user.email", "test@example.test");
+      await git(root, "add", ".");
+      await git(root, "commit", "-qm", "baseline");
+      const profile = await profileRepo(root);
+      const logger = new Logger(logs, "structural-repair", true);
+      let calls = 0;
+      const result = await implement(
+        { config: await config(undefined, { maxIterations: 1 }), logger,
+          budget: new Budget(1, 100000, 60000) } as any,
+        root, `${taskPrefix} ${target} with a deterministic fixture test`,
+        { ...makeSubtask([target]), id: "direct", objective: `${taskPrefix} ${target}` },
+        { acceptanceCriteria: ["The fixture test and required structural check pass"] }, profile,
+        { codingWorker: { engine: "aider", async run(input) {
+          calls++;
+          assert.deepEqual(input.writeScope, [target]);
+          if (calls === 2) {
+            assert.match(input.context?.diagnostics ?? "", /required fixture field count is missing/);
+            assert.match(input.context?.diagnostics ?? "", /Running structural checker/);
+            assert.match(input.context?.diagnostics ?? "", /Failing command:.*typecheck/);
+            assert.ok(input.context?.sourceFiles?.some((file) => file.path === target &&
+              file.snippet.includes("const fixture")), "repair reads the newly created candidate");
+            assert.ok(input.context?.sourceFiles?.some((file) => file.path === "src/shape.cjs" &&
+              file.snippet.includes("exports.label")), "candidate imports supply grounded repair contracts");
+          }
+          await writeFile(join(root, target),
+            "const {test}=require('node:test');const assert=require('node:assert/strict');" +
+            `const {label}=require('../src/shape.cjs');const fixture={label${calls === 2 && repairSucceeds ? ", count: 2" : ""}};` +
+            "test('fixture label',()=>assert.equal(fixture.label,'value'));\n");
+          return { exitStatus: "completed", model: input.model, engine: "aider", engineVersion: "test",
+            changedPaths: [target], wallClockMs: 1, terminationReason: "candidate_ready_for_verification" };
+        } } },
+      );
+      assert.equal(calls, 2);
+      assert.equal(result.verification.status, repairSucceeds ? "VERIFIED_SUCCESS" : "FAILED");
+      assert.ok(result.verification.checks.some((check) => check.kind === "test" && check.outcome === "CHECK_PASS"));
+      assert.ok(result.verification.checks.some((check) => check.kind === "typecheck" &&
+        check.outcome === (repairSucceeds ? "CHECK_PASS" : "CHECK_FAIL")));
+      assert.equal(logger.events.filter((event) => event.type === "verification_repair").length, 1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      await rm(logs, { recursive: true, force: true });
+    }
+  });
+}
+
 test("a no-op verification repair stops after one repair and remains failed", async () => {
   const { mkdtemp, mkdir, writeFile, rm } = await import("node:fs/promises");
   const { join } = await import("node:path");

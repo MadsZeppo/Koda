@@ -603,7 +603,7 @@ export function objectiveCanBeAlreadySatisfied(subtask: Subtask) {
   ].map((value) => value.trim().toLowerCase());
 
   return !requests.some((request) =>
-    /^(?:add|create|introduce|write|document|rename|remove|delete|refactor)\b|[,;:]\s*(?:add|create|introduce|write|document|rename|remove|delete|refactor)\b|\b(?:must|should|please|needs? to)\s+(?:add|create|introduce|write|document|rename|remove|delete|refactor)\b|\b(?:regression|new)\s+(?:test|coverage|file|command|section|bullet)\b/.test(
+    /^(?:add|create|introduce|write|modify|update|replace|document|rename|remove|delete|refactor)\b|[.,;:!?\n]\s*(?:please\s+)?(?:add|create|introduce|write|modify|update|replace|document|rename|remove|delete|refactor)\b|\b(?:must|should|please|needs? to|and|then)\s+(?:add|create|introduce|write|modify|update|replace|document|rename|remove|delete|refactor)\b|\b(?:regression|new)\s+(?:test|coverage|file|command|section|bullet)\b/.test(
       request,
     ),
   );

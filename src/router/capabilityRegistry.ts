@@ -273,6 +273,7 @@ export class CapabilityRegistry {
       const metadata: Metadata = source ? {
         inputPrice: price(source, "prompt"), outputPrice: price(source, "completion"),
         contextLength: finite(source.context_length), available: true,
+        maxOutputTokens: finite(source.top_provider?.max_completion_tokens),
         supportedParameters: Array.isArray(source.supported_parameters) ? source.supported_parameters : undefined,
         // Absence of endpoint detail means unknown.  Only an explicit empty
         // endpoint list proves that no endpoint can satisfy a protocol.

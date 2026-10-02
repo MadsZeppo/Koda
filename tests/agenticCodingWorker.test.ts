@@ -737,3 +737,48 @@ test("real worker HTTP protocol requires tools and returns a runnable determinis
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
 });
+
+test("localized output-limit continuation reads known contracts and mutates without rediscovery", async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-localized-recovery-"));
+  await writeFile(join(root, "value.ts"), "export const value = 1;\n");
+  await writeFile(join(root, "setup.ts"), "export const setup = true;\n");
+  await writeFile(join(root, "contract.ts"), "export const requiredValue = 3;\n");
+  let calls = 0;
+  const events: any[] = [];
+  const worker = new AgenticCodingWorker(new Budget(1, 30_000, 60_000),
+    { log(type: string, payload: any) { events.push({ type, ...payload }); } } as any,
+    async (_input, messages, tools) => {
+      calls++;
+      const names = tools.map((tool) => "function" in tool ? tool.function.name : "");
+      assert.ok(!names.includes("search_code"), "retained scope must not restart broad search");
+      assert.ok(!names.includes("list_files"));
+      const packet = JSON.stringify(messages);
+      assert.match(packet, /contract\.ts/);
+      assert.match(packet, /retained-symbol/);
+      if (calls === 1) {
+        assert.ok(names.includes("read_file"), "a real read still precedes implementation");
+        assert.ok(!names.includes("edit_file"));
+        return response(toolCall("read_file", { path: "value.ts", startLine: 1, endLine: 1 }));
+      }
+      if (calls === 2) return response(toolCall("read_file", { path: "setup.ts", startLine: 1, endLine: 1 }));
+      if (calls === 3) {
+        assert.ok(names.includes("read_file"), "necessary contract read remains available after two observations");
+        return response(toolCall("read_file", { path: "contract.ts", startLine: 1, endLine: 1 }));
+      }
+      assert.equal(calls, 4);
+      assert.match(packet, /requiredValue = 3/);
+      assert.ok(!names.includes("read_file"), "bounded contract reads advance to mutation");
+      return response(toolCall("edit_file", { path: "value.ts", oldText: "= 1", newText: "= 3" }));
+    });
+  const result = await worker.run({ ...workerInput(root), task: "Correct value and cover its test contract",
+    writeScope: ["value.ts"], context: { implementationRecovery: { reason: "output_limit" },
+      relevantFiles: ["value.ts", "setup.ts", "contract.ts"],
+      sourceFiles: [{ path: "value.ts", snippet: "export const value = 1;" }],
+      evidence: { symbols: ["retained-symbol"] } } });
+  assert.equal(result.exitStatus, "completed");
+  assert.deepEqual(result.changedPaths, ["value.ts"]);
+  assert.equal(calls, 4);
+  assert.equal(events.filter((event) => event.type === "agentic_discovery_call_deferred").length, 0);
+  assert.ok(events.some((event) => event.type === "agentic_implementation_transition" &&
+    event.useful_discovery_steps === 1), "retained localization needs one real read, not another discovery cycle");
+});

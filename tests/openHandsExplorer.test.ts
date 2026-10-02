@@ -13,11 +13,27 @@ import {
   OpenHandsExplorer,
   OpenHandsOperationalError,
   fastPathExploration,
+  deterministicRepositoryExploration,
   strategyWithExploration,
   type OpenHandsInvocation,
   type OpenHandsReport,
   type RepositoryExploration,
 } from "../src/agent/openHandsExplorer.js";
+
+test("local fallback prefers imported implementation over standalone patch scripts with matching words", async (t) => {
+  const f = await fixture(t);
+  await writeFile(join(f.root, "update_budget.py"),
+    "# budget router route attempt budget route attempt\nfrom pathlib import Path\nPath('src/budget.ts').write_text('export const attemptBudget = 1')\n");
+  const profile = await profileRepo(f.root);
+  const result = await deterministicRepositoryExploration(f.root,
+    "Correct attempt budget routing and add focused tests", profile, ["update_budget.py"]);
+  assert.ok(result.editableCandidates.some((file) => file.path === "src/budget.ts"));
+  assert.equal(result.editableCandidates.some((file) => file.path === "update_budget.py"), false);
+  const explicit = await deterministicRepositoryExploration(f.root,
+    "Modify update_budget.py to correct its attempt budget routing", profile);
+  assert.ok(explicit.editableCandidates.some((file) => file.path === "update_budget.py"),
+    "an explicitly requested script must remain a valid implementation target");
+});
 import { chooseExecutionStrategy } from "../src/router/executionStrategy.js";
 import { selectAiderFiles } from "../src/agent/aiderExecutor.js";
 import { inferRepositoryDependencies } from "../src/orchestrator/dag.js";
@@ -127,6 +143,24 @@ test("OpenHands evidence overrides a wrong cheap initial hint", async (t) => {
   }, exploration());
   assert.equal(route.preciseTarget, "src/budget.ts");
   assert.equal(route.likelyFiles.includes("src/other.ts"), false);
+});
+
+test("an explicit discovered test target prevents promotion of additional related tests", () => {
+  const evidence = exploration({
+    editableCandidates: [
+      { path: "src/budget.ts", reason: "implementation target" },
+      { path: "tests/newBudget.test.ts", reason: "requested new test" },
+    ],
+    relatedTests: ["tests/budget.test.ts"],
+  });
+  strategyWithExploration("Add focused tests for the budget helper", {
+    execution_strategy: "direct", execution_effort: "normal",
+    strategy_reason: "bounded", likelyFiles: [],
+  }, evidence);
+  assert.deepEqual(evidence.editableCandidates.map(({ path }) => path), [
+    "src/budget.ts", "tests/newBudget.test.ts",
+  ]);
+  assert.deepEqual(evidence.relatedTests, ["tests/budget.test.ts"]);
 });
 
 test("multiple implementation candidates remain in the authorized scope", async (t) => {

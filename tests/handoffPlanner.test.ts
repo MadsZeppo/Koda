@@ -50,7 +50,7 @@ test("localized concrete scope is handed directly to Aider and oversized seconda
   assert.equal(plan.aiderFiles?.readOnly.includes("src/huge.ts"), false);
 });
 
-test("attempt token pressure never changes a localized multi-file scope into AgenticCodingWorker", async () => {
+test("oversized editable packets use bounded reads despite a large model context", async () => {
   const root = await fixture();
   await writeFile(join(root, "src/a.ts"), "a".repeat(100_000));
   await writeFile(join(root, "src/b.ts"), "b".repeat(100_000));
@@ -63,11 +63,11 @@ test("attempt token pressure never changes a localized multi-file scope into Age
     writeScope: ["src/a.ts", "src/b.ts"],
   });
 
-  assert.equal(plan.mode, "aider");
-  assert.deepEqual(plan.aiderFiles?.editable, ["src/a.ts", "src/b.ts"]);
+  assert.equal(plan.mode, "agentic");
+  assert.match(plan.reason, /bounded repository reads/);
 });
 
-test("provider context overflow stays Aider-owned so model recovery can choose a larger-context model", async () => {
+test("provider context overflow uses bounded reads instead of an impossible Aider preflight", async () => {
   const root = await fixture();
   await writeFile(join(root, "src/a.ts"), "a".repeat(100_000));
   await writeFile(join(root, "src/b.ts"), "b".repeat(100_000));
@@ -79,12 +79,11 @@ test("provider context overflow stays Aider-owned so model recovery can choose a
     writeScope: ["src/a.ts", "src/b.ts"],
   });
 
-  assert.equal(plan.mode, "aider");
-  assert.deepEqual(plan.aiderFiles?.editable, ["src/a.ts", "src/b.ts"]);
-  assert.match(plan.reason, /larger-context model/i);
+  assert.equal(plan.mode, "agentic");
+  assert.match(plan.reason, /bounded repository reads/i);
 });
 
-test("localized single-file work no longer switches to DirectEdit", async () => {
+test("large single-file packets use bounded reads even when provider context is large", async () => {
   const root = await fixture();
   await writeFile(join(root, "src/a.ts"), "a".repeat(200_000));
 
@@ -97,8 +96,8 @@ test("localized single-file work no longer switches to DirectEdit", async () => 
     writeScope: ["src/a.ts"],
   });
 
-  assert.equal(plan.mode, "aider");
-  assert.deepEqual(plan.aiderFiles?.editable, ["src/a.ts"]);
+  assert.equal(plan.mode, "agentic");
+  assert.match(plan.reason, /bounded repository reads/);
 });
 
 test("concrete missing files remain editable Aider creation targets", async () => {
@@ -126,4 +125,19 @@ test("only unresolved root scope keeps the emergency progressive fallback", asyn
 
   assert.equal(plan.mode, "agentic");
   assert.match(plan.reason, /localization must finish/i);
+});
+
+ test("whole-run token overflow uses bounded reads without dropping authorized files", async () => {
+  const root = await fixture();
+  await writeFile(join(root, "src/a.ts"), "a".repeat(100_000));
+  await writeFile(join(root, "src/b.ts"), "b".repeat(100_000));
+  const input = { ...base, repoPath: root, attemptTokenCapacity: 10_000,
+    modelContextTokens: 1_000_000, writeScope: ["src/a.ts", "src/b.ts"] };
+  const roomy = await planCodingHandoff({ ...input, remainingRunTokens: 100_000 });
+  assert.equal(roomy.mode, "agentic", "a large run budget must not admit an oversized provider packet");
+  const bounded = await planCodingHandoff({ ...input, remainingRunTokens: 55_000 });
+  assert.equal(bounded.mode, "agentic");
+  assert.match(bounded.reason, /remaining run tokens/);
+  assert.ok(bounded.estimatedPromptBytes / 4 + 9216 < 55_000);
+  assert.deepEqual(input.writeScope, ["src/a.ts", "src/b.ts"]);
 });

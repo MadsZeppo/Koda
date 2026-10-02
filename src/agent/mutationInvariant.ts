@@ -164,6 +164,13 @@ export function testRequirementAlreadyCovered(
     files.some((file) => !isTestPath(file.path))
   )
     return false;
+  const explicitlyNamedArtifact = task.match(
+    /\bnamed\s+(["'`])([^"'`\n]+)\1/i,
+  )?.[2];
+  if (
+    explicitlyNamedArtifact &&
+    !files.some((file) => file.content.includes(explicitlyNamedArtifact))
+  ) return false;
   const words = taskConceptWords(task);
   if (words.length < 2) return false;
   if (

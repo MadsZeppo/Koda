@@ -1,3 +1,4 @@
+import { MAX_PROVIDER_INPUT_TOKENS } from "../context/packetPolicy.js";
 import { mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { tmpdir } from "node:os";
@@ -846,6 +847,11 @@ export class AiderExecutor implements CodingWorker {
               progressPhase: "DISCOVERY" as const,
             }
           : {}),
+        ...(reason === "output_limit" || reason === "provider_input_preflight" ? {
+          limitKind: reason === "output_limit" ? "output_limit" as const : "context_limit" as const,
+          exactLimitFired: "provider_output_limit",
+          progressPhase: changedPaths.length ? "MUTATION_OBSERVED" as const : "MUTATION_ATTEMPTED" as const,
+        } : {}),
       };
     };
 
@@ -1035,6 +1041,7 @@ export class AiderExecutor implements CodingWorker {
               maxOutputTokens:
                 input.maxOutputTokens,
               maxTokens: input.maxTokens,
+              maxInputTokens: MAX_PROVIDER_INPUT_TOKENS,
               budgetUsd: input.budgetUsd,
               baseUrl: input.baseUrl,
               requestTimeoutMs:
@@ -1350,6 +1357,9 @@ export class AiderExecutor implements CodingWorker {
         ) {
           failure =
             report.failureKind;
+        } else if (ledger?.outputLimitReached === true ||
+          /exceeded output limit|output tokens:[^\n]*--\s*exceeded|finish_reason["':\s]+length/i.test(`${result.stdout}\n${result.stderr}`)) {
+          failure = "output_limit";
         } else if (
           !this.options.runner &&
           !report
@@ -1473,10 +1483,10 @@ export class AiderExecutor implements CodingWorker {
           changedPaths.length
         ) {
           return await finish(
-            result.exitCode === 0
+            result.exitCode === 0 && failure !== "output_limit"
               ? "completed"
               : "failed",
-            result.exitCode === 0
+            result.exitCode === 0 && failure !== "output_limit"
               ? "candidate_ready_for_verification"
               : failure ?? "aider_execution_failure",
             changedPaths,
@@ -1491,6 +1501,10 @@ export class AiderExecutor implements CodingWorker {
             [],
             actualFormat,
           );
+        }
+
+        if (failure === "output_limit") {
+          return await finish("failed", "output_limit", [], actualFormat);
         }
 
         /**

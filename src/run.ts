@@ -1,3 +1,5 @@
+import { compileTaskSpec } from "./planner/taskSpec.js";
+import { MAX_CODING_PACKET_BYTES } from "./context/packetPolicy.js";
 import { prepareRepairChecks, newFailureIds } from "./verifier/repairFocus.js";
 import { verificationPlan } from "./verifier/plan.js";
 import type { PoolRouter } from "./router/modelRouter.js";
@@ -22,6 +24,7 @@ import {
   allowedJointExecutionStrategies,
   chooseExecutionStrategy,
   directWritePaths,
+  explicitTaskPaths,
   requestsTestMutation,
   type ExecutionStrategy,
 } from "./router/executionStrategy.js";
@@ -37,7 +40,7 @@ import { bestExecutablePlanner } from "./planner/routing.js";
 import { schedule } from "./orchestrator/scheduler.js";
 import { inferRepositoryDependencies } from "./orchestrator/dag.js";
 import { implement } from "./agent/codingExecutor.js";
-import { completionReviewGate } from "./agent/completionReview.js";
+import { completionReviewMessages, parseCompletionReview, taskRequirementChecklist, completionReviewGate } from "./agent/completionReview.js";
 import { currentDiff, safePath } from "./agent/tools.js";
 import { truncateBytes } from "./context/bounds.js";
 import { AttemptCheckpoint } from "./agent/attemptCheckpoint.js";
@@ -191,6 +194,9 @@ function explorationPacket(exploration: RepositoryExploration): EvidencePacket {
   };
 }
 export async function run(options: RunOptions) {
+  const originalTask = options.task;
+  const taskSpec = compileTaskSpec(originalTask);
+  options = { ...options, task: taskSpec.routingPrompt };
   const start = Date.now(),
     runId = `run-${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID().slice(0, 6)}`;
   const repo = await realpath(resolve(options.repo));
@@ -200,6 +206,8 @@ export async function run(options: RunOptions) {
   if (output === repo || output.startsWith(repo + "/"))
     throw Error("Report output must be outside the target repository");
   const logger = new Logger(output, runId, options.quiet);
+  await mkdir(output, { recursive: true });
+  await writeFile(join(output, "task-spec.json"), JSON.stringify(taskSpec, null, 2));
   let acceptedRepairState: string | undefined;
   let status: Status = "FAILED",
     verification = verificationResult([]),
@@ -613,6 +621,12 @@ export async function run(options: RunOptions) {
         model: joint.plan.initialModel,
       });
     }
+    const scopeBytes = (await Promise.all(exploration.editableCandidates.map(async ({ path: file }) => {
+      try { return (await readFile(join(integration!.path, file))).byteLength; } catch { return 0; }
+    }))).reduce((sum, size) => sum + size, 0);
+    if (taskSpec.parts.length > 1 || (scopeBytes > MAX_CODING_PACKET_BYTES && exploration.editableCandidates.length > 1)) {
+      strategy = { ...strategy, execution_strategy: "planned", strategy_reason: "bounded coding packet requires dependent decomposition" };
+    }
     let taskVerificationCommands: string[] = [];
     let taskVerificationIsFocused = false;
     let stableRepairContext:
@@ -642,7 +656,7 @@ export async function run(options: RunOptions) {
           .test(options.task);
       const stableWritePaths = [...new Set([
         ...exploration.editableCandidates.map(({ path }) => path),
-        ...(explicitTestMutation ? exploration.relatedTests : []),
+        ...(explicitTestMutation ? exploration.relatedTests.filter((file) => taskSpec.explicitPaths.includes(file)) : []),
       ])];
       const subtask: Subtask = {
         id: "stable",
@@ -889,7 +903,10 @@ export async function run(options: RunOptions) {
       });
   } else if (strategy.execution_strategy === "direct") {
     const directEvidencePaths = directWritePaths(
-      exploration.editableCandidates.map(({ path }) => path),
+      [...new Set([
+        ...exploration.editableCandidates.map(({ path }) => path),
+        ...explicitTaskPaths(options.task, profile),
+      ])],
       profile,
       options.task,
     );
@@ -1032,10 +1049,11 @@ export async function run(options: RunOptions) {
     } else {
       const rawPlan = await compileTask(
         gateway,
-        options.task,
+        originalTask,
         profile,
         routingResume,
         exploration,
+        integration.path,
       );
       const normalized = normalizePlan(rawPlan);
       const plan = normalized.plan;
@@ -2125,6 +2143,26 @@ export async function run(options: RunOptions) {
           )
         )
           break;
+      }
+    }
+    if (strategy.execution_strategy === "planned" &&
+      logger.events.some((event) => event.type === "bounded_task_decomposition")) {
+      const changed = await backend.changes(integration.path);
+      const diff = truncateBytes(await currentDiff(integration.path), 8_000);
+      const reviewModel = preselectedExecutionPlan?.initialModel ?? options.config.registry.STRONG_MODEL;
+      const reviewGroups = taskSpec.parts.flatMap((part) => {
+        const requirements = compileTaskSpec(part).requirements;
+        return Array.from({ length: Math.ceil(requirements.length / 8) }, (_, index) =>
+          requirements.slice(index * 8, (index + 1) * 8).join("\n"));
+      });
+      for (const [index, part] of reviewGroups.entries()) {
+        const requirements = taskRequirementChecklist({ task: part, objective: "", integrationContract: "", acceptanceCriteria: [] });
+        const message = await gateway.call(reviewModel, completionReviewMessages({ task: part, requirements, diff,
+          changedPaths: changed.map((change) => change.path), changedSymbols: [], workerExitStatus: "completed",
+          verification }), `bounded-final-${index}`, "completion-review", 0, undefined, { maxOutputTokens: 1000 });
+        const review = parseCompletionReview(String(message.content ?? ""), requirements);
+        logger.log("completion_review", { subtaskId: `bounded-final-${index}`, ...review });
+        if (!review.passed) throw Error("Decomposed task failed final requirement review");
       }
     }
     const completionGate = completionReviewGate(verification.status, logger.events);

@@ -1,5 +1,7 @@
 export interface CodingWorkerContext {
   localizationSummary?: string;
+  /** Continue a localized attempt after an execution limit without rediscovery. */
+  implementationRecovery?: { reason: string };
   relevantFiles?: string[];
   sourceFiles?: { path: string; snippet: string }[];
   completePaths?: string[];

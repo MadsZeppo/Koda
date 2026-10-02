@@ -1,3 +1,4 @@
+import { admitProviderPayload, providerPayloadBound } from "../context/packetPolicy.js";
 import { readFile, lstat } from "node:fs/promises";
 import { join } from "node:path";
 import { isTestPath } from "../context/compiler.js";
@@ -49,6 +50,9 @@ const DISCOVERY_TOOLS = new Set([
 const MUTATION_TOOLS = new Set(["apply_patch", "edit_file", "write_file"]);
 const MUTATION_TOOL_DEFINITIONS = toolDefinitions.filter((tool) =>
   "function" in tool && MUTATION_TOOLS.has(tool.function.name));
+const LOCALIZED_READ_TOOLS = new Set(["read_file", "file_outline"]);
+const LOCALIZED_READ_DEFINITIONS = toolDefinitions.filter((tool) =>
+  "function" in tool && LOCALIZED_READ_TOOLS.has(tool.function.name));
 const READ_TOOL_DEFINITIONS = toolDefinitions.filter((tool) =>
   "function" in tool && tool.function.name === "read_file");
 
@@ -77,20 +81,9 @@ export type AgenticCodingRequester = (
 
 function estimatedPromptTokens(
   messages: ChatCompletionMessageParam[],
+  tools: ChatCompletionTool[] = toolDefinitions,
 ) {
-  const bytes = Buffer.byteLength(
-    JSON.stringify({
-      messages,
-      tools: toolDefinitions,
-    }),
-  );
-
-  return Math.ceil(
-    Math.max(
-      256,
-      bytes / 4,
-    ) * 1.4,
-  ) + 128;
+  return providerPayloadBound({ messages, tools }) + 1024;
 }
 
 function compactSeed(
@@ -116,6 +109,9 @@ function compactSeed(
       : "",
     input.context?.completionRepair
       ? `UNRESOLVED REQUIREMENT IDS\n${JSON.stringify(input.context.completionRepair.unresolvedRequirementIds)}`
+      : "",
+    input.context?.implementationRecovery && input.context.evidence
+      ? `RETAINED LOCALIZATION EVIDENCE\n${JSON.stringify(input.context.evidence).slice(0, 2000)}`
       : "",
     `KNOWN RELEVANT PATHS\n${JSON.stringify(
       input.context?.relevantFiles ?? [],
@@ -255,9 +251,10 @@ function compactToolText(
 function compactToolHistoryToBudget(
   messages: ChatCompletionMessageParam[],
   promptBudgetTokens: number,
+  tools: ChatCompletionTool[] = toolDefinitions,
 ) {
   let promptTokens =
-    estimatedPromptTokens(messages);
+    estimatedPromptTokens(messages, tools);
 
   if (
     !Number.isFinite(promptBudgetTokens) ||
@@ -319,7 +316,7 @@ function compactToolHistoryToBudget(
     }
 
     promptTokens =
-      estimatedPromptTokens(messages);
+      estimatedPromptTokens(messages, tools);
 
     if (promptTokens <= promptBudgetTokens) {
       break;
@@ -391,6 +388,15 @@ export class AgenticCodingWorker
     tools: ChatCompletionTool[],
     maxOutputTokens: number,
   ): Promise<AgenticCodingResponse> {
+    const payloadBound = admitProviderPayload({ model: input.model, messages, tools,
+      tool_choice: "required", max_tokens: maxOutputTokens, stream: false,
+      session_id: input.sessionId, provider: { require_parameters: true, allow_fallbacks: true,
+        sort: { by: "price", partition: "none" },
+        max_price: { prompt: input.promptPricePerMillion, completion: input.completionPricePerMillion } } },
+      maxOutputTokens, input.contextWindowTokens);
+    if (payloadBound.inputTokens + maxOutputTokens > input.maxTokens)
+      throw Error("provider_input_preflight: request cannot consume remaining attempt tokens");
+    this.logger.log("provider_payload_bound", { subtaskId: input.attemptId, ...payloadBound });
     if (this.requester) {
       return this.requester(
         input,
@@ -502,7 +508,15 @@ export class AgenticCodingWorker
       testGlobs = discoveredTestGlobs(manifest.scripts?.test ?? "");
     } catch {}
     const inspectedFiles = new Map<string, string>();
+    const localizedRecovery = !!input.context?.implementationRecovery &&
+      input.writeScope.length > 0 && !input.writeScope.includes(".");
+    const recoveryReadPaths = new Set([
+      ...input.writeScope, ...(input.context?.relevantFiles ?? []),
+    ]);
+    const recoveryReadLimit = Math.max(2, Math.min(6, recoveryReadPaths.size));
+    const recoveryReads = () => tools.progressEvidence.filter((key) => key.startsWith("read_file:")).length;
     const broadScope = input.writeScope.includes(".");
+    const returnAfterMutation = input.returnOnMutation ?? (input.writeScope.length === 1 && !broadScope);
     const needsContractReads = broadScope || input.writeScope.some(isTestPath) ||
       /\b(?:tests?|regression)\b/i.test(input.task);
     const hasRead = () => tools.progressEvidence.some((key) => key.startsWith("read_file:"));
@@ -510,9 +524,13 @@ export class AgenticCodingWorker
       tools.progressEvidence.some((key) => key.startsWith(`read_file:${path}:`))));
     const implementationExcerpts = () => {
       let room = 8000;
-      return [...inspectedFiles].map(([path, content]) => {
-        const excerpt = content.slice(0, Math.max(0, room));
+      let secondaryRoom = 1000;
+      return [...inspectedFiles].sort(([left], [right]) =>
+        Number(input.writeScope.includes(right)) - Number(input.writeScope.includes(left))).map(([path, content]) => {
+        const primary = input.writeScope.includes(path) || broadScope;
+        const excerpt = content.slice(0, Math.max(0, Math.min(room, primary ? room : secondaryRoom)));
         room -= excerpt.length;
+        if (!primary) secondaryRoom -= excerpt.length;
         return excerpt ? `READ FILE ${path}\n${excerpt}` : "";
       }).filter(Boolean).join("\n\n");
     };
@@ -541,6 +559,7 @@ export class AgenticCodingWorker
           "Follow LOCATE -> READ -> MUTATE -> RETURN TO KODA. Read relevant code before implementing. Never run tests; deterministic Koda verification owns all checks.",
           testGlobs.length ? `Test files must match the discovered runner globs: ${testGlobs.join(", ")}.` : "",
           "Koda performs authoritative verification after this worker finishes.",
+          localizedRecovery ? "This is an implementation continuation after an execution limit. Localization and write scope are already established. Read a precise range in the supplied relevant files, then implement. Do not repeat repository-wide searches or listing. Necessary precise contract reads remain available within the supplied paths." : "",
           input.context?.completionRepair
             ? "This is a completion-repair continuation. The existing diff, compact excerpts, and reviewer diagnostics already establish the missing work. Mutate the authorized scope first. After a real mutation, normal tools reopen for at most two new evidence reads before another implementation mutation is required."
             : "",
@@ -577,6 +596,43 @@ export class AgenticCodingWorker
     let minimalImplementationRebuilt = false;
     let readNudgeSent = false;
     let consecutiveTextTurns = 0;
+    const activeTools = () => {
+      const repairMutationRequired =
+        !!input.context?.completionRepair?.mutationRequiredBeforeDiscovery &&
+        hasRead() &&
+        (!mutationObserved || repairDiscoverySinceMutation >= 2);
+
+      // Normal agentic execution must also leave discovery once enough
+      // repository evidence exists. A prose nudge is not sufficient:
+      // weaker/cheaper models may keep requesting reads until the attempt
+      // token budget is exhausted without ever editing anything.
+      //
+      // After the implementation transition, expose mutation tools only
+      // until the first real mutation. Normal discovery tools reopen after
+      // that mutation so the worker can continue a multi-file implementation.
+      const implementationMutationRequired =
+        (!needsContractReads || (localizedRecovery && recoveryReads() >= recoveryReadLimit)) &&
+        !mutationObserved &&
+        implementationNudgeSent;
+
+      const mutationRequired =
+        repairMutationRequired ||
+        implementationMutationRequired;
+
+      const readRequired =
+        (readNudgeSent || localizedRecovery) &&
+        !hasTargetRead();
+
+      return mutationRequired
+            ? MUTATION_TOOL_DEFINITIONS
+            : readRequired
+              ? localizedRecovery ? LOCALIZED_READ_DEFINITIONS : READ_TOOL_DEFINITIONS
+            : localizedRecovery && !mutationObserved
+              ? toolDefinitions.filter((tool) => "function" in tool &&
+                  (MUTATION_TOOLS.has(tool.function.name) || LOCALIZED_READ_TOOLS.has(tool.function.name)))
+              : toolDefinitions;
+    };
+
 
     const settleKnown = () => {
       const usage = aggregateUsage(
@@ -654,7 +710,7 @@ export class AgenticCodingWorker
           !mutationObserved &&
           !hasTargetRead() &&
           !readNudgeSent &&
-          tools.progressEvidence.length >= 2
+          (tools.progressEvidence.length >= 2 || localizedRecovery)
         ) {
           const discoveryEvidence = evidencePacket();
           const systemMessage = messages[0]!;
@@ -686,7 +742,7 @@ export class AgenticCodingWorker
           !mutationObserved &&
           !implementationNudgeSent &&
           hasTargetRead() &&
-          tools.progressEvidence.length >= 2
+          (tools.progressEvidence.length >= 2 || localizedRecovery)
         ) {
           const discoveryEvidence = evidencePacket();
           const systemMessage = messages[0]!;
@@ -746,6 +802,7 @@ export class AgenticCodingWorker
           compactToolHistoryToBudget(
             messages,
             promptBudgetTokens,
+            activeTools(),
           );
 
         if (compacted.compactedMessages > 0) {
@@ -1037,41 +1094,11 @@ export class AgenticCodingWorker
         }
         providerDispatched = true;
 
-        const repairMutationRequired =
-          !!input.context?.completionRepair?.mutationRequiredBeforeDiscovery &&
-          hasRead() &&
-          (!mutationObserved || repairDiscoverySinceMutation >= 2);
-
-        // Normal agentic execution must also leave discovery once enough
-        // repository evidence exists. A prose nudge is not sufficient:
-        // weaker/cheaper models may keep requesting reads until the attempt
-        // token budget is exhausted without ever editing anything.
-        //
-        // After the implementation transition, expose mutation tools only
-        // until the first real mutation. Normal discovery tools reopen after
-        // that mutation so the worker can continue a multi-file implementation.
-        const implementationMutationRequired =
-          !needsContractReads &&
-          !mutationObserved &&
-          implementationNudgeSent;
-
-        const mutationRequired =
-          repairMutationRequired ||
-          implementationMutationRequired;
-
-        const readRequired =
-          readNudgeSent &&
-          !hasTargetRead();
-
         const requestStarted = Date.now();
         const response = await this.request(
-          { ...input, requestTimeoutMs: Math.min(input.requestTimeoutMs, remainingWorkerMs) },
+          { ...input, maxTokens: input.maxTokens - usedTokens, requestTimeoutMs: Math.min(input.requestTimeoutMs, remainingWorkerMs) },
           messages,
-          mutationRequired
-            ? MUTATION_TOOL_DEFINITIONS
-            : readRequired
-              ? READ_TOOL_DEFINITIONS
-            : toolDefinitions,
+          activeTools(),
           maxOutput,
         );
 
@@ -1219,9 +1246,15 @@ export class AgenticCodingWorker
                   subtaskId: input.attemptId,
                   tool: call.function.name,
                 });
+              } else if (localizedRecovery && !mutationObserved &&
+                DISCOVERY_TOOLS.has(call.function.name) &&
+                (!LOCALIZED_READ_TOOLS.has(call.function.name) ||
+                  !recoveryReadPaths.has(String(parsedArgs.path)) ||
+                  recoveryReads() >= recoveryReadLimit)) {
+                discoveryDeferred = true;
+                content = "Localization is retained. Read only a precise supplied path/range or mutate the authorized scope; broad rediscovery is unnecessary.";
               } else if (
-                !needsContractReads &&
-                !mutationObserved &&
+                !localizedRecovery && !mutationObserved &&
                 DISCOVERY_TOOLS.has(call.function.name) &&
                 hasTargetRead() &&
                 tools.progressEvidence.length >=
@@ -1301,7 +1334,7 @@ export class AgenticCodingWorker
           }
 
           // Stop within the batch: a queued command must never run after the edit.
-          if (input.returnOnMutation && MUTATION_TOOLS.has(call.function.name) && !/^Tool error:/i.test(content)) {
+          if (returnAfterMutation && MUTATION_TOOLS.has(call.function.name) && !/^Tool error:/i.test(content)) {
             const changes = await currentChanges();
             if (changes.length) {
               timeToFirstMutationMs ??= Date.now() - started;
@@ -1340,7 +1373,7 @@ export class AgenticCodingWorker
 
           mutationObserved = true;
 
-          if (input.returnOnMutation) {
+          if (returnAfterMutation) {
             return result({
               exitStatus: "completed",
               changedPaths:

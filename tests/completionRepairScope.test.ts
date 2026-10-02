@@ -84,7 +84,7 @@ test(
   "rejected completion review expands an empty test scope, continuation mutates the test, and review can pass",
   async (t) => {
     const root = await fixture(t);
-    const cfg = await config(undefined, { maxIterations: 1 });
+    const cfg = await config(undefined, { maxIterations: 1, maxInputPrice: 1, maxOutputPrice: 1 });
     const logger = new Logger(join(root, ".koda"), "completion-scope-e2e", true);
 
     let workerCalls = 0;

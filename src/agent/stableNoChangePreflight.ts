@@ -117,6 +117,7 @@ export async function stableNoChangePreflight(
     ? await verify(root, missing, timeoutMs, onCheck, undefined, candidates)
     : verificationResult([]);
   const verification = verificationResult([...reusable, ...executed.checks]);
-  return { satisfied: verification.status === "VERIFIED_SUCCESS" && verification.checks.length > 0,
+  return { satisfied: verification.status === "VERIFIED_SUCCESS" &&
+      verification.checks.some((check) => check.kind === "test" && check.outcome === "CHECK_PASS"),
     verification, evidencePaths: files.map((file) => file.path) };
 }

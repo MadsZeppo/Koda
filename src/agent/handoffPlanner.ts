@@ -1,3 +1,4 @@
+import { MAX_CODING_PACKET_BYTES } from "../context/packetPolicy.js";
 import { lstat } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -24,6 +25,9 @@ export interface CodingHandoffInput {
 
   /** Whole-attempt Koda token capacity. */
   attemptTokenCapacity: number;
+
+  /** Actual remaining run capacity, independent of the normal stage bound. */
+  remainingRunTokens?: number;
 
   /** Per-provider-call context capacity. */
   modelContextTokens?: number;
@@ -221,14 +225,10 @@ function readonlyCandidates(
  *
  *   OpenHands/Koda localize -> Koda routes a model -> Aider edits -> Koda verifies.
  *
- * A concrete, validated write scope therefore remains Aider-owned. Prompt,
- * token, price, or context pressure may make the current MODEL non-viable,
- * but must not silently replace Aider with Koda's separate agentic coder.
- * attemptPolicy/model recovery owns that decision and can move to a larger-
- * context or otherwise compatible model.
- *
- * The only remaining agentic handoff is an unresolved root scope ("."), which
- * represents localization failure rather than a normal post-localization path.
+ * Concrete scopes use Aider when the complete file packet fits the provider
+ * and remaining run capacity. A packet that cannot fit uses bounded agentic
+ * reads with the same authorized write scope. Model-specific preflight failures
+ * remain the responsibility of attemptPolicy/model recovery.
  */
 export async function planCodingHandoff(
   input: CodingHandoffInput,
@@ -305,6 +305,11 @@ export async function planCodingHandoff(
     };
   }
 
+  if (input.context?.implementationRecovery) {
+    return { mode: "agentic", estimatedPromptBytes: compactTokens * ATTEMPT_POLICY_BYTES_PER_TOKEN,
+      reason: "localized execution-limit continuation uses bounded reads instead of resending the complete file packet" };
+  }
+
   const editable =
     inspected.map(
       ({ path }) => path,
@@ -350,10 +355,8 @@ export async function planCodingHandoff(
         AIDER_PROMPT_OVERHEAD_TOKENS,
     );
 
-  // Optional read-only context must fit both the provider request and the
-  // current Koda attempt budget. Editable targets remain authoritative even
-  // when they exceed the attempt budget: attemptPolicy can reject the current
-  // model/attempt without changing the coding engine away from Aider.
+  // Optional read-only context must fit provider, stage and run capacities.
+  // The normal stage bound may grow for Aider, but the run capacity cannot.
   const attemptInputCapacity =
     Math.max(
       0,
@@ -362,11 +365,23 @@ export async function planCodingHandoff(
         AIDER_PROMPT_OVERHEAD_TOKENS,
     );
 
-  const optionalContextCapacity =
-    Math.min(
-      providerInputCapacity,
-      attemptInputCapacity,
-    );
+  const runInputCapacity = input.remainingRunTokens === undefined
+    ? Infinity
+    : Math.max(0, input.remainingRunTokens - outputReserve - AIDER_PROMPT_OVERHEAD_TOKENS);
+  const optionalContextCapacity = Math.min(
+    providerInputCapacity, attemptInputCapacity, runInputCapacity,
+    (MAX_CODING_PACKET_BYTES - AIDER_PROMPT_OVERHEAD_TOKENS) / ATTEMPT_POLICY_BYTES_PER_TOKEN,
+  );
+
+  if (editableTokens > Math.min(providerInputCapacity, runInputCapacity) ||
+      editableTokens * ATTEMPT_POLICY_BYTES_PER_TOKEN > MAX_CODING_PACKET_BYTES - AIDER_PROMPT_OVERHEAD_TOKENS) {
+    return {
+      mode: "agentic",
+      estimatedPromptBytes: compactTokens * ATTEMPT_POLICY_BYTES_PER_TOKEN,
+      reason:
+        "complete editable scope exceeds the provider context or remaining run tokens; use bounded repository reads before mutation",
+    };
+  }
 
   const editableSet =
     new Set(editable);
@@ -375,55 +390,46 @@ export async function planCodingHandoff(
   let totalTokens =
     editableTokens;
 
-  if (
-    editableTokens <=
-    optionalContextCapacity
+  for (
+    const candidate
+    of readonlyCandidates(
+      input,
+      editableSet,
+    ).slice(
+      0,
+      MAX_AIDER_READ_ONLY_FILES,
+    )
   ) {
-    for (
-      const candidate
-      of readonlyCandidates(
-        input,
-        editableSet,
-      ).slice(
-        0,
-        MAX_AIDER_READ_ONLY_FILES,
-      )
+    const info =
+      await inspectPath(
+        input.repoPath,
+        candidate,
+      );
+
+    if (
+      !info.exists ||
+      !info.file ||
+      info.hardlinked
     ) {
-      const info =
-        await inspectPath(
-          input.repoPath,
-          candidate,
-        );
-
-      if (
-        !info.exists ||
-        !info.file ||
-        info.hardlinked
-      ) {
-        continue;
-      }
-
-      const tokens =
-        filePromptTokens(
-          candidate,
-          info.size,
-        );
-
-      if (
-        totalTokens + tokens >
-        optionalContextCapacity
-      ) {
-        continue;
-      }
-
-      readOnly.push(candidate);
-      totalTokens += tokens;
+      continue;
     }
-  }
 
-  const contextOverflow =
-    editableTokens >
-    providerInputCapacity;
+    const tokens =
+      filePromptTokens(
+        candidate,
+        info.size,
+      );
+
+    if (
+      totalTokens + tokens >
+      optionalContextCapacity
+    ) {
+      continue;
+    }
+
+    readOnly.push(candidate);
+    totalTokens += tokens;
+  }
 
   return {
     mode: "aider",
@@ -435,9 +441,7 @@ export async function planCodingHandoff(
       readOnly,
     },
     reason:
-      contextOverflow
-        ? "concrete scope remains Aider-owned; current model context is too small and authoritative preflight/model recovery must choose a larger-context model"
-        : missing.length
+      missing.length
           ? "localized scope is Aider-owned and includes authorized creation targets"
           : readOnly.length
             ? "localized scope plus highest-value read-only evidence is handed directly to Aider"

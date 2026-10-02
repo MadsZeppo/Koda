@@ -126,6 +126,14 @@ test("DIRECT explicit test mutation codes despite related words and keeps final 
       false,
     );
     assert.equal(
+      testRequirementAlreadyCovered(
+        `In ${testPath}, add a deterministic test named 'a brand new requested test'.`,
+        [{ path: testPath, content: source }],
+      ),
+      false,
+      "a passing related test cannot prove that an explicitly named new test exists",
+    );
+    assert.equal(
       testRequirementAlreadyCovered(task, [
         {
           path: testPath,
@@ -293,6 +301,70 @@ test("DIRECT skips coding when the requested bounded behavior is already proven"
     await rm(f.parent, { recursive: true, force: true });
   }
 });
+
+for (const mutate of [true, false]) {
+  test(`DIRECT compound implementation request cannot use typecheck as completion proof (${mutate ? "mutation" : "no-op"})`, async () => {
+    const f = await sandbox("koda-implementation-proof-");
+    const sourcePath = "src/evidence.ts";
+    const testPath = "tests/evidence.test.ts";
+    const original = "export const existing = 1;\n";
+    const changed = `${original}export function compactAdjacent(values: string[]) { return values.filter((value, index) => index === 0 || value !== values[index - 1]); }\n`;
+    const newTest = `import {test} from "node:test";\nimport assert from "node:assert/strict";\nimport {compactAdjacent} from "../src/evidence.ts";\ntest("adjacent duplicates",()=>assert.deepEqual(compactAdjacent(["a","a","b","a"]),["a","b","a"]));\n`;
+    let modelCalls = 0;
+    const server = createServer(async (req, res) => {
+      let raw = "";
+      for await (const chunk of req) raw += chunk;
+      const body = JSON.parse(raw);
+      modelCalls++;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ id: "mock", model: body.model,
+        choices: [{ index: 0, finish_reason: mutate ? "tool_calls" : "stop", message: {
+          role: "assistant", content: mutate ? null : "The existing checks pass.",
+          tool_calls: mutate ? [
+            { id: "source", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: sourcePath, content: changed }) } },
+            { id: "test", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: testPath, content: newTest }) } },
+          ] : [],
+        } }], usage: { prompt_tokens: 100, completion_tokens: 20, cost: 0 } }));
+    });
+    try {
+      await mkdir(join(f.root, "src"));
+      await mkdir(join(f.root, "tests"));
+      await writeFile(join(f.root, sourcePath), original);
+      await writeFile(join(f.root, testPath), `import {test} from "node:test";\nimport assert from "node:assert/strict";\ntest("existing",()=>assert.equal(1,1));\n`);
+      await writeFile(join(f.root, "package.json"), JSON.stringify({ type: "module", scripts: {
+        test: "node --test tests/*.test.ts", typecheck: 'node -e "process.exit(0)"',
+      } }));
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const result = await run({
+        repo: f.root, output: f.output, quiet: true,
+        task: `Find where evidence is summarized in ${sourcePath}. Add an exported helper that removes adjacent duplicate strings while preserving order. Add deterministic tests in ${testPath}.`,
+        config: await config(undefined, { adaptiveCoding: false, specialistRouting: false,
+          maxIterations: 1, models: {}, budgetUsd: 10,
+          baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1` }),
+      });
+      const events = (await readFile(join(f.output, "events.jsonl"), "utf8"))
+        .trim().split("\n").map((line) => JSON.parse(line));
+      assert.ok(events.some((event) => event.type === "routing_baseline_verification" &&
+        event.checks.some((check: any) => check.kind === "typecheck" && check.outcome === "CHECK_PASS")));
+      assert.equal(events.some((event) => event.type === "no_changes_required"), false);
+      assert.ok(modelCalls > 0, "a healthy baseline must still invoke the coding worker");
+      if (mutate) {
+        assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
+        assert.deepEqual(new Set(result.changedFiles), new Set([sourcePath, testPath]));
+        assert.ok(result.integration);
+        assert.equal(await readFile(join(result.integration.path, sourcePath), "utf8"), changed);
+        assert.ok(events.some((event) => event.type === "final_verification" &&
+          event.kind === "test" && event.outcome === "CHECK_PASS"));
+      } else {
+        assert.notEqual(result.status, "VERIFIED_SUCCESS");
+        assert.deepEqual(result.changedFiles, []);
+      }
+    } finally {
+      if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(f.parent, { recursive: true, force: true });
+    }
+  });
+}
 
 test("Linux /tmp workspaces have mountpoints before /tmp becomes read-only", async () => {
   for (const cwd of [

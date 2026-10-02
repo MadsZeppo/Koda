@@ -8,6 +8,7 @@ export type AttemptLimitKind =
   | "discovery_limit"
   | "timeout"
   | "context_limit"
+  | "output_limit"
   | "run_budget"
   | "provider_limit"
   | "other";

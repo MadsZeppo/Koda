@@ -1,3 +1,4 @@
+import { codingCapacity } from "../context/packetPolicy.js";
 import type { Gateway } from "../openrouter/client.js";
 import type { Candidate } from "../router/modelRouter.js";
 import type { Role } from "../router/modelRegistry.js";
@@ -69,6 +70,7 @@ import { router } from "../router/router.js";
 import { taskBucket } from "../router/features.js";
 import { tierRank } from "../router/pool.js";
 import { testRequirementAlreadyCovered } from "./mutationInvariant.js";
+import { stableNoChangePreflight } from "./stableNoChangePreflight.js";
 import { readFile, lstat } from "node:fs/promises";
 import { join, posix } from "node:path";
 import {
@@ -441,10 +443,10 @@ export async function implement(
     evidence: [],
   };
   const requirements = taskRequirementChecklist({
-    task,
+    task: subtask.id.startsWith("bounded-") ? subtask.objective : task,
     objective: subtask.objective,
     integrationContract: subtask.integrationContract,
-    acceptanceCriteria: plan.acceptanceCriteria,
+    acceptanceCriteria: subtask.id.startsWith("bounded-") ? [subtask.integrationContract] : plan.acceptanceCriteria,
   });
   gateway.logger.log("task_requirement_checklist", {
     subtaskId: subtask.id,
@@ -607,10 +609,12 @@ export async function implement(
       ? `${failed.command}: ${failed.unavailable ?? "verification could not execute"}`
       : undefined;
   };
+  const canonicalBaseline =
+    options.canonicalRoutingVerification ?? options.canonicalVerification;
   let baseline = options.stableRepair?.baselineChecks?.length
     ? verificationResult(options.stableRepair.baselineChecks)
-    : options.canonicalVerification?.checks.length
-      ? options.canonicalVerification
+    : canonicalBaseline?.checks.length
+      ? canonicalBaseline
     : options.tinyDirect
       ? verificationResult([])
       : baselineCommands(commands).length
@@ -656,22 +660,43 @@ export async function implement(
         content: await readFile(join(path, file), "utf8").catch(() => ""),
       })),
   );
-  const alreadySatisfied =
+  // A passing structural baseline proves repository health, not completion.
+  // An explicit mutation needs concrete assertion evidence and its executed test.
+  const noChangeProof = testRequirementAlreadyCovered(task, lockedTests)
+    ? await stableNoChangePreflight(
+        path, task, profile,
+        () => Math.min(gateway.config.commandTimeoutMs, gateway.budget.remainingMs()),
+        (check) => gateway.logger.log("verification", { subtaskId: subtask.id, ...check }),
+        baseline,
+        lockedTests.map((file) => file.path),
+      )
+    : undefined;
+  const taskAcceptanceCommands = workerChecks(subtask, profile, context);
+  const existingAcceptanceProven =
+    objectiveCanBeAlreadySatisfied(subtask) &&
+    workerChecksAreTaskSpecific(subtask, profile, context) &&
     baseline.status === "VERIFIED_SUCCESS" &&
-    (testRequirementAlreadyCovered(task, lockedTests) ||
-      (objectiveCanBeAlreadySatisfied(subtask) &&
-        !!profile.ecosystem &&
-        workerChecksAreTaskSpecific(subtask, profile, context)));
-  if (alreadySatisfied) {
+    taskAcceptanceCommands.every((command) => baseline.checks.some((check) =>
+      check.command === command && check.outcome === "CHECK_PASS")) &&
+    baseline.checks.some((check) =>
+      check.kind === "test" && check.outcome === "CHECK_PASS" &&
+      taskAcceptanceCommands.includes(check.command));
+  const noChangeVerification = noChangeProof?.satisfied
+    ? noChangeProof.verification
+    : existingAcceptanceProven ? baseline : undefined;
+  if (noChangeVerification) {
     gateway.logger.log("no_changes_required", {
       subtaskId: subtask.id,
       status: "VERIFIED_SUCCESS",
       reason: "acceptance_checks_already_pass",
       diffBytes: 0,
-      verificationCommands: baseline.checks.map((check) => check.command),
+      verificationCommands: noChangeVerification.checks.map((check) => check.command),
+      evidence_paths: noChangeProof?.satisfied ? noChangeProof.evidencePaths : context.files
+        .filter((file) => isTestPath(file.path) && taskAcceptanceCommands.some((command) => command.includes(file.path)))
+        .map((file) => file.path),
     });
     return {
-      verification: baseline,
+      verification: noChangeVerification,
       role: "CHEAP_CODER_A" as Role,
       evidence,
       noChangesRequired: true,
@@ -1008,7 +1033,7 @@ export async function implement(
   const injectedWorker =
     options.codingWorker;
   let diagnostics = options.stableRepair?.failedChecks
-    .map((check) => `${check.command}\n${check.stderr || check.stdout}`)
+    .map((check) => `${check.command}\n${[check.stdout, check.stderr].filter(Boolean).join("\n")}`)
     .join("\n");
   let previousFailedDiff = options.stableRepair?.failedDiff;
   let tinyNoMutationAttempts = 0;
@@ -1019,6 +1044,7 @@ export async function implement(
   let verificationRepairPending = false;
   let verificationFailureBeforeRepair: VerificationResult | undefined;
   let completionRepair: CodingWorkerContext["completionRepair"];
+  let implementationRecovery: CodingWorkerContext["implementationRecovery"];
   const maxCompletionContinuations = 2;
   const maxOperationalRetries = 2;
   const resumedDiscoveryEvidence = new Set<string>();
@@ -1078,6 +1104,7 @@ export async function implement(
     const workerTask = [...new Set(workerRequirements.filter(
       (value): value is string => !!value,
     ))].join("\n\n");
+    const capacity = codingCapacity(gateway.budget.remainingTokens(), remaining, !!implementationRecovery || operationalRetries > 0);
     const workerContext = codingContextPacket({
       context,
       evidence,
@@ -1092,12 +1119,14 @@ export async function implement(
       // a compact repair handoff.
       repair: !!diagnostics || !!previousFailedDiff,
     });
+    workerContext.implementationRecovery = implementationRecovery;
     // Role-based and virtual routes use Koda's configured price ceilings, as
     // Gateway.call does. A concrete catalog selection keeps its own metadata.
     const attemptMetadata = selected?.metadata ??
       (!pool || adaptiveTier
         ? { inputPrice: gateway.config.maxInputPrice, outputPrice: gateway.config.maxOutputPrice }
         : (await pool.catalog?.get?.())?.get(model));
+    const workerOutputTokens = Math.min(gateway.config.maxOutputTokens, attemptMetadata?.maxOutputTokens ?? 4096);
     const handoff =
       injectedWorker
         ? undefined
@@ -1110,10 +1139,11 @@ export async function implement(
               gateway.budget.remainingTokens(),
               gateway.config.stageMaxTokens,
             ),
+            remainingRunTokens: capacity.tokens,
             modelContextTokens:
               attemptMetadata?.contextLength,
             maxOutputTokens:
-              gateway.config.maxOutputTokens,
+              workerOutputTokens,
             costCapacityUsd: Math.min(
               remaining,
               gateway.config.stageMaxUsd,
@@ -1129,6 +1159,9 @@ export async function implement(
               writeScope.paths[0] !== ".",
           });
 
+    if (handoff?.mode === "agentic" && !writeScope.paths.includes(".")) {
+      workerContext.implementationRecovery ??= { reason: "bounded_coding_packet" };
+    }
     const worker: CodingWorker =
       injectedWorker ??
       (handoff!.mode === "direct"
@@ -1179,13 +1212,9 @@ export async function implement(
         estimated_prompt_bytes:
           handoffPromptBytes,
         editable_files:
-          handoff?.mode === "aider"
-            ? handoff.aiderFiles?.editable ?? []
-            : [],
+          handoff?.aiderFiles?.editable ?? writeScope.paths.filter((file) => file !== "."),
         readonly_files:
-          handoff?.mode === "aider"
-            ? handoff.aiderFiles?.readOnly ?? []
-            : [],
+          handoff?.aiderFiles?.readOnly ?? workerContext.relevantFiles?.filter((file) => !writeScope.paths.includes(file)) ?? [],
       },
     );
 
@@ -1194,14 +1223,14 @@ export async function implement(
       effort,
       promptBytes: handoffPromptBytes,
       maxIterations: gateway.config.maxIterations,
-      maxOutputTokens: gateway.config.maxOutputTokens,
+      maxOutputTokens: workerOutputTokens,
       learnedP90Tokens: finite(learnedTokenBound)
         ? Math.ceil(learnedTokenBound)
         : undefined,
-      remainingTokens: gateway.budget.remainingTokens(),
+      remainingTokens: capacity.tokens,
       stageMaxTokens: gateway.config.stageMaxTokens,
       plannedBudgetUsd: plannedAttemptCost,
-      remainingUsd: remaining,
+      remainingUsd: capacity.usd,
       stageMaxUsd: gateway.config.stageMaxUsd,
       promptPricePerMillion: attemptMetadata?.inputPrice,
       completionPricePerMillion: attemptMetadata?.outputPrice,
@@ -1223,7 +1252,7 @@ export async function implement(
       directEditEligible:
         worker instanceof DirectEditWorker,
     });
-    if (!limits.viable) {
+    if (!limits.viable || workerOutputTokens < 512) {
       const skippedModel = model;
       gateway.logger.log("coding_attempt_non_viable", {
         subtaskId: subtask.id,
@@ -1248,7 +1277,7 @@ export async function implement(
         available_timeout_ms: limits.timeoutMs,
       });
       const moved = await nextPlannedModel({
-        failureMode: "other",
+        failureMode: "operational",
         failurePhase: "BEFORE_EXECUTION",
         terminationReason: limits.nonViableLimitKind,
       });
@@ -1309,7 +1338,7 @@ export async function implement(
       timeoutMs: attemptTimeoutMs,
       requestTimeoutMs: gateway.config.modelTimeoutMs.implementation,
       commandTimeoutMs: gateway.config.commandTimeoutMs,
-      maxOutputTokens: gateway.config.maxOutputTokens,
+      maxOutputTokens: workerOutputTokens,
       baseUrl: gateway.config.baseUrl,
       sessionId: `${gateway.logger.runId}/${subtask.id}/${model}`,
       maxToolOutputBytes: gateway.config.context.toolResultBytes,
@@ -1720,7 +1749,9 @@ export async function implement(
       const resumableDiscoveryLimit =
         boundedDiscoveryLimit || discoveryTokenLimit;
       const failureMode =
-          result.limitKind === "timeout" || result.limitKind === "provider_limit"
+          result.limitKind === "timeout" ||
+          result.limitKind === "provider_limit" ||
+          ["output_limit", "context_limit", "token_limit", "token_preflight"].includes(result.limitKind)
             ? "operational"
             : boundedDiscoveryOperationalLimit
               ? "operational"
@@ -1769,6 +1800,9 @@ export async function implement(
         moved,
       });
       if (moved) {
+        if (["output_limit", "context_limit", "token_limit", "token_preflight"].includes(result.limitKind)) {
+          implementationRecovery = { reason: result.limitKind };
+        }
         if (operational || resumableDiscoveryLimit) attempt--;
         continue;
       }
@@ -2219,7 +2253,7 @@ export async function implement(
     previousFailedDiff = diff;
     diagnostics = relative.checks
       .filter((check) => check.outcome === "CHECK_FAIL")
-      .map((check) => `${check.command}\n${check.stderr || check.stdout}`)
+      .map((check) => `${check.command}\n${[check.stdout, check.stderr].filter(Boolean).join("\n")}`)
       .join("\n");
     const attributable = verificationRegressed(baseline, candidateVerification);
     if (pool && attributable) {
@@ -2266,9 +2300,20 @@ export async function implement(
           .filter((check) => check.outcome === "CHECK_FAIL")
           .map((check) => [
             `Failing command: ${check.command}`,
-            check.stderr || check.stdout,
+            check.stdout,
+            check.stderr,
           ].filter(Boolean).join("\n")),
       ].join("\n\n");
+      // New files and their imports were absent from the original repository
+      // profile. Repair must read the candidate and its actual API contracts.
+      context = await compileContext(
+        path,
+        task,
+        result.changedPaths,
+        { ...profile, files: [...new Set([...profile.files, ...result.changedPaths])] },
+        gateway.config.context,
+        true,
+      );
       previousFailedDiff = diff;
       completionRepair = {
         unresolvedRequirementIds: ["VERIFICATION_REGRESSION"],

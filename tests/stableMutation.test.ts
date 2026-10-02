@@ -807,7 +807,7 @@ test(`Stable ${failure} prior routing state does not block scoped Aider executio
     assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
     const events = (await readFile(join(output, "events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
     assert.deepEqual(events.find((event) => event.type === "stable_discovery_start")
-      .initial_write_scope, ["src/a.js", "src/b.js", "src/c.js", "tests/a.test.js"]);
+      .initial_write_scope, ["src/a.js", "src/b.js", "src/c.js"]);
     const lock = events.find((event) => event.type === "stable_discovery_scope_locked");
     assert.deepEqual(lock.actual_changed_paths, ["src/a.js"]);
     assert.deepEqual(lock.repair_write_scope, ["src/a.js"]);

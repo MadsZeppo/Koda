@@ -207,6 +207,7 @@ test("a source change and its companion test stay one direct workstream", () => 
   const repository = profile([
     "src/value.ts",
     "tests/value.test.ts",
+    "tests/helpers/value.ts",
     "src/unrelated.ts",
     "package.json",
   ]);

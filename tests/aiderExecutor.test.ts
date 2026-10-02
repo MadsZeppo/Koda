@@ -19,6 +19,7 @@ import { config } from "../src/config.js";
 import { completionRepairWriteScope, implement } from "../src/agent/codingExecutor.js";
 import { History } from "../src/router/history.js";
 import { modelSchema } from "../src/router/pool.js";
+import { chooseAdaptiveRecovery, freezeExecutionPolicy } from "../src/router/controlPolicy.js";
 import type { CodingWorkerInput } from "../src/agent/codingWorker.js";
 import type { CodingWorker } from "../src/agent/codingWorker.js";
 
@@ -69,6 +70,33 @@ test("arbitrary OpenRouter model IDs transform deterministically without an allo
   for (const id of ["foo/bar", "new-company/future-model:free", "vendor/model-v123", "openrouter/future-route"]) {
     assert.equal(aiderOpenRouterModel(id), `openrouter/${id}`);
   }
+});
+
+for (const mutate of [false, true]) {
+  test(`provider output truncation is an output limit even with zero exit (${mutate ? "partial mutation" : "no mutation"})`, async (t) => {
+    const root = await fixture(t);
+    const result = await worker(root, async (cwd, invocation) => {
+      if (mutate) await writeFile(join(cwd, "src/value.cjs"), "module.exports = 2;\n");
+      await report(invocation, "diff");
+      await writeFile(invocation.ledgerPath, JSON.stringify({ costUsd: .001,
+        inputTokens: 100, outputTokens: 1000, tokens: 1100, steps: 1, outputLimitReached: true }));
+      return success;
+    }).run(input(root));
+    assert.equal(result.exitStatus, "failed");
+    assert.equal(result.terminationReason, "output_limit");
+    assert.equal(result.limitKind, "output_limit");
+    assert.deepEqual(result.changedPaths, mutate ? ["src/value.cjs"] : []);
+  });
+}
+
+test("Aider's explicit output-limit warning is recognized without a bridge flag", async (t) => {
+  const root = await fixture(t);
+  const result = await worker(root, async (_cwd, invocation) => {
+    await report(invocation, "diff");
+    return { ...success, stdout: "Output tokens: 4096 of 4096 -- exceeded output limit!" };
+  }).run(input(root));
+  assert.equal(result.limitKind, "output_limit");
+  assert.notEqual(result.terminationReason, "no_mutation");
 });
 
 test("Aider file handoff keeps grounded source editable and tests/read context read-only", () => {
@@ -410,6 +438,88 @@ test("Aider fixture reaches VERIFIED_SUCCESS only through Koda's real checks", a
   assert.equal(roleResult.verification.status, "VERIFIED_SUCCESS");
 });
 
+for (const preflight of [false, true]) {
+for (const correct of [true, false]) {
+  test(`${preflight ? "preflight" : "output-limit"} recovery executes the frozen fallback and ${correct ? "verifies correct code" : "rejects incorrect code"}`, async (t) => {
+    const root = await fixture(t);
+    await mkdir(join(root, "tests"));
+    await writeFile(join(root, "tests/value.test.cjs"),
+      "const {test}=require('node:test');const a=require('node:assert/strict');test('value',()=>a.equal(require('../src/value.cjs'),3));\n");
+    const candidates = ["initial", "fallback"].map((id) => ({
+      model: modelSchema.parse({ id: `vendor/${id}`, tier: "cheap", qualityPrior: .99 }),
+      metadata: { inputPrice: preflight && id === "initial" ? 1000 : 1, outputPrice: 1 }, quality: .99, cost: .01, latency: 1, score: 1,
+      conservativeQuality: .99, evidenceLevel: "PROMISING", observationCount: 0,
+      expectedAttemptCost: .01, conservativeAttemptCost: .012, expectedAttemptLatencyMs: 1,
+      operationalErrorRate: 0, tokenEfficiency: { p90TotalTokens: 200 },
+    }));
+    const plan: any = freezeExecutionPolicy({
+      id: "output-recovery", approvedCandidateSet: candidates,
+      activeBoard: [], providerConstraints: {}, writeScopes: ["src/value.cjs"],
+      verificationContract: { required: true }, stopConditions: ["verified", "plan exhausted"],
+      initialCandidate: candidates[0], initialModel: candidates[0]!.model.id,
+      referenceModel: candidates[1]!.model.id, qualityClass: "LOW", requiredQuality: .9,
+      maxCodingAttempts: 1, totalBudgetUsd: .3, latencyBudgetMs: 30000,
+      taskFingerprint: { primary: "implementation", scope: "single", effort: "tiny" },
+      operationalRecoveryModelIds: [candidates[1]!.model.id],
+    } as any);
+    const cfg = await config(undefined, { specialistRouting: true, maxIterations: 1,
+      modelPool: { provider: "openrouter", models: candidates.map((c) => c.model) } });
+    const logger = new Logger(join(root, ".koda"), "output-recovery", true);
+    const history = new History(join(root, ".koda", "history"));
+    const gateway: any = { config: cfg, logger, budget: new Budget(1, 100000, 60000), modelRouter: {
+      selectSpecialist: async () => candidates, select: async () => candidates[0],
+      selectRecoveryCandidate: chooseAdaptiveRecovery, record: () => {}, history,
+    } };
+    const calledModels: string[] = [];
+    const aiderWorker = worker(root, async (cwd, i) => {
+      const request = JSON.parse(await readFile(i.args[2]!, "utf8"));
+      calledModels.push(request.model);
+      await report(i, "diff");
+      if (!preflight && calledModels.length === 1) {
+        await writeFile(i.ledgerPath, JSON.stringify({ costUsd: .001,
+          tokens: 1100, inputTokens: 100, outputTokens: 1000, steps: 1, outputLimitReached: true }));
+      } else {
+        await writeFile(join(cwd, "src/value.cjs"), `module.exports = ${correct ? 3 : 2};\n`);
+      }
+      return success;
+    });
+    let workerCalls = 0;
+    const codingWorker: CodingWorker = { engine: "aider", async run(input) {
+      workerCalls++;
+      assert.deepEqual(input.writeScope, ["src/value.cjs"]);
+      assert.ok(input.context?.relevantFiles?.includes("src/value.cjs"));
+      assert.ok(input.context?.sourceFiles?.some((file) => file.path === "src/value.cjs"));
+      if (!input.context?.completionRepair)
+        assert.ok(input.context?.evidence, "localization evidence survives operational recovery");
+      if (!preflight && workerCalls === 2) {
+        assert.deepEqual(input.context?.implementationRecovery, { reason: "output_limit" });
+      }
+      return aiderWorker.run(input);
+    } };
+    const subtask: any = { id: "fix", title: "Fix value", objective: "Make value equal 3",
+      likelyReadPaths: ["src/value.cjs"], likelyWritePaths: ["src/value.cjs"], dependsOn: [],
+      integrationContract: "value equals 3", verificationCommands: ["node --test tests/value.test.cjs"],
+      estimatedDifficulty: "normal", parallelSafe: false };
+    const result = await implement(gateway, root, subtask.objective, subtask,
+      { acceptanceCriteria: ["value equals 3"] },
+      { files: ["src/value.cjs", "tests/value.test.cjs"], verificationCommands: subtask.verificationCommands } as any,
+      { codingWorker, executionPlan: plan, compiledContext: {
+        files: [{ path: "src/value.cjs", snippet: "module.exports = 1" }],
+        localDependencies: [], completePaths: ["src/value.cjs"], repoMap: ["src/value.cjs"],
+      } as any });
+    const expected = (preflight ? candidates.slice(1) : candidates).map((c) => aiderOpenRouterModel(c.model.id));
+    assert.deepEqual(calledModels.slice(0, expected.length), expected);
+    if (correct) assert.equal(calledModels.length, expected.length);
+    assert.ok(logger.events.some((e) => preflight
+      ? e.type === "model_attempt" && e.escalated === true && /non_viable_attempt:/.test(String(e.reason))
+      : e.type === "aider_fallback" && e.moved === true && e.reason === "execution_limit:output_limit"));
+    if (correct) assert.equal(result.verification.status, "VERIFIED_SUCCESS");
+    else assert.notEqual(result.verification.status, "VERIFIED_SUCCESS");
+  });
+}
+
+}
+
 test("completion review keeps the full write scope and continues partial work in the same worktree", async (t) => {
   const root = await fixture(t);
   await mkdir(join(root, "tests"));
@@ -418,7 +528,7 @@ test("completion review keeps the full write scope and continues partial work in
     "const {test}=require('node:test');test('placeholder',()=>{});\n");
   await execa("git", ["add", "."], { cwd: root });
   await execa("git", ["-c", "user.name=Koda", "-c", "user.email=koda@localhost", "commit", "-qm", "completion fixture"], { cwd: root });
-  const cfg = await config(undefined, { maxIterations: 1 });
+  const cfg = await config(undefined, { maxIterations: 1, maxInputPrice: 1, maxOutputPrice: 1 });
   const logger = new Logger(join(root, ".koda"), "completion-loop", true);
   let calls = 0;
   const codingWorker: CodingWorker = {
@@ -523,7 +633,7 @@ test("a killed Aider attempt with a passing partial mutation is never verified",
   );
 
   assert.equal(output.verification.status, "NOT_FULLY_VERIFIED");
-  assert.equal(interruptedCalls, 1);
+  assert.ok(interruptedCalls >= 1 && interruptedCalls <= 3, "operational recovery is bounded");
   assert.equal(await readFile(join(root, "src/value.cjs"), "utf8"), "module.exports = 3;\n",
     "the partial mutation remains inspectable for recovery");
   assert.ok(logger.events.some((event) =>

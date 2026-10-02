@@ -128,7 +128,7 @@ test("an explicit source change plus deterministic tests remains one bounded DIR
   );
 });
 
-test("the normalizeTaskLabel smoke scope goes localization -> Aider and never AgenticCodingWorker", async () => {
+test("oversized localized source and tests use bounded reads instead of a giant Aider packet", async () => {
   const root = await mkdtemp(join(tmpdir(), "koda-coding-regression-"));
   try {
     await mkdir(join(root, "src/planner"), { recursive: true });
@@ -156,11 +156,8 @@ test("the normalizeTaskLabel smoke scope goes localization -> Aider and never Ag
       directEditEligible: false,
     });
 
-    assert.equal(handoff.mode, "aider");
-    assert.deepEqual(handoff.aiderFiles?.editable, [
-      "src/planner/taskCompiler.ts",
-      "tests/planner.test.ts",
-    ]);
+    assert.equal(handoff.mode, "agentic");
+    assert.ok(handoff.estimatedPromptBytes < 32_768);
 
     const policy = attemptLimitPolicy({
       fingerprint: fingerprint({
@@ -181,14 +178,14 @@ test("the normalizeTaskLabel smoke scope goes localization -> Aider and never Ag
       completionPricePerMillion: 4,
       remainingMs: 120_000,
       configuredTimeoutMs: 120_000,
-      aiderWorker: true,
+      aiderWorker: false,
       modelContextTokens: 128_000,
     });
 
     assert.equal(policy.viable, true);
     assert.ok(
-      policy.maxTokens > 19_725,
-      "the old smoke must not be killed by the historical 19,725-token agentic budget",
+      policy.maxTokens <= 30_000,
+      "bounded reads must fit the existing stage budget",
     );
   } finally {
     await rm(root, { recursive: true, force: true });

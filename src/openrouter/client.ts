@@ -1,3 +1,4 @@
+import { admitProviderPayload, MAX_PROVIDER_OUTPUT_TOKENS } from "../context/packetPolicy.js";
 import { PoolRouter } from "../router/modelRouter.js";
 import type { ModelDiscoveryAdapter } from "../router/capabilityRegistry.js";
 import OpenAI from "openai";
@@ -99,6 +100,7 @@ export class Gateway {
     const configuredTimeout = this.config.modelTimeoutMs[deadlineClass];
     const maxOutputTokens = Math.min(
       limits?.maxOutputTokens ?? this.config.maxOutputTokens,
+      MAX_PROVIDER_OUTPUT_TOKENS,
       this.config.maxOutputTokens,
     );
     if (!Number.isInteger(maxOutputTokens) || maxOutputTokens <= 0)
@@ -111,8 +113,8 @@ export class Gateway {
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0)
       throw Error("Invalid model timeout");
     const bytes = Buffer.byteLength(JSON.stringify({ messages, tools }));
-    const tokenBound = bytes + 256;
-    const reserveTokens = tokenBound + maxOutputTokens;
+    let tokenBound = admitProviderPayload({ model, messages, tools, max_tokens: maxOutputTokens }, maxOutputTokens).inputTokens;
+    let reserveTokens = tokenBound + maxOutputTokens;
     const pareto = model === PARETO_CODE_MODEL;
     if (
       pareto &&
@@ -168,9 +170,36 @@ export class Gateway {
     this.logger.log("provider_policy", { subtaskId, stage, model,
       session_id: openrouter ? sessionId : null, provider: openrouter ? providerPolicy : null,
       reasoning_effort: reasoningEffort ?? null });
+    const providerPayload = {
+          model,
+          messages,
+          tools,
+          tool_choice: limits?.requireTool ? "required" as const : undefined,
+          max_tokens: maxOutputTokens,
+          stream: false as const,
+          ...(reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
+          ...({
+            ...(pareto
+              ? {
+                  plugins: [
+                    {
+                      id: "pareto-router",
+                      min_coding_score: codingScore(limits!.codingRoute!.tier),
+                    },
+                  ],
+                }
+              : {}),
+            ...(openrouter ? { session_id: sessionId, provider: providerPolicy } : {}),
+          } as any),
+        };
+    const finalBound = admitProviderPayload(providerPayload, maxOutputTokens, metadata?.contextLength);
+    tokenBound = finalBound.inputTokens;
+    reserveTokens = tokenBound + maxOutputTokens;
+    this.logger.log("provider_payload_bound", { subtaskId, stage, ...finalBound });
     const operation = (outcome: "response" | "error", served: string | null,
       provider: unknown, wallClockMs: number, costUsd: number | null,
-      costSource?: "provider_reported" | "estimated_from_tokens") => {
+      costSource?: "provider_reported" | "estimated_from_tokens",
+      failureKind?: "tool_protocol_incompatible" | "timeout" | "provider") => {
       if (!this.modelRouter) return;
       const providerName = typeof provider === "string" ? provider
         : provider && typeof provider === "object"
@@ -183,6 +212,7 @@ export class Gateway {
         modelRequested: model, modelServed: served, provider: providerName,
         wallClockMs, outcome, costUsd, costSource,
         classification: outcome === "error" ? "OPERATIONAL_FAILURE" : undefined,
+        failureKind,
       });
     };
     const estimated =
@@ -227,28 +257,7 @@ export class Gateway {
     let responseLogged = false;
     try {
       const response = await this.sdk.chat.completions.create(
-        {
-          model,
-          messages,
-          tools,
-          tool_choice: limits?.requireTool ? "required" : undefined,
-          max_tokens: maxOutputTokens,
-          stream: false,
-          ...(reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
-          ...({
-            ...(pareto
-              ? {
-                  plugins: [
-                    {
-                      id: "pareto-router",
-                      min_coding_score: codingScore(limits!.codingRoute!.tier),
-                    },
-                  ],
-                }
-              : {}),
-            ...(openrouter ? { session_id: sessionId, provider: providerPolicy } : {}),
-          } as any),
-        },
+        providerPayload,
         {
           timeout: timeoutMs,
           signal: AbortSignal.timeout(timeoutMs),
@@ -386,7 +395,10 @@ export class Gateway {
           error: String(e),
         });
       if (!responseLogged) operation("error", null, null, Date.now() - start,
-        rejectedBeforeExecution ? 0 : transient ? estimated : null);
+        rejectedBeforeExecution ? 0 : transient ? estimated : null, undefined,
+        isRouteEndpointIncompatibility(e) && /tool_choice|tool protocol|tools?[^\n]*support/i.test(String(e))
+          ? "tool_protocol_incompatible"
+          : /timeout|timed out|ETIMEDOUT|AbortError/i.test(String(e)) ? "timeout" : "provider");
       this.logger.log("model_error", {
         subtaskId,
         stage,

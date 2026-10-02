@@ -792,6 +792,11 @@ async function mock(
       const body = JSON.parse(raw);
       requests.push(body);
       const message = await handler(body);
+      if (message.httpError) {
+        res.statusCode = message.httpError.status;
+        res.end(JSON.stringify({ error: { message: message.httpError.message } }));
+        return;
+      }
       res.end(
         JSON.stringify({
           id: "mock",
@@ -1150,6 +1155,78 @@ test("planner routing excludes endpoints that cannot enforce submit_plan", async
     "required planning tool protocol unsupported");
 });
 
+test("planner ranking rejects batch transport even with advertised tool support", async () => {
+  const c = await config(undefined, { modelPool: pool });
+  const model = { ...c.modelPool!.models[0]!, id: "vendor/future:batch" };
+  const ranked = rankPlanners([model], new Map([[model.id, {
+    inputPrice: .01, outputPrice: .01,
+    supportedParameters: ["tools", "tool_choice", "structured_outputs"],
+  }]]), [], "complex", c.planner, 1000, 1000);
+  assert.equal(ranked[0]?.rejected, "batch endpoint unsupported for interactive planner");
+});
+
+test("planner ranking excludes both free aliases and zero-priced endpoints", async () => {
+  const c = await config(undefined, { modelPool: pool });
+  const models = ["vendor/new:free", "vendor/zero-priced", "vendor/paid"].map((id) =>
+    ({ ...c.modelPool!.models[0]!, id }));
+  const metadata = new Map(models.map((model) => [model.id, {
+    inputPrice: model.id.endsWith("zero-priced") ? 0 : .1,
+    outputPrice: model.id.endsWith("zero-priced") ? 0 : .2,
+    supportedParameters: ["tools", "tool_choice", "structured_outputs"],
+  }]));
+  const ranked = rankPlanners(models, metadata, [], "complex", c.planner, 1000, 1000);
+  assert.equal(ranked.find((row) => row.model.id === "vendor/new:free")?.rejected,
+    "free models temporarily disabled");
+  assert.equal(ranked.find((row) => row.model.id === "vendor/zero-priced")?.rejected,
+    "free models temporarily disabled");
+  assert.equal(ranked.find((row) => row.model.id === "vendor/paid")?.rejected, undefined);
+});
+
+test("discovered unknown planners cannot inherit the configured high planning prior", async () => {
+  const f = await fixture();
+  try {
+    const c = await config(undefined, { modelPool: pool });
+    const metadata = { inputPrice: .1, outputPrice: .2,
+      supportedParameters: ["tools", "tool_choice", "structured_outputs"] };
+    const unknown = { ...c.modelPool!.models[0]!, id: "vendor/discovered-unknown",
+      qualityPrior: .5, latencyPriorMs: 1 };
+    const qualified = { ...unknown, id: "vendor/discovered-qualified", qualityPrior: .94 };
+    const logger = new Logger(join(f.root, "prior-log"), "prior", true);
+    const selected = await selectPlanner({ config: c, logger, disabled: new Set(),
+      catalog: { get: async () => new Map() },
+      capabilities: { all: async () => [unknown, qualified].map((model) => ({ model, metadata })) },
+      history: { read: () => [], readOperations: () => [] },
+    } as any, { taskKind: "planning", complexity: "complex" } as any, "strong", [], 1000, 1, 10000);
+    assert.equal(selected.id, qualified.id);
+    const rows = logger.events.find((event) => event.type === "planner_route")!.candidates;
+    assert.equal(rows.find((row: any) => row.id === unknown.id).quality, .5);
+    assert.equal(rows.find((row: any) => row.id === unknown.id).rejected, "below planner quality threshold");
+    assert.ok(Math.abs(rows.find((row: any) => row.id === qualified.id).quality - .94) < 1e-9);
+  } finally { await f.cleanup(); }
+});
+
+test("planner selection preserves endpoint evidence instead of replacing it with catalog unions", async () => {
+  const f = await fixture();
+  try {
+    const c = await config(undefined, { modelPool: pool });
+    const metadata = { inputPrice: .1, outputPrice: .2,
+      supportedParameters: ["tools", "tool_choice", "structured_outputs"] };
+    const logger = new Logger(join(f.root, "endpoint-log"), "endpoint", true);
+    const selected = await selectPlanner({ config: c, logger, disabled: new Set(),
+      catalog: { get: async () => new Map(c.modelPool!.models.map((model) => [model.id, metadata])) },
+      capabilities: { all: async () => c.modelPool!.models.map((model) => ({ model,
+        metadata: { ...metadata, routableParameterSets: model.id === "fast"
+          ? [["tools"], ["tool_choice"]] : [["tools", "tool_choice"]] } })) },
+      history: { read: () => [], readOperations: () => [] },
+    } as any, { taskKind: "planning", complexity: "complex" } as any,
+    "fast", [], 1000, 1, 10000);
+    assert.equal(selected.id, "strong");
+    assert.equal(logger.events.find((event) => event.type === "planner_route")?.candidates
+      .find((candidate: any) => candidate.id === "fast").rejected,
+      "required planning tool protocol unsupported");
+  } finally { await f.cleanup(); }
+});
+
 test("deterministic gate maps bounded imports and refuses missing tests, ambiguous aliases, and extra requirements", async () => {
   const f = await fixture();
   try {
@@ -1380,6 +1457,63 @@ for (const invalid of [
       await f.cleanup();
     }
   });
+
+test("complex planner recovery skips incompatible transport, preserves strong routing and records provider failures operationally", async () => {
+  const f = await fixture();
+  const models = [
+    { id: "protocol-strong", tier: "strong" as const, latencyPriorMs: 100, inputPrice: .01, outputPrice: .01 },
+    { id: "malformed-strong", tier: "strong" as const, latencyPriorMs: 200, inputPrice: .01, outputPrice: .01 },
+    { id: "valid-strong", tier: "strong" as const, latencyPriorMs: 300, inputPrice: .01, outputPrice: .01 },
+    { id: "cheap-fast", tier: "fast" as const, latencyPriorMs: 1, inputPrice: .001, outputPrice: .001 },
+    { id: "vendor/other:batch", tier: "strong" as const, latencyPriorMs: 1, inputPrice: .001, outputPrice: .001 },
+  ].map((model) => ({ ...model, qualityPrior: .99, plannerQualityPrior: .99,
+    strengths: ["coding", "tool_use", "structured_output", "reasoning"] }));
+  let good: any;
+  const m = await mock((body) => {
+    assert.equal(body.tool_choice, "required");
+    assert.equal(body.max_tokens, 3072, "configured output capacity reaches the planner");
+    if (body.model === "protocol-strong") return { httpError: {
+      status: 404, message: "No endpoints found that support the provided 'tool_choice' value",
+    } };
+    if (body.model === "malformed-strong") return response("No structured plan");
+    return { role: "assistant", content: null, tool_calls: [{ id: "plan",
+      type: "function", function: { name: "submit_plan", arguments: JSON.stringify(good) } }] };
+  }, models);
+  try {
+    const c = await config(undefined, { modelPool: { provider: "openrouter", models },
+      baseUrl: m.url, planner: { maxOutputTokens: 3072 },
+      routing: { stateDirectory: join(f.root, "complex-recovery-history") }, budgetUsd: .1 });
+    const profile = await profileRepo(f.repo);
+    good = (await planningPolicy(task, profile, c.planner)).candidate;
+    good.subtasks[1].dependsOn = [good.subtasks[0].id];
+    const logger = new Logger(join(f.root, "complex-recovery-log"), "complex-recovery", true);
+    const gateway = new Gateway(c, logger, new Budget(.1, 200000, 60000));
+    const result = await compileTask(gateway,
+      "Refactor authentication and update the dependent API behavior.", profile);
+    assert.deepEqual(m.requests.map((request) => request.model),
+      ["protocol-strong", "malformed-strong", "valid-strong"]);
+    assert.deepEqual(result.subtasks[1]?.dependsOn, [result.subtasks[0]!.id]);
+    assert.ok(logger.events.filter((event) => event.type === "planner_route")
+      .every((event) => event.phase === "strong"));
+    const history = gateway.modelRouter!.history.read();
+    assert.equal(history.some((row) => row.modelRequested === "protocol-strong"), false,
+      "endpoint rejection must not decrease planning-quality estimates");
+    assert.ok(history.some((row) => row.modelRequested === "malformed-strong" && row.verification === "FAILED"));
+    assert.ok(history.some((row) => row.modelRequested === "valid-strong" && row.verification === "DAG_VALIDATED"));
+    assert.ok(gateway.modelRouter!.history.readOperations().some((row) =>
+      row.modelRequested === "protocol-strong" && row.outcome === "error" &&
+      row.failureKind === "tool_protocol_incompatible"));
+    const reranked = rankPlanners(c.modelPool!.models, await gateway.modelRouter!.catalog.get(),
+      [...history, { ...history.find((row) => row.modelRequested === "malformed-strong")!,
+        modelRequested: "protocol-strong", reason: "404 tool_choice unsupported" }],
+      "complex", c.planner, 1000, 3072, 1, 10000,
+      gateway.modelRouter!.history.readOperations());
+    assert.equal(reranked.find((candidate) => candidate.model.id === "protocol-strong")?.rejected,
+      "observed planning tool protocol incompatible", "future runs must retain capability rejection evidence");
+    assert.equal(reranked.find((candidate) => candidate.model.id === "protocol-strong")?.quality, .99,
+      "historical provider rejection rows must not decrease planner-quality estimates");
+  } finally { await m.close(); await f.cleanup(); }
+});
 
 test("planner fallback re-ranks remaining qualified candidates within budget", async () => {
   const f = await fixture();

@@ -395,6 +395,9 @@ export function directWritePaths(
         (f) =>
           changeTests &&
           isTestPath(f) &&
+          (/(?:^|[._-])(?:test|spec)(?:[._-]|$)/i.test(posix.basename(f)) ||
+            /(?:^|\/)test_[^/]+\.py$/i.test(f) ||
+            /_test\.go$/i.test(f)) &&
           stems.some((stem) =>
             posix.basename(f).toLowerCase().split(/[._-]/).includes(stem),
           ),

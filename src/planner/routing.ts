@@ -29,13 +29,23 @@ async function plannerRanking(
         metadata: catalog.get(model.id) ?? model.fallback ?? {},
       }));
   const allowed = pool.config.routing.plannerCandidates;
+  const configured = new Set(pool.config.modelPool!.models.map((model) => model.id));
   const specialists = discovered.filter((candidate) =>
     !allowed || allowed.includes(candidate.model.id));
   return rankPlanners(
-    specialists.map((candidate) => candidate.model),
+    specialists.map(({ model }) => configured.has(model.id) ? model : {
+      ...model,
+      // Discovery alone is not evidence of strong planning capability.
+      plannerQualityPrior: model.plannerQualityPrior ??
+        Math.min(model.qualityPrior, pool.config.planner.qualityPrior),
+    }),
     new Map(specialists.map((candidate) =>
-      [candidate.model.id, catalog.get(candidate.model.id) ??
-        candidate.metadata] as const)),
+      [candidate.model.id, {
+        ...catalog.get(candidate.model.id),
+        ...candidate.metadata,
+        routableParameterSets: candidate.metadata.routableParameterSets ??
+          catalog.get(candidate.model.id)?.routableParameterSets,
+      }] as const)),
     pool.history.read(),
     features.complexity as PlannerComplexity,
     pool.config.planner,
@@ -82,7 +92,11 @@ export function rankPlanners(
         (r) =>
           r.modelRequested === model.id &&
           r.features.taskKind === "planning" &&
-          ["DAG_VALIDATED", "FAILED"].includes(r.verification),
+          ["DAG_VALIDATED", "FAILED"].includes(r.verification) &&
+          !r.operationalFailure &&
+          !(r.verification === "FAILED" && operations.some((operation) =>
+            operation.runId === r.runId && operation.subtaskId === r.subtaskId &&
+            operation.modelRequested === r.modelRequested && operation.outcome === "error")),
       );
       const similar = rows.filter((r) => r.features.complexity === complexity);
       const n = settings.priorStrength;
@@ -116,6 +130,10 @@ export function rankPlanners(
         operation.failureKind === "tool_protocol_incompatible");
       const rejected = !model.enabled
         ? "disabled"
+        : model.id.endsWith(":free") || (md.inputPrice === 0 && md.outputPrice === 0)
+          ? "free models temporarily disabled"
+        : model.id.endsWith(":batch")
+          ? "batch endpoint unsupported for interactive planner"
         : md.available === false
           ? "unavailable"
           : !structured

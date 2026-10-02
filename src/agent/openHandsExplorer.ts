@@ -14,7 +14,7 @@ import {
 } from "../router/executionStrategy.js";
 import { extractFeatures } from "../router/features.js";
 import { snapshotTree, changesBetween } from "../workspace/files.js";
-import { isSourcePath, isTestPath, taskTerms } from "../context/compiler.js";
+import { isSourcePath, isTestPath, taskTerms, resolveImports } from "../context/compiler.js";
 import { ensureOpenHandsRuntime, OPENHANDS_SDK_VERSION } from "./openHandsRuntime.js";
 import { AttemptCheckpoint } from "./attemptCheckpoint.js";
 import { WriteScope } from "../repo/writeScope.js";
@@ -332,15 +332,20 @@ export async function deterministicRepositoryExploration(
 ): Promise<RepositoryExploration> {
   const terms = taskTerms(task).filter((term) => term.length >= 3).slice(0, 20);
   const preferred = new Set(preferredPaths.map(normalizeRepoPath));
+  const explicitlyRequested = new Set(explicitTaskPaths(task, profile));
   const files = profile.files
     .filter((path) => (isSourcePath(path) || isTestPath(path)) && !/(?:^|\/)(?:node_modules|dist|build|coverage)(?:\/|$)/.test(path))
     .slice(0, 220);
 
+  const known = new Set(profile.files);
+  const imported = new Set<string>();
   const ranked: { path: string; score: number; text: string }[] = [];
   for (const path of files) {
     let text = "";
     try {
-      text = (await readFile(join(root, path), "utf8")).slice(0, 64_000).toLowerCase();
+      text = (await readFile(join(root, path), "utf8")).slice(0, 64_000);
+      for (const dependency of resolveImports(path, text, known)) imported.add(dependency);
+      text = text.toLowerCase();
     } catch {
       continue;
     }
@@ -358,7 +363,29 @@ export async function deterministicRepositoryExploration(
   }
   ranked.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
 
-  const sources = ranked.filter((item) => isSourcePath(item.path) && !isTestPath(item.path));
+  const allSources = ranked.filter((item) => isSourcePath(item.path) && !isTestPath(item.path));
+  const backedSources = allSources.filter((item) => imported.has(item.path) || explicitlyRequested.has(item.path));
+  // Existing runtime/test imports are stronger implementation evidence than
+  // filenames of standalone scripts containing copied source or patch text.
+  // Standalone/empty repositories keep the lexical fallback.
+  const sources = backedSources.some((item) => item.score >= 4) ? backedSources : allSources;
+  // A focused existing test is executable localization evidence. Follow its
+  // runtime imports rather than letting generic words select large callers.
+  const testAnchors = ranked.filter((item) => isTestPath(item.path)).map((item) => {
+    const name = item.path.replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase();
+    return { item, matches: terms.filter((term) => name.includes(term)).length };
+  }).filter(({ matches }) => matches >= 2).sort((a, b) => b.matches - a.matches);
+  const anchor = testAnchors[0]?.item;
+  if (anchor) {
+    const code = (await readFile(join(root, anchor.path), "utf8")).replace(/import\s+type\b[\s\S]*?;/g, "");
+    const staticCode = code.replace(/\bimport\s*\([^)]*\)/g, "");
+    const staticDependencies = resolveImports(anchor.path, staticCode, known);
+    const dependencies = new Set(staticDependencies.length ? staticDependencies : resolveImports(anchor.path, code, known));
+    const owners = allSources.filter((item) => dependencies.has(item.path) || explicitlyRequested.has(item.path));
+    if (owners.length && owners.length <= 3) {
+      sources.splice(0, sources.length, ...owners);
+    }
+  }
   const top = sources[0];
   if (!top || top.score < 4) {
     return {
@@ -409,9 +436,17 @@ export function strategyWithExploration(
   initial: ExecutionStrategy,
   exploration: RepositoryExploration,
 ): ExecutionStrategy {
-  if (requestsTestMutation(task) && exploration.relatedTests.length) {
+  const explorationAlreadyOwnsTest = exploration.editableCandidates.some(
+    ({ path }) => isTestPath(path),
+  );
+  if (
+    requestsTestMutation(task) &&
+    exploration.relatedTests.length &&
+    !explorationAlreadyOwnsTest
+  ) {
     const existing = new Set(exploration.editableCandidates.map(({ path }) => path));
-    const promoted = exploration.relatedTests.filter((path) => !existing.has(path));
+    const promoted = exploration.relatedTests.filter((path) => !existing.has(path) &&
+      explicitTaskPaths(task, { files: exploration.relatedTests } as RepoProfile).includes(path));
     exploration.editableCandidates = [
       ...exploration.editableCandidates,
       ...promoted.map((path) => ({
@@ -527,7 +562,7 @@ export class OpenHandsExplorer implements RepositoryExplorer {
       maxTokens: tokenCapacity,
       maxInputTokens: Math.min(
         contextLength - maxOutputTokens,
-        Math.max(16_384, tokenCapacity - maxOutputTokens),
+        16_384,
       ),
       maxOutputTokens,
       maxIterations: 12,

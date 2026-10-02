@@ -218,6 +218,17 @@ class CallGuard:
             )
         )
 
+        payload_bytes = len(json.dumps({"model": kwargs.get("model"), "messages": messages,
+            "tools": kwargs.get("tools"), "extra_body": kwargs.get("extra_body"),
+            "response_format": kwargs.get("response_format"), "max_tokens": r["maxOutputTokens"]},
+            ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        prompt_bound = max(prompt, payload_bytes + 512)
+        state["lastPromptTokens"] = prompt
+        state["lastPromptBound"] = prompt_bound
+        if prompt_bound > r.get("maxInputTokens", 32768):
+            self.save()
+            raise StopExecution("provider_input_preflight")
+
         # maxTokens is Koda's TOTAL provider-token allowance for
         # this attempt, not a completion-only allowance.
         #
@@ -230,7 +241,7 @@ class CallGuard:
         remaining_tokens = (
             r["maxTokens"]
             - state["tokens"]
-            - prompt
+            - prompt_bound
         )
 
         output = min(
@@ -268,7 +279,7 @@ class CallGuard:
                 ) from None
 
         prompt_cost = (
-            prompt
+            prompt_bound
             * prices[0]
             / 1e6
         )
@@ -297,7 +308,7 @@ class CallGuard:
 
         if (
             context_limit is not None
-            and prompt >= context_limit
+            and prompt_bound + output > context_limit
         ):
             raise StopExecution(
                 "context_preflight_exhausted"
@@ -313,7 +324,7 @@ class CallGuard:
             )
 
         reserved_cost = (
-            prompt * prices[0]
+            prompt_bound * prices[0]
             + output * prices[1]
         ) / 1e6
 
@@ -321,7 +332,7 @@ class CallGuard:
         state["steps"] += 1
 
         state["tokens"] += (
-            prompt + output
+            prompt_bound + output
         )
 
         state["costUsd"] += (
@@ -441,6 +452,14 @@ class CallGuard:
             None,
         )
 
+        choices = getattr(response, "choices", []) or []
+        if any(
+            (choice.get("finish_reason") if isinstance(choice, dict)
+             else getattr(choice, "finish_reason", None)) == "length"
+            for choice in choices
+        ):
+            state["outputLimitReached"] = True
+
         raw = (
             usage.model_dump()
             if hasattr(
@@ -481,7 +500,7 @@ class CallGuard:
                 >= 0
             ):
                 reserved_tokens = (
-                    prompt + output
+                    prompt_bound + output
                 )
 
                 actual_tokens = (

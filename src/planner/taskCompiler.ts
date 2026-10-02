@@ -1,3 +1,8 @@
+import { compileTaskSpec } from "./taskSpec.js";
+import { MAX_CODING_PACKET_BYTES } from "../context/packetPolicy.js";
+import { stat } from "node:fs/promises";
+import { join } from "node:path";
+import type { Plan } from "./schemas.js";
 import { boundMessages, truncateBytes } from "../context/bounds.js";
 import { canFallback } from "../openrouter/client.js";
 import { extractFeatures } from "../router/features.js";
@@ -99,7 +104,29 @@ export async function compileTask(
   profile: RepoProfile,
   routingResume?: TaskResume,
   exploration?: RepositoryExploration,
+  repoPath?: string,
 ) {
+  const spec = compileTaskSpec(task);
+  const targets = exploration?.editableCandidates.map(({ path }) => path) ?? [];
+  const targetBytes = repoPath ? (await Promise.all(targets.map(async (file) => {
+    try { return (await stat(join(repoPath, file))).size; } catch { return 0; }
+  }))).reduce((sum, size) => sum + size, 0) : 0;
+  if ((spec.parts.length > 1 || targetBytes > MAX_CODING_PACKET_BYTES) && targets.length) {
+    const reads = [...new Set([...targets, ...(exploration?.relatedTests ?? []),
+      ...(exploration?.readonlyFiles.map(({ path }) => path) ?? [])])];
+    const testTarget = /\b(?:add|create|write|extend)\b[\s\S]{0,80}\btests?\b/i.test(task)
+      ? exploration?.relatedTests.find((file) => /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(file)) : undefined;
+    if (testTarget && !targets.includes(testTarget)) targets.push(testTarget);
+    const jobs = spec.parts.flatMap((part) => targets.map((file) => ({ part, file })));
+    const plan: Plan = { taskSummary: spec.routingPrompt, acceptanceCriteria: spec.requirements,
+      subtasks: jobs.map(({ part, file }, index) => ({ id: `bounded-${index}`, title: `Implement scoped contribution in ${file}`,
+        objective: `Implement only the contribution owned by ${file} to these requirements. Other files belong to dependent subtasks.\n${part}`,
+        dependsOn: index ? [`bounded-${index - 1}`] : [], likelyReadPaths: reads,
+        likelyWritePaths: [file], integrationContract: `Preserve interfaces; provide the scoped contribution from ${file}`,
+        verificationCommands: [], estimatedDifficulty: "normal", parallelSafe: false })) };
+    gateway.logger.log("bounded_task_decomposition", { groups: spec.parts.length, subtasks: jobs.length, scope_bytes: targetBytes });
+    return plan;
+  }
   const started = Date.now(),
     settings = gateway.config.planner;
   let strategy = "model",
@@ -236,7 +263,7 @@ Maximum four tasks. Preserve real dependencies. Combine same-file fixes. Every t
             features,
             phase,
             excluded,
-            Buffer.byteLength(JSON.stringify({ messages })) + 256,
+            Math.ceil(Buffer.byteLength(JSON.stringify({ messages })) / 4) + 256,
             gateway.availableUsd("plan"),
             gateway.availableTokens("plan"),
           )
@@ -261,7 +288,7 @@ Maximum four tasks. Preserve real dependencies. Combine same-file fixes. Every t
           attempt,
           submitPlanTool,
           {
-            maxOutputTokens: Math.min(settings.maxOutputTokens, 1800),
+            maxOutputTokens: Math.min(settings.maxOutputTokens, gateway.config.maxOutputTokens),
             timeoutMs: 30000,
             requireTool: true,
           },
@@ -298,7 +325,7 @@ Maximum four tasks. Preserve real dependencies. Combine same-file fixes. Every t
         return plan;
       } catch (error) {
         failure = truncateBytes(String(error), 800);
-        if (selected)
+        if (selected && response)
           pool!.record(
             selected,
             features,
@@ -324,7 +351,7 @@ Maximum four tasks. Preserve real dependencies. Combine same-file fixes. Every t
         if (!response) pool?.disabled.add(model);
         // Re-rank every remaining qualified candidate. A fallback is recovery
         // from one planner failure, not a mandatory tier escalation.
-        phase = "fast";
+        phase = complexity === "complex" ? "strong" : "fast";
         gateway.logger.log("planner_fallback", {
           planner_fallback: true,
           previous_model: model,

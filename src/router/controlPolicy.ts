@@ -152,7 +152,7 @@ export function effectiveRecoveryFailureMode(
 
   const reason = observation.terminationReason ?? "";
   if (
-    /direct_edit_protocol_error/i.test(reason) ||
+    /direct_edit_protocol_error|output_limit|provider_output_limit/i.test(reason) ||
     /(?:tool[_ -]?choice|response[_ -]?format|json[_ -]?schema|no endpoints?(?:\s+found)?|unsupported|not support|requested parameters?|protocol|RepeatedFormatError|format error|HTTP\s*4(?:00|04))/i.test(reason)
   )
     return "operational";
