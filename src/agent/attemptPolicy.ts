@@ -20,6 +20,7 @@ export type AttemptProgressPhase =
   | "REPAIR";
 
 export const AIDER_PROMPT_OVERHEAD_TOKENS = 4_096;
+export const AIDER_PROMPT_HEADROOM_TOKENS = 1_024;
 
 export interface AttemptLimitPolicyInput {
   fingerprint: TaskFingerprint;
@@ -142,11 +143,20 @@ export function attemptLimitPolicy(
   /**
    * Planning estimate only.
    *
+   * Aider's runtime token guard falls back to a conservative 3 bytes/token
+   * estimate when the routed model tokenizer is unavailable. Budget Aider with
+   * the same conversion here so TypeScript never declares an attempt viable
+   * using a looser 4 bytes/token estimate and then has the Python bridge reject
+   * it before the first provider call.
+   *
    * Actual provider accounting remains authoritative inside the worker.
    */
   const promptTokens = Math.max(
     256,
-    Math.ceil(input.promptBytes / 4),
+    Math.ceil(
+      input.promptBytes /
+        (input.aiderWorker ? 3 : 4),
+    ),
   );
 
   const perTurnOutput = input.boundedDiscovery
@@ -192,7 +202,9 @@ export function attemptLimitPolicy(
         : perTurnOutput * viableCalls;
 
   const aiderPromptTokens = input.aiderWorker
-    ? promptTokens + AIDER_PROMPT_OVERHEAD_TOKENS
+    ? promptTokens +
+      AIDER_PROMPT_OVERHEAD_TOKENS +
+      AIDER_PROMPT_HEADROOM_TOKENS
     : 0;
 
   const viablePromptTokens = Math.max(
