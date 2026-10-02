@@ -37,6 +37,7 @@ export interface RecoveryObservation {
   outputTokens?: number;
   wallClockMs?: number;
   terminationReason?: string;
+  /** Semantic coding attempts used; operational retries are tracked separately. */
   codingAttempts?: number;
 }
 
@@ -48,8 +49,11 @@ export interface FrozenExecutionPolicy<T extends ControlCandidate = ControlCandi
   readonly requiredQuality: number;
   readonly verificationStrength: TaskFingerprint["verificationStrength"];
   readonly approvedCandidateSet: readonly T[];
+  /** Models in the optimizer's coding-quality cascade, in escalation order. */
   readonly qualityCascadeModelIds?: readonly string[];
+  /** Bounded peers approved only for provider/protocol recovery. */
   readonly operationalRecoveryModelIds?: readonly string[];
+  /** Economically ranked quality-safe initial legs for operational recovery. */
   readonly orderedRecoveryModelIds?: readonly string[];
   readonly activeBoard: readonly ActiveBoardEntry<T>[];
   readonly referenceModel: string;
@@ -91,6 +95,7 @@ const dominates = <T extends ControlCandidate>(a: T, b: T) =>
     a.expectedAttemptCost < b.expectedAttemptCost ||
     a.expectedAttemptLatencyMs < b.expectedAttemptLatencyMs);
 
+/** Build a small production board from the discovery universe. */
 export function activeModelBoard<T extends ControlCandidate>(candidates: readonly T[], limit: number) {
   const executable = candidates.filter((candidate) => !candidate.hardRejection);
   const reference = [...executable].sort((a, b) =>
@@ -106,6 +111,8 @@ export function activeModelBoard<T extends ControlCandidate>(candidates: readonl
       a.model.id.localeCompare(b.model.id))[0];
   const ordered = [...new Map([
     ...(reference ? [[reference.model.id, reference] as const] : []),
+    // Sparse evidence is uncertainty, not permanent exclusion. Keep one
+    // bounded challenger visible so strong verification can earn local proof.
     ...(protectedUnknown && protectedUnknown !== reference
       ? [[protectedUnknown.model.id, protectedUnknown] as const] : []),
     ...pareto.sort((a, b) => b.conservativeQuality - a.conservativeQuality ||
@@ -129,6 +136,14 @@ const evidenceRank: Record<EvidenceStrength, number> = {
   REJECTED: -1, UNKNOWN: 0, PROMISING: 1, SUPPORTED: 2, PROVEN: 3,
 };
 
+
+/**
+ * Provider/protocol incompatibility is operational evidence, not evidence that
+ * the model could not solve the coding task.
+ *
+ * The executor can discover this either as an explicit infra failure or as a
+ * successful provider response that fails Koda's required DIRECT protocol.
+ */
 export function effectiveRecoveryFailureMode(
   observation: RecoveryObservation,
 ): RecoveryFailureMode {
@@ -145,6 +160,19 @@ export function effectiveRecoveryFailureMode(
   return observation.failureMode;
 }
 
+/**
+ * Select only within the frozen board.
+ *
+ * Coding-quality recovery is monotonic: after actual coding evidence, do not
+ * quality-downgrade.
+ *
+ * Operational recovery is different. The failed model/provider has not shown
+ * weak coding ability; it has shown that this execution path is unavailable or
+ * protocol-incompatible. In that case choose the cheapest reliable unattempted
+ * candidate that still satisfies the frozen task-level quality floor. Model
+ * tier is not a quality contract and must not force a trivial task onto an
+ * expensive model.
+ */
 export function recoveryEvidenceSufficient<T extends ControlCandidate>(
   candidate: T,
   fp: TaskFingerprint,
@@ -187,6 +215,16 @@ export function recoveryEvidenceSufficient<T extends ControlCandidate>(
   );
 }
 
+/**
+ * Recovery stays inside the frozen quality contract.
+ *
+ * Provider/runtime failure is not evidence of weak coding quality. We simply
+ * remove the failed execution path and choose the cheapest remaining
+ * quality-evidenced candidate that still satisfies requiredQuality.
+ *
+ * Actual coding failure may prefer more conservative quality, but model tier
+ * is never itself the contract.
+ */
 export function chooseAdaptiveRecovery<T extends ControlCandidate>(
   policy: FrozenExecutionPolicy<T>,
   observation: RecoveryObservation,
@@ -209,25 +247,18 @@ export function chooseAdaptiveRecovery<T extends ControlCandidate>(
 
   let candidates = policy.approvedCandidateSet.filter(
     (candidate) => {
-      const qualitySafe =
-        candidate.conservativeQuality + 1e-9 >= policy.requiredQuality &&
-        recoveryEvidenceSufficient(candidate, policy.taskFingerprint);
-
-      // Operational failure is not negative coding evidence, so it may move to
-      // any frozen recovery peer rather than monotonically escalating quality.
-      // It still may not cross the frozen task-level quality floor.
+      // Every entry in approvedCandidateSet was frozen by the optimizer as a
+      // task-safe execution leg. An operational/provider failure supplies no
+      // coding-quality evidence, so do not re-qualify that approved set here.
       if (failureMode === "operational")
-        return !attempted.has(candidate.model.id) &&
-          !candidate.hardRejection &&
-          qualitySafe;
-
+        return !attempted.has(candidate.model.id) && !candidate.hardRejection;
       const optimizerApprovedQualityLeg =
         qualityCascade?.has(candidate.model.id) === true;
       return !attempted.has(candidate.model.id) &&
         !candidate.hardRejection &&
-        candidate.conservativeQuality + 1e-9 >= policy.requiredQuality &&
-        (optimizerApprovedQualityLeg ||
-          recoveryEvidenceSufficient(candidate, policy.taskFingerprint));
+        (candidate.conservativeQuality + 1e-9 >= policy.requiredQuality &&
+          (optimizerApprovedQualityLeg ||
+            recoveryEvidenceSufficient(candidate, policy.taskFingerprint)));
     },
   );
 
