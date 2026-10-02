@@ -37,32 +37,18 @@ export interface CodingHandoffInput {
   completionPricePerMillion?: number;
 
   /**
-   * True only when Koda has already established that one concrete target is
-   * sufficiently localized for DirectEdit.
+   * Retained for compatibility with the surrounding executor.
+   * The production handoff no longer selects DirectEdit for a concrete scope:
+   * OpenHands/Koda localize, Aider edits, Koda verifies.
    */
   directEditEligible: boolean;
 }
 
-/**
- * Aider is currently budgeted as one provider turn by attemptPolicy.
- * Keep this reserve identical to its Aider output reservation:
- *
- *   Math.min(input.maxOutputTokens, 4_096)
- *
- * The handoff planner must be at least as conservative as the authoritative
- * attempt preflight. Otherwise it can select Aider and have attemptPolicy
- * reject the exact same packet a millisecond later.
- */
 const AIDER_OUTPUT_RESERVE_TOKENS = 4_096;
-
-const TOKEN_ESTIMATE_SAFETY = 1.4;
-const PER_FILE_FRAMING_BYTES = 512;
-// Repository source is materially denser than prose/JSON framing. Keeping a
-// separate calibrated ratio avoids rejecting a focused Aider handoff at the
-// 30k boundary while framing and output reserves remain fully enforced.
-const SOURCE_BYTES_PER_TOKEN = 4.5;
-// attemptPolicy converts prompt bytes back to tokens with bytes / 4.
 const ATTEMPT_POLICY_BYTES_PER_TOKEN = 4;
+const PER_FILE_FRAMING_BYTES = 512;
+const MAX_AIDER_READ_ONLY_FILES = 8;
+const UNKNOWN_CONTEXT_INPUT_CAP_TOKENS = 64_000;
 
 function normalized(path: string) {
   const value = path.trim().replaceAll("\\", "/");
@@ -131,12 +117,12 @@ function compactPromptBytes(
   return Buffer.byteLength(summary) + 1_024;
 }
 
-function safeTokenEstimate(bytes: number) {
+function promptTokensFromBytes(bytes: number) {
   return Math.max(
     1,
     Math.ceil(
-      (bytes / SOURCE_BYTES_PER_TOKEN) *
-        TOKEN_ESTIMATE_SAFETY,
+      bytes /
+        ATTEMPT_POLICY_BYTES_PER_TOKEN,
     ),
   );
 }
@@ -228,142 +214,31 @@ function readonlyCandidates(
   );
 }
 
-function maxPromptTokensByCost(
-  input: CodingHandoffInput,
-  outputReserveTokens: number,
-) {
-  const inputPrice =
-    input.promptPricePerMillion;
-  const outputPrice =
-    input.completionPricePerMillion;
-
-  if (
-    inputPrice === undefined ||
-    outputPrice === undefined
-  ) {
-    return Infinity;
-  }
-
-  const outputCost =
-    outputReserveTokens *
-    outputPrice /
-    1e6;
-
-  const available =
-    input.costCapacityUsd -
-    outputCost;
-
-  if (available <= 0) {
-    return 0;
-  }
-
-  if (inputPrice === 0) {
-    return Infinity;
-  }
-
-  return Math.max(
-    0,
-    Math.floor(
-      available *
-        1e6 /
-        inputPrice,
-    ),
-  );
-}
-
 /**
- * Deterministically decides how coding context is admitted.
+ * Decide what repository context the coding executor receives.
  *
- * Key invariant:
- * repo size is never allowed to become provider prompt size by accident.
+ * Production invariant:
  *
- * - Aider gets complete editable files only when the complete one-turn Aider
- *   packet fits BOTH Koda's attempt budget and the provider context window.
- * - The exact Aider framing/output reserves match attemptPolicy's one-turn
- *   viability assumptions so planner admission cannot contradict preflight.
- * - Read-only files are admitted in relevance order while budget remains.
- * - A large localized single target may use DirectEdit, which sends bounded
- *   excerpts rather than the complete file.
- * - Broad, directory-scoped or oversized work becomes agentic and retrieves
- *   context progressively through search/read tools.
- * - Validated missing editable paths remain authorized creation targets.
+ *   OpenHands/Koda localize -> Koda routes a model -> Aider edits -> Koda verifies.
+ *
+ * A concrete, validated write scope therefore remains Aider-owned. Prompt,
+ * token, price, or context pressure may make the current MODEL non-viable,
+ * but must not silently replace Aider with Koda's separate agentic coder.
+ * attemptPolicy/model recovery owns that decision and can move to a larger-
+ * context or otherwise compatible model.
+ *
+ * The only remaining agentic handoff is an unresolved root scope ("."), which
+ * represents localization failure rather than a normal post-localization path.
  */
 export async function planCodingHandoff(
   input: CodingHandoffInput,
 ): Promise<CodingHandoffPlan> {
-  /**
-   * Aider is a one-provider-turn worker for admission purposes.
-   *
-   * attemptTokenCapacity is the cumulative Koda capacity.
-   * modelContextTokens is one provider request's capacity.
-   *
-   * For Aider the same single turn must fit both, so the admissible capacity
-   * is the smaller value.
-   */
-  const capacity = Math.max(
-    0,
-    Math.min(
-      input.attemptTokenCapacity,
-      input.modelContextTokens ??
-        Infinity,
-    ),
-  );
-
-  /**
-   * IMPORTANT:
-   *
-   * attemptPolicy reserves up to 4,096 output tokens for Aider.
-   * The old planner used 20% of at most 16k (= 3,200 tokens at a 30k stage
-   * budget), which made it less conservative than attemptPolicy.
-   *
-   * That produced the contradiction:
-   *   planner => Aider fits
-   *   attemptPolicy => required_tokens 30,154 > 30,000
-   *
-   * Use the exact same Aider output reserve here.
-   */
-  const outputReserve = Math.min(
-    input.maxOutputTokens,
-    AIDER_OUTPUT_RESERVE_TOKENS,
-  );
-
-  const costPromptCapacity =
-    maxPromptTokensByCost(
-      input,
-      outputReserve,
-    );
-
-  /**
-   * This is the maximum provider INPUT packet we are allowed to hand to
-   * Aider after reserving:
-   *
-   * - Aider/system framing overhead
-   * - Aider completion/output capacity
-   *
-   * The same framing constant is imported from attemptPolicy so those two
-   * layers cannot silently drift on prompt overhead.
-   */
-  const admittedPromptTokens =
-    Math.max(
-      0,
-      Math.min(
-        capacity -
-          outputReserve -
-          AIDER_PROMPT_OVERHEAD_TOKENS,
-        costPromptCapacity -
-          AIDER_PROMPT_OVERHEAD_TOKENS,
-      ),
-    );
-
-  const compactBytes =
-    compactPromptBytes(
-      input.task,
-      input.context,
-    );
-
   const compactTokens =
-    safeTokenEstimate(
-      compactBytes,
+    promptTokensFromBytes(
+      compactPromptBytes(
+        input.task,
+        input.context,
+      ),
     );
 
   const scope = uniqueSafe(
@@ -380,7 +255,7 @@ export async function planCodingHandoff(
         compactTokens *
         ATTEMPT_POLICY_BYTES_PER_TOKEN,
       reason:
-        "broad or unresolved write scope requires progressive repository reads",
+        "write scope is still unresolved; localization must finish before the normal Aider coding path can start",
     };
   }
 
@@ -409,7 +284,7 @@ export async function planCodingHandoff(
         compactTokens *
         ATTEMPT_POLICY_BYTES_PER_TOKEN,
       reason:
-        `target ${unsafeTarget.path} cannot be admitted as a normal full-file handoff`,
+        `target ${unsafeTarget.path} is hardlinked and cannot be handed to Aider safely`,
     };
   }
 
@@ -426,40 +301,20 @@ export async function planCodingHandoff(
         compactTokens *
         ATTEMPT_POLICY_BYTES_PER_TOKEN,
       reason:
-        "directory-level write scope requires progressive file selection",
+        "directory-level write scope is not a concrete Aider file handoff",
     };
   }
+
+  const editable =
+    inspected.map(
+      ({ path }) => path,
+    );
 
   const missing =
     inspected.filter(
       ({ info }) =>
         !info.exists,
     );
-
-  if (missing.length) {
-    if (
-      scope.length === 1 &&
-      input.directEditEligible
-    ) {
-      return {
-        mode: "direct",
-        estimatedPromptBytes:
-          compactTokens *
-          ATTEMPT_POLICY_BYTES_PER_TOKEN,
-        reason:
-          "one localized missing target can be safely created by DirectEdit",
-      };
-    }
-
-    /**
-     * A concrete, validated missing path is an authorized creation target.
-     *
-     * It contributes framing/path bytes but zero source bytes to Aider's
-     * initial packet. If the total one-turn packet still fits the authoritative
-     * budget, Aider may create it. Otherwise the normal size gate below sends
-     * the work to the progressive agentic worker.
-     */
-  }
 
   const editableTokens =
     inspected.reduce(
@@ -475,37 +330,24 @@ export async function planCodingHandoff(
       compactTokens,
     );
 
-  if (
-    editableTokens >
-    admittedPromptTokens
-  ) {
-    if (
-      scope.length === 1 &&
-      input.directEditEligible
-    ) {
-      return {
-        mode: "direct",
-        estimatedPromptBytes:
-          compactTokens *
-          ATTEMPT_POLICY_BYTES_PER_TOKEN,
-        reason:
-          "localized target is too large for a complete Aider handoff; DirectEdit will use bounded excerpts",
-      };
-    }
+  const outputReserve =
+    Math.min(
+      input.maxOutputTokens,
+      AIDER_OUTPUT_RESERVE_TOKENS,
+    );
 
-    return {
-      mode: "agentic",
-      estimatedPromptBytes:
-        compactTokens *
-        ATTEMPT_POLICY_BYTES_PER_TOKEN,
-      reason:
-        "complete editable scope exceeds the authoritative one-turn Aider budget",
-    };
-  }
-
-  const editable =
-    inspected.map(
-      ({ path }) => path,
+  const providerInputCapacity =
+    Math.max(
+      0,
+      (
+        input.modelContextTokens ??
+        Math.max(
+          UNKNOWN_CONTEXT_INPUT_CAP_TOKENS,
+          input.attemptTokenCapacity,
+        )
+      ) -
+        outputReserve -
+        AIDER_PROMPT_OVERHEAD_TOKENS,
     );
 
   const editableSet =
@@ -515,43 +357,58 @@ export async function planCodingHandoff(
   let totalTokens =
     editableTokens;
 
-  for (
-    const candidate
-    of readonlyCandidates(
-      input,
-      editableSet,
-    )
+  // Read-only context is optional. Keep every authorized editable target even
+  // when the currently selected model is too small; attemptPolicy will reject
+  // that model by context_limit and model recovery can select a larger one.
+  if (
+    editableTokens <=
+    providerInputCapacity
   ) {
-    const info =
-      await inspectPath(
-        input.repoPath,
-        candidate,
-      );
-
-    if (
-      !info.exists ||
-      !info.file ||
-      info.hardlinked
+    for (
+      const candidate
+      of readonlyCandidates(
+        input,
+        editableSet,
+      ).slice(
+        0,
+        MAX_AIDER_READ_ONLY_FILES,
+      )
     ) {
-      continue;
+      const info =
+        await inspectPath(
+          input.repoPath,
+          candidate,
+        );
+
+      if (
+        !info.exists ||
+        !info.file ||
+        info.hardlinked
+      ) {
+        continue;
+      }
+
+      const tokens =
+        filePromptTokens(
+          candidate,
+          info.size,
+        );
+
+      if (
+        totalTokens + tokens >
+        providerInputCapacity
+      ) {
+        continue;
+      }
+
+      readOnly.push(candidate);
+      totalTokens += tokens;
     }
-
-    const tokens =
-      filePromptTokens(
-        candidate,
-        info.size,
-      );
-
-    if (
-      totalTokens + tokens >
-      admittedPromptTokens
-    ) {
-      continue;
-    }
-
-    readOnly.push(candidate);
-    totalTokens += tokens;
   }
+
+  const contextOverflow =
+    editableTokens >
+    providerInputCapacity;
 
   return {
     mode: "aider",
@@ -563,10 +420,12 @@ export async function planCodingHandoff(
       readOnly,
     },
     reason:
-      missing.length
-        ? "complete editable scope fits the authoritative Aider budget and includes authorized new files"
-        : readOnly.length
-          ? "complete editable scope plus highest-value read-only evidence fits the authoritative Aider budget"
-          : "complete editable scope fits the authoritative Aider budget; secondary context will be retrieved only if needed",
+      contextOverflow
+        ? "concrete scope remains Aider-owned; current model context is too small and authoritative preflight/model recovery must choose a larger-context model"
+        : missing.length
+          ? "localized scope is Aider-owned and includes authorized creation targets"
+          : readOnly.length
+            ? "localized scope plus highest-value read-only evidence is handed directly to Aider"
+            : "localized concrete scope is handed directly to Aider",
   };
 }
