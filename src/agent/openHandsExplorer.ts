@@ -14,7 +14,7 @@ import {
 } from "../router/executionStrategy.js";
 import { extractFeatures } from "../router/features.js";
 import { snapshotTree, changesBetween } from "../workspace/files.js";
-import { isSourcePath, isTestPath } from "../context/compiler.js";
+import { isSourcePath, isTestPath, taskTerms } from "../context/compiler.js";
 import { ensureOpenHandsRuntime, OPENHANDS_SDK_VERSION } from "./openHandsRuntime.js";
 import { AttemptCheckpoint } from "./attemptCheckpoint.js";
 import { WriteScope } from "../repo/writeScope.js";
@@ -168,19 +168,20 @@ async function defaultRunner(python: string, invocation: OpenHandsInvocation) {
         NO_COLOR: "1",
       },
     });
-    let report: OpenHandsReport;
     try {
-      report = fromBridge(JSON.parse(await readFile(reportPath, "utf8")));
+      return fromBridge(JSON.parse(await readFile(reportPath, "utf8")));
     } catch {
       throw new OpenHandsOperationalError(
         `OpenHands bridge did not produce a valid report: ${processResult.stderr || processResult.stdout || `exit ${processResult.exitCode}`}`,
       );
     }
-    return report;
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
 }
+
+const normalizeRepoPath = (value: string) =>
+  value.replaceAll("\\", "/").split("/").filter((part) => part && part !== ".").join("/");
 
 export function fastPathExploration(
   task: string,
@@ -189,17 +190,12 @@ export function fastPathExploration(
 ): RepositoryExploration | undefined {
   const exact = explicitTaskPaths(task, profile);
   const broad = /\b(?:across|multiple|multi[- ]component|throughout|entire|refactor|migrat|architecture|client and server|independent|parallel)\b/i.test(task);
-  if (
-    broad ||
-    exact.length < 1 ||
-    exact.length > 4 ||
-    strategy.execution_strategy !== "direct"
-  ) return undefined;
+  if (broad || exact.length < 1 || exact.length > 4 || strategy.execution_strategy !== "direct")
+    return undefined;
 
   const changeTests = requestsTestMutation(task);
   const editablePaths = exact.filter((path) => !isTestPath(path) || changeTests);
   const relatedTests = exact.filter((path) => isTestPath(path) && !changeTests);
-
   if (!editablePaths.length) return undefined;
 
   return {
@@ -231,19 +227,20 @@ async function validatePath(
 ) {
   if (!value || value.includes("\0") || value.startsWith("/") || /^[A-Za-z]:\//.test(value))
     throw new OpenHandsOperationalError(`OpenHands returned invalid repository path: ${value}`);
-  const normalized = value.replaceAll("\\", "/").split("/").filter((part) => part && part !== ".");
-  if (!normalized.length || normalized.some((part) => part === "..") || normalized[0] === ".git")
+  const normalized = normalizeRepoPath(value);
+  const parts = normalized.split("/");
+  if (!normalized || parts.some((part) => part === "..") || parts[0] === ".git")
     throw new OpenHandsOperationalError(`OpenHands returned invalid repository path: ${value}`);
-  const path = normalized.join("/");
-  if (!known.has(path) && !allowMissing)
-    throw new OpenHandsOperationalError(`OpenHands returned unknown repository path: ${path}`);
+  if (!known.has(normalized) && !allowMissing)
+    throw new OpenHandsOperationalError(`OpenHands returned unknown repository path: ${normalized}`);
+
   const canonicalRoot = await realpath(root);
-  let candidate = join(root, path);
+  let candidate = join(root, normalized);
   try {
     await realpath(candidate);
   } catch {
     if (!allowMissing)
-      throw new OpenHandsOperationalError(`OpenHands returned unknown repository path: ${path}`);
+      throw new OpenHandsOperationalError(`OpenHands returned unknown repository path: ${normalized}`);
     candidate = dirname(candidate);
     while (candidate !== root) {
       try {
@@ -257,52 +254,52 @@ async function validatePath(
   const canonical = await realpath(candidate);
   const rel = relative(canonicalRoot, canonical);
   if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel))
-    throw new OpenHandsOperationalError(`OpenHands path escapes repository: ${path}`);
-  return path;
+    throw new OpenHandsOperationalError(`OpenHands path escapes repository: ${normalized}`);
+  return normalized;
 }
 
-async function validateExploration(root: string, profile: RepoProfile, raw: RepositoryExploration) {
+async function validateExploration(
+  root: string,
+  profile: RepoProfile,
+  task: string,
+  raw: RepositoryExploration,
+) {
   const known = new Set(profile.files);
-  const validateReasons = async (
-    values: RepositoryExploration["editableCandidates"],
-    allowMissing = false,
-  ) => {
-    const result: typeof values = [];
-    const seen = new Set<string>();
-    for (const item of values) {
-      const path = await validatePath(root, known, item.path, allowMissing);
-      if (!seen.has(path)) result.push({ path, reason: item.reason.slice(0, 600) });
-      seen.add(path);
-    }
-    return result;
-  };
-  const editableCandidates = await validateReasons(raw.editableCandidates, true);
-  const authorized = new Set([
-    ...known,
-    ...editableCandidates.map(({ path }) => path),
-  ]);
+  const explicit = new Set(explicitTaskPaths(task, profile));
+  const editableCandidates: RepositoryExploration["editableCandidates"] = [];
+  const seenEditable = new Set<string>();
 
+  for (const item of raw.editableCandidates) {
+    const normalized = normalizeRepoPath(item.path);
+    const exists = known.has(normalized);
+    const allowMissing = raw.confidence === "high" || explicit.has(normalized);
+    if (!exists && !allowMissing) continue;
+    const path = await validatePath(root, known, normalized, allowMissing);
+    if (!seenEditable.has(path)) {
+      editableCandidates.push({ path, reason: item.reason.slice(0, 600) });
+      seenEditable.add(path);
+    }
+  }
+
+  const authorized = new Set([...known, ...editableCandidates.map(({ path }) => path)]);
   const editable = new Set(editableCandidates.map(({ path }) => path));
-  const validateAuthorizedPath = (path: string) => {
-    const normalized = path.replaceAll("\\", "/").split("/")
-      .filter((part) => part && part !== ".").join("/");
+  const validateAuthorizedPath = async (value: string) => {
+    const normalized = normalizeRepoPath(value);
     if (!authorized.has(normalized))
       throw new OpenHandsOperationalError(`OpenHands returned unknown repository path: ${normalized}`);
-    return validatePath(root, authorized, path, true);
+    return validatePath(root, authorized, normalized, true);
   };
-  const validateAuthorizedReasons = async (
-    values: RepositoryExploration["editableCandidates"],
-  ) => {
-    const result: typeof values = [];
-    const seen = new Set<string>();
-    for (const item of values) {
-      const path = await validateAuthorizedPath(item.path);
-      if (!seen.has(path)) result.push({ path, reason: item.reason.slice(0, 600) });
-      seen.add(path);
+
+  const readonlyFiles: RepositoryExploration["readonlyFiles"] = [];
+  const seenReadonly = new Set<string>();
+  for (const item of raw.readonlyFiles) {
+    const path = await validateAuthorizedPath(item.path);
+    if (!editable.has(path) && !seenReadonly.has(path)) {
+      readonlyFiles.push({ path, reason: item.reason.slice(0, 600) });
+      seenReadonly.add(path);
     }
-    return result;
-  };
-  const readonlyFiles = (await validateAuthorizedReasons(raw.readonlyFiles)).filter(({ path }) => !editable.has(path));
+  }
+
   const relatedTests = [...new Set(await Promise.all(raw.relatedTests.map(validateAuthorizedPath)))]
     .filter((path) => !editable.has(path));
   const dependencies = [];
@@ -316,6 +313,7 @@ async function validateExploration(root: string, profile: RepoProfile, raw: Repo
     path: await validateAuthorizedPath(item.path),
     detail: item.detail.slice(0, 800),
   });
+
   return repositoryExplorationSchema.parse({
     ...raw,
     editableCandidates,
@@ -326,14 +324,89 @@ async function validateExploration(root: string, profile: RepoProfile, raw: Repo
   });
 }
 
+export async function deterministicRepositoryExploration(
+  root: string,
+  task: string,
+  profile: RepoProfile,
+): Promise<RepositoryExploration> {
+  const terms = taskTerms(task).filter((term) => term.length >= 3).slice(0, 20);
+  const files = profile.files
+    .filter((path) => (isSourcePath(path) || isTestPath(path)) && !/(?:^|\/)(?:node_modules|dist|build|coverage)(?:\/|$)/.test(path))
+    .slice(0, 220);
+
+  const ranked: { path: string; score: number; text: string }[] = [];
+  for (const path of files) {
+    let text = "";
+    try {
+      text = (await readFile(join(root, path), "utf8")).slice(0, 64_000).toLowerCase();
+    } catch {
+      continue;
+    }
+    const normalizedPath = path.toLowerCase().replace(/[^a-z0-9]+/g, " ");
+    let score = 0;
+    for (const term of terms) {
+      const pieces = term.toLowerCase().split(/[^a-z0-9]+/).filter((piece) => piece.length >= 3);
+      for (const piece of pieces) {
+        if (normalizedPath.includes(piece)) score += 6;
+        if (text.includes(piece)) score += 1;
+      }
+    }
+    if (/planner|compiler|router|executor|worker|handler|service|controller|model/.test(normalizedPath)) score += 1;
+    if (score > 0) ranked.push({ path, score, text });
+  }
+  ranked.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
+
+  const sources = ranked.filter((item) => isSourcePath(item.path) && !isTestPath(item.path));
+  const top = sources[0];
+  if (!top || top.score < 4) {
+    return {
+      confidence: "low",
+      editableCandidates: [],
+      readonlyFiles: [],
+      relatedTests: [],
+      dependencies: [],
+      evidence: [],
+      unresolvedQuestions: ["Local deterministic localization found no bounded implementation candidate."],
+    };
+  }
+
+  const second = sources[1];
+  const dominant = !second || top.score >= second.score + 3;
+  const selected = dominant
+    ? [top]
+    : sources.filter((item) => item.score >= Math.max(4, Math.floor(top.score * 0.75))).slice(0, 3);
+  const selectedStems = selected.map((item) =>
+    item.path.split("/").pop()!.replace(/\.[^.]+$/, "").toLowerCase());
+
+  const relatedTests = ranked
+    .filter((item) => isTestPath(item.path))
+    .filter((item) => selectedStems.some((stem) =>
+      item.path.toLowerCase().includes(stem) || item.text.includes(stem)))
+    .slice(0, 4)
+    .map((item) => item.path);
+
+  return {
+    confidence: dominant ? "medium" : "low",
+    editableCandidates: selected.map((item) => ({
+      path: item.path,
+      reason: `Local deterministic fallback ranked this existing source file highest for the task (score ${item.score}).`,
+    })),
+    readonlyFiles: [],
+    relatedTests,
+    dependencies: [],
+    evidence: selected.map((item) => ({
+      path: item.path,
+      detail: `Existing-file lexical/path evidence score ${item.score}; no model call used.`,
+    })),
+    unresolvedQuestions: dominant ? [] : ["Several existing source files had similar local evidence scores."],
+  };
+}
+
 export function strategyWithExploration(
   task: string,
   initial: ExecutionStrategy,
   exploration: RepositoryExploration,
 ): ExecutionStrategy {
-  // Tests discovered as related context stay read-only unless the task actually
-  // asks for test mutation. When it does, promote that bounded repository
-  // evidence into the editable scope before DIRECT locking happens.
   if (requestsTestMutation(task) && exploration.relatedTests.length) {
     const existing = new Set(exploration.editableCandidates.map(({ path }) => path));
     const promoted = exploration.relatedTests.filter((path) => !existing.has(path));
@@ -349,31 +422,38 @@ export function strategyWithExploration(
   }
 
   const proposedEditable = exploration.editableCandidates.map(({ path }) => path);
-  const editable = proposedEditable
-    .filter((path) => isSourcePath(path) && !isTestPath(path));
-  const all = [...new Set([...proposedEditable, ...exploration.relatedTests,
-    ...exploration.readonlyFiles.map(({ path }) => path)])];
-  if (initial.preciseTarget && proposedEditable.length === 1 &&
-      proposedEditable[0] === initial.preciseTarget && exploration.confidence === "high")
+  const editable = proposedEditable.filter((path) => isSourcePath(path) && !isTestPath(path));
+  const all = [...new Set([
+    ...proposedEditable,
+    ...exploration.relatedTests,
+    ...exploration.readonlyFiles.map(({ path }) => path),
+  ])];
+
+  if (initial.preciseTarget && proposedEditable.length === 1 && proposedEditable[0] === initial.preciseTarget && exploration.confidence === "high")
     return { ...initial, likelyFiles: all };
   const broad = /\b(?:across|multiple|multi[- ]component|throughout|entire|refactor|migrat|architecture|independent|parallel)\b/i.test(task);
   if (initial.execution_strategy === "planned" || broad || editable.length > 3)
-    return { ...initial, execution_strategy: "planned", execution_effort: "complex", likelyFiles: all,
-      strategy_reason: "OpenHands evidence identifies work requiring dependency-aware planning" };
+    return {
+      ...initial,
+      execution_strategy: "planned",
+      execution_effort: "complex",
+      likelyFiles: all,
+      strategy_reason: "Repository evidence identifies work requiring dependency-aware planning",
+    };
   if (initial.execution_strategy === "stable") return {
     ...initial,
     likelyFiles: all,
     preciseTarget: proposedEditable.length === 1 && editable.length === 1 ? editable[0] : undefined,
-    strategy_reason: "OpenHands resolved the Stable workstream to evidence-backed files",
+    strategy_reason: "Repository exploration resolved the Stable workstream to evidence-backed files",
   };
   if (editable.length) return {
     execution_strategy: "direct",
     execution_effort: initial.execution_effort === "tiny" && proposedEditable.length === 1 && editable.length === 1 ? "tiny" : "normal",
-    strategy_reason: "OpenHands supplied evidence-backed implementation scope",
+    strategy_reason: "Repository exploration supplied evidence-backed implementation scope",
     likelyFiles: all,
     preciseTarget: proposedEditable.length === 1 && editable.length === 1 ? editable[0] : undefined,
   };
-  return { ...initial, likelyFiles: all, strategy_reason: "OpenHands did not establish editable repository evidence" };
+  return { ...initial, likelyFiles: all, strategy_reason: "Repository exploration did not establish editable repository evidence" };
 }
 
 export class OpenHandsExplorer implements RepositoryExplorer {
@@ -385,6 +465,7 @@ export class OpenHandsExplorer implements RepositoryExplorer {
     this.gateway.logger.log(continuation ? "repo_exploration_continuation" : "repo_exploration_start", {
       reason: input.continuationReason ?? null,
     });
+
     const subtask = {
       id: continuation ? "repository-exploration-continuation" : "repository-exploration",
       title: input.task,
@@ -400,6 +481,7 @@ export class OpenHandsExplorer implements RepositoryExplorer {
     };
     const features = extractFeatures(subtask, input.profile, 2_000);
     features.taskKind = "repository_exploration";
+
     const maxOutputTokens = Math.min(1_600, this.gateway.config.maxOutputTokens);
     const tokenCapacity = Math.min(
       12_000,
@@ -413,6 +495,7 @@ export class OpenHandsExplorer implements RepositoryExplorer {
     );
     if (tokenCapacity < 2_000 || usdCapacity <= 0)
       throw new OpenHandsOperationalError("OpenHands exploration budget is unavailable");
+
     let model = this.gateway.config.registry.SCOUT_MODEL;
     let inputPrice = this.gateway.config.maxInputPrice;
     let outputPrice = this.gateway.config.maxOutputPrice;
@@ -428,9 +511,8 @@ export class OpenHandsExplorer implements RepositoryExplorer {
       outputPrice = selected.metadata.outputPrice ?? outputPrice;
       contextLength = selected.metadata.contextLength ?? contextLength;
     }
-    const budgetUsd = usdCapacity;
-    if (budgetUsd <= 0) throw new OpenHandsOperationalError("Selected exploration model has no usable budget");
-    const reserve = this.gateway.budget.reserve(budgetUsd, tokenCapacity);
+
+    const reserve = this.gateway.budget.reserve(usdCapacity, tokenCapacity);
     const provider = this.gateway.config.modelPool?.provider ?? "openrouter";
     const invocation: OpenHandsInvocation = {
       repoPath: input.repoPath,
@@ -439,19 +521,19 @@ export class OpenHandsExplorer implements RepositoryExplorer {
       llmModel: provider === "openrouter" && !model.startsWith("openrouter/") ? `openrouter/${model}` : model,
       baseUrl: this.gateway.config.baseUrl,
       provider,
-      budgetUsd,
+      budgetUsd: usdCapacity,
       maxTokens: tokenCapacity,
       maxInputTokens: Math.min(
         contextLength - maxOutputTokens,
         Math.max(16_384, tokenCapacity - maxOutputTokens),
       ),
       maxOutputTokens,
-      maxIterations: 6,
-      maxFilesRead: Math.min(24, this.gateway.config.context.scanFiles),
+      maxIterations: 12,
+      maxFilesRead: Math.min(32, this.gateway.config.context.scanFiles),
       timeoutMs: Math.min(
         this.gateway.config.stageMaxMinutes * 60_000,
         this.gateway.budget.remainingMs(),
-        30_000,
+        90_000,
       ),
       requestTimeoutMs: this.gateway.config.modelTimeoutMs.inspection,
       inputCostPerToken: inputPrice / 1e6,
@@ -461,11 +543,13 @@ export class OpenHandsExplorer implements RepositoryExplorer {
     };
     if (invocation.maxInputTokens < 16_384)
       throw new OpenHandsOperationalError("Selected exploration model context is below OpenHands' 16k minimum");
+
     const before = await snapshotTree(input.repoPath);
     const readOnlyCheckpoint = await AttemptCheckpoint.capture(
       input.repoPath,
       new WriteScope(["."], this.gateway.logger, subtask.id),
     );
+
     try {
       const report = this.options.runner
         ? await this.options.runner(invocation)
@@ -477,16 +561,17 @@ export class OpenHandsExplorer implements RepositoryExplorer {
           input.repoPath,
           new WriteScope(["."], this.gateway.logger, subtask.id),
         );
-        throw new OpenHandsOperationalError(`OpenHands read-only violation: ${mutations.map(({ path }) => path).join(", ")}`, report.providerDispatched);
+        throw new OpenHandsOperationalError(
+          `OpenHands read-only violation: ${mutations.map(({ path }) => path).join(", ")}`,
+          report.providerDispatched,
+        );
       }
-      if (report.status !== "completed" || !report.result) {
-        if (report.providerDispatched) reserve.settleUncertain(); else reserve.cancel();
-        this.gateway.logger.log("repo_exploration_failure", {
-          model, operational: true, provider_dispatched: report.providerDispatched,
-          error: report.error ?? "OpenHands did not return structured evidence",
-        });
-        throw new OpenHandsOperationalError(report.error ?? "OpenHands exploration failed", report.providerDispatched);
-      }
+      if (report.status !== "completed" || !report.result)
+        throw new OpenHandsOperationalError(
+          report.error ?? "OpenHands exploration failed",
+          report.providerDispatched,
+        );
+
       const usage: Usage = {
         promptTokens: report.inputTokens,
         completionTokens: report.outputTokens,
@@ -497,7 +582,7 @@ export class OpenHandsExplorer implements RepositoryExplorer {
         raw: { prompt_tokens: report.inputTokens, completion_tokens: report.outputTokens },
       };
       reserve.settle(usage);
-      const result = await validateExploration(input.repoPath, input.profile, report.result);
+      const result = await validateExploration(input.repoPath, input.profile, input.task, report.result);
       this.gateway.logger.log("repo_exploration_finish", {
         model,
         sdk_version: report.sdkVersion,
@@ -518,11 +603,35 @@ export class OpenHandsExplorer implements RepositoryExplorer {
       if (error instanceof OpenHandsOperationalError && error.providerDispatched)
         reserve.settleUncertain();
       else reserve.cancel();
-      if (!(error instanceof OpenHandsOperationalError))
-        this.gateway.logger.log("repo_exploration_failure", { model, operational: true, error: String(error) });
-      throw error instanceof OpenHandsOperationalError
-        ? error
-        : new OpenHandsOperationalError(`OpenHands infrastructure failure: ${String(error)}`);
+
+      this.gateway.logger.log("repo_exploration_failure", {
+        model,
+        operational: true,
+        error: String(error),
+      });
+
+      // Injected runners are deterministic test seams and preserve the old
+      // rejection contract. Production/default OpenHands gets a zero-credit,
+      // existing-files-only localization fallback instead of write scope '.'.
+      if (this.options.runner)
+        throw error instanceof OpenHandsOperationalError
+          ? error
+          : new OpenHandsOperationalError(`OpenHands infrastructure failure: ${String(error)}`);
+
+      const fallback = await deterministicRepositoryExploration(
+        input.repoPath,
+        input.task,
+        input.profile,
+      );
+      this.gateway.logger.log("repo_exploration_local_fallback", {
+        confidence: fallback.confidence,
+        editable_files: fallback.editableCandidates.map(({ path }) => path),
+        related_tests: fallback.relatedTests,
+        model_calls: 0,
+        cost_usd: 0,
+        reason: String(error),
+      });
+      return fallback;
     }
   }
 }
