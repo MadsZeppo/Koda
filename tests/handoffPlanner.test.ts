@@ -81,25 +81,9 @@ test(
         },
       });
 
-    assert.equal(
-      plan.mode,
-      "aider",
-    );
-
-    assert.deepEqual(
-      plan.aiderFiles?.editable,
-      [
-        "src/a.ts",
-        "src/b.ts",
-      ],
-    );
-
-    assert.equal(
-      plan.aiderFiles?.readOnly.includes(
-        "src/huge.ts",
-      ),
-      false,
-    );
+    assert.equal(plan.mode, "aider");
+    assert.deepEqual(plan.aiderFiles?.editable, ["src/a.ts", "src/b.ts"]);
+    assert.equal(plan.aiderFiles?.readOnly.includes("src/huge.ts"), false);
   },
 );
 
@@ -108,32 +92,17 @@ test(
   async () => {
     const root = await fixture();
 
-    await writeFile(
-      join(root, "src/a.ts"),
-      "a".repeat(100_000),
-    );
+    await writeFile(join(root, "src/a.ts"), "a".repeat(100_000));
+    await writeFile(join(root, "src/b.ts"), "b".repeat(100_000));
 
-    await writeFile(
-      join(root, "src/b.ts"),
-      "b".repeat(100_000),
-    );
+    const plan = await planCodingHandoff({
+      ...base,
+      repoPath: root,
+      attemptTokenCapacity: 10_000,
+      writeScope: ["src/a.ts", "src/b.ts"],
+    });
 
-    const plan =
-      await planCodingHandoff({
-        ...base,
-        repoPath: root,
-        attemptTokenCapacity:
-          10_000,
-        writeScope: [
-          "src/a.ts",
-          "src/b.ts",
-        ],
-      });
-
-    assert.equal(
-      plan.mode,
-      "agentic",
-    );
+    assert.equal(plan.mode, "agentic");
   },
 );
 
@@ -142,24 +111,14 @@ test(
   async () => {
     const root = await fixture();
 
-    await writeFile(
-      join(root, "src/planner.ts"),
-      "p".repeat(10_000),
-    );
-
-    await writeFile(
-      join(root, "src/executor.ts"),
-      "e".repeat(66_000),
-    );
+    await writeFile(join(root, "src/planner.ts"), "p".repeat(10_000));
+    await writeFile(join(root, "src/executor.ts"), "e".repeat(66_000));
 
     const plan = await planCodingHandoff({
       ...base,
       repoPath: root,
       attemptTokenCapacity: 30_000,
-      writeScope: [
-        "src/planner.ts",
-        "src/executor.ts",
-      ],
+      writeScope: ["src/planner.ts", "src/executor.ts"],
     });
 
     assert.equal(plan.mode, "aider");
@@ -171,7 +130,7 @@ test(
 );
 
 test(
-  "focused mixed existing and new scope near the 30k boundary stays on Aider",
+  "focused mixed scope at the 30k framing boundary becomes progressive before provider preflight",
   async () => {
     const root = await fixture();
     await writeFile(join(root, "src/worker.ts"), "w".repeat(3_100));
@@ -190,17 +149,8 @@ test(
       ],
     });
 
-    assert.equal(plan.mode, "aider");
-    assert.deepEqual(plan.aiderFiles?.editable, [
-      "src/worker.ts",
-      "src/executor.ts",
-      "src/summary.ts",
-      "src/executionOutcome.ts",
-    ]);
-    assert.ok(
-      Math.ceil(plan.estimatedPromptBytes / 4) + 4_096 + 4_096 <= 30_000,
-      "planner admission must remain viable under attemptPolicy's byte conversion",
-    );
+    assert.equal(plan.mode, "agentic");
+    assert.match(plan.reason, /exceeds the authoritative one-turn Aider budget/i);
   },
 );
 
@@ -209,27 +159,17 @@ test(
   async () => {
     const root = await fixture();
 
-    await writeFile(
-      join(root, "src/a.ts"),
-      "a".repeat(200_000),
-    );
+    await writeFile(join(root, "src/a.ts"), "a".repeat(200_000));
 
-    const plan =
-      await planCodingHandoff({
-        ...base,
-        repoPath: root,
-        attemptTokenCapacity:
-          8_000,
-        directEditEligible: true,
-        writeScope: [
-          "src/a.ts",
-        ],
-      });
+    const plan = await planCodingHandoff({
+      ...base,
+      repoPath: root,
+      attemptTokenCapacity: 8_000,
+      directEditEligible: true,
+      writeScope: ["src/a.ts"],
+    });
 
-    assert.equal(
-      plan.mode,
-      "direct",
-    );
+    assert.equal(plan.mode, "direct");
   },
 );
 
@@ -258,16 +198,12 @@ test(
   async () => {
     const root = await fixture();
 
-    const plan =
-      await planCodingHandoff({
-        ...base,
-        repoPath: root,
-        writeScope: ["."],
-      });
+    const plan = await planCodingHandoff({
+      ...base,
+      repoPath: root,
+      writeScope: ["."],
+    });
 
-    assert.equal(
-      plan.mode,
-      "agentic",
-    );
+    assert.equal(plan.mode, "agentic");
   },
 );
