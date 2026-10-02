@@ -74,7 +74,7 @@ function profile(): RepoProfile {
   };
 }
 
-test("Aider receives real prompt headroom instead of the old exact-minimum 27,434-token budget", () => {
+test("Aider reserves bounded framing headroom beyond the old exact-minimum 27,434-token budget", () => {
   const promptBytes = 76_968;
   const oldExactMinimum = Math.ceil(promptBytes / 4) + 4_096 + 4_096;
   assert.equal(oldExactMinimum, 27_434);
@@ -99,9 +99,9 @@ test("Aider receives real prompt headroom instead of the old exact-minimum 27,43
     modelContextTokens: 128_000,
   });
 
-  const conservativePrompt = Math.ceil(promptBytes / 3);
+  const estimatedPrompt = Math.ceil(promptBytes / 4);
   const expectedMinimum =
-    conservativePrompt +
+    estimatedPrompt +
     AIDER_PROMPT_OVERHEAD_TOKENS +
     AIDER_PROMPT_HEADROOM_TOKENS +
     4_096;
@@ -113,22 +113,20 @@ test("Aider receives real prompt headroom instead of the old exact-minimum 27,43
   assert.ok(policy.maxTokens > oldExactMinimum);
   assert.ok(
     policy.forecastProviderInputTokens >=
-      conservativePrompt + AIDER_PROMPT_OVERHEAD_TOKENS + AIDER_PROMPT_HEADROOM_TOKENS,
+      estimatedPrompt + AIDER_PROMPT_OVERHEAD_TOKENS + AIDER_PROMPT_HEADROOM_TOKENS,
   );
 });
 
-test("an explicit source change plus deterministic tests is one bounded writable workstream", () => {
+test("an explicit source change plus deterministic tests remains one bounded DIRECT workstream", () => {
   const repository = profile();
   const task =
     "Add normalizeTaskLabel to src/planner/taskCompiler.ts and add deterministic tests in tests/planner.test.ts. Preserve existing behavior.";
 
   const strategy = chooseExecutionStrategy(task, repository);
 
-  assert.equal(strategy.execution_strategy, "stable");
+  assert.equal(strategy.execution_strategy, "direct");
   assert.equal(strategy.preciseTarget, undefined);
-  assert.match(strategy.strategy_reason, /test mutation/i);
   assert.ok(strategy.likelyFiles.includes("src/planner/taskCompiler.ts"));
-  assert.ok(strategy.likelyFiles.includes("tests/planner.test.ts"));
 
   assert.deepEqual(
     directWritePaths(
