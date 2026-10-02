@@ -274,10 +274,12 @@ export function attemptLimitPolicy(
 
   const complex =
     !localized &&
-    (input.effort === "complex" ||
-      input.fingerprint.architectureHeavy ||
-      input.fingerprint.repoReasoningHeavy ||
-      input.fingerprint.crossComponent);
+    Boolean(
+      input.effort === "complex" ||
+        input.fingerprint.architectureHeavy ||
+        input.fingerprint.repoReasoningHeavy ||
+        input.fingerprint.crossComponent,
+    );
 
   if (input.aiderWorker) {
     return aiderAttemptLimitPolicy(
