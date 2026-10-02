@@ -328,8 +328,10 @@ export async function deterministicRepositoryExploration(
   root: string,
   task: string,
   profile: RepoProfile,
+  preferredPaths: readonly string[] = [],
 ): Promise<RepositoryExploration> {
   const terms = taskTerms(task).filter((term) => term.length >= 3).slice(0, 20);
+  const preferred = new Set(preferredPaths.map(normalizeRepoPath));
   const files = profile.files
     .filter((path) => (isSourcePath(path) || isTestPath(path)) && !/(?:^|\/)(?:node_modules|dist|build|coverage)(?:\/|$)/.test(path))
     .slice(0, 220);
@@ -343,7 +345,7 @@ export async function deterministicRepositoryExploration(
       continue;
     }
     const normalizedPath = path.toLowerCase().replace(/[^a-z0-9]+/g, " ");
-    let score = 0;
+    let score = preferred.has(path) ? 3 : 0;
     for (const term of terms) {
       const pieces = term.toLowerCase().split(/[^a-z0-9]+/).filter((piece) => piece.length >= 3);
       for (const piece of pieces) {
@@ -582,7 +584,34 @@ export class OpenHandsExplorer implements RepositoryExplorer {
         raw: { prompt_tokens: report.inputTokens, completion_tokens: report.outputTokens },
       };
       reserve.settle(usage);
-      const result = await validateExploration(input.repoPath, input.profile, input.task, report.result);
+      let result = await validateExploration(input.repoPath, input.profile, input.task, report.result);
+
+      if (!result.editableCandidates.length) {
+        const fallback = await deterministicRepositoryExploration(
+          input.repoPath,
+          input.task,
+          input.profile,
+          report.filesInspected,
+        );
+        this.gateway.logger.log("repo_exploration_local_fallback", {
+          confidence: fallback.confidence,
+          editable_files: fallback.editableCandidates.map(({ path }) => path),
+          related_tests: fallback.relatedTests,
+          model_calls: 0,
+          cost_usd: 0,
+          reason: "OpenHands completed without an editable implementation scope",
+        });
+        if (fallback.editableCandidates.length) {
+          result = {
+            ...fallback,
+            unresolvedQuestions: [...new Set([
+              ...fallback.unresolvedQuestions,
+              ...result.unresolvedQuestions,
+            ])].slice(0, 12),
+          };
+        }
+      }
+
       this.gateway.logger.log("repo_exploration_finish", {
         model,
         sdk_version: report.sdkVersion,
