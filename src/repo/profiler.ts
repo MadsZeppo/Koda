@@ -79,8 +79,26 @@ export async function profileRepo(root: string): Promise<RepoProfile> {
       if ((await lstat(path)).size <= 65536)
         configs[f] = (await readFile(path, "utf8")).slice(0, 3000);
     } catch {}
+
+  // Aggregate package test entrypoints are authoritative final-verification
+  // contracts, but they are a bad planning/pre-coding primitive. Copying
+  // `pnpm test`/`npm test` into every localized subtask makes Koda execute the
+  // entire repository suite before a coding worker can start. Keep those
+  // candidates in `ecosystem.projectUnits[*].verification` so post-mutation
+  // and final verification can still select them, while exposing only bounded
+  // or non-test checks through the lightweight profile command list.
+  const aggregatePackageTest = (kind: string, command: string) =>
+    kind === "test" &&
+    /(?:^|&&\s*)(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\s*$/.test(
+      command.trim(),
+    );
+
   const verificationCommands = ecosystem.projectUnits.flatMap((u) =>
-    u.verification.map((c) => c.command),
+    u.verification
+      .filter((candidate) =>
+        !aggregatePackageTest(candidate.kind, candidate.command),
+      )
+      .map((candidate) => candidate.command),
   );
   return {
     root,
