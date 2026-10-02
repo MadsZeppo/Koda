@@ -246,22 +246,6 @@ export function chooseExecutionStrategy(
     return planned("Several explicit source targets require dependency-aware planning");
   }
 
-  // Explicitly requested test mutation is one coupled implementation unit.
-  // Do this before the preciseTarget DIRECT branch: a source path may be the
-  // primary localization target, but it is not the only authorized mutation
-  // when the task also requires tests. Stable already locks source + related
-  // tests together and therefore prevents the DIRECT single-file truncation
-  // that caused the coding worker to receive tests as read-only context.
-  if (requestsTestMutation(task) && stableTargets.length > 0) {
-    return {
-      execution_strategy: "stable",
-      execution_effort: "normal",
-      strategy_reason:
-        "Explicit test mutation shares one bounded implementation scope",
-      likelyFiles: stableTargets,
-    };
-  }
-
   const boundedFeature =
     /\b(?:add|implement|introduce|support|enable|wire|fix|repair|modify)\b[^.;\n]{0,140}\b(?:flag|option|feature|command|behavior|capability|flow|logic)\b/i.test(requestedWork) &&
     /\b(?:focused|regression|unit|integration)?\s*tests?\b/i.test(requestedWork) &&
