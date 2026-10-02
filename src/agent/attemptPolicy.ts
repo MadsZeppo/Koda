@@ -19,8 +19,10 @@ export type AttemptProgressPhase =
   | "VERIFICATION_ATTEMPTED"
   | "REPAIR";
 
-export const AIDER_PROMPT_OVERHEAD_TOKENS = 4_096;
-export const AIDER_PROMPT_HEADROOM_TOKENS = 1_024;
+// Shared with handoffPlanner. This includes Aider/system framing plus a bounded
+// safety margin so planner admission and authoritative preflight agree.
+export const AIDER_PROMPT_OVERHEAD_TOKENS = 5_120;
+export const AIDER_PROMPT_HEADROOM_TOKENS = 0;
 
 export interface AttemptLimitPolicyInput {
   fingerprint: TaskFingerprint;
@@ -45,23 +47,11 @@ export interface AttemptLimitPolicyInput {
   plannedLatencyP90Ms?: number;
 
   boundedDiscovery?: boolean;
-
-  /** Whether this attempt may use Koda's one-call direct editor. */
   directEditEligible?: boolean;
-
-  /** True whenever this concrete attempt runs through Aider. */
   aiderWorker?: boolean;
-
-  /**
-   * Per-provider-call context window.
-   *
-   * This is deliberately separate from Koda's cumulative attempt token
-   * capacity.
-   */
   modelContextTokens?: number;
 }
 
-/** True when Koda can execute the task through the one-call editor. */
 export function usesDirectEditEngine(
   fingerprint: TaskFingerprint,
 ) {
@@ -83,16 +73,6 @@ export function usesDirectEditEngine(
   );
 }
 
-/**
- * Determine whether one bounded coding attempt can actually execute.
- *
- * Important distinction:
- *
- * - remainingTokens / stageMaxTokens = cumulative Koda attempt budget
- * - modelContextTokens = capacity of ONE provider request
- *
- * They must not be collapsed into one value.
- */
 export function attemptLimitPolicy(
   input: AttemptLimitPolicyInput,
 ) {
@@ -102,12 +82,6 @@ export function attemptLimitPolicy(
     !input.fingerprint.architectureHeavy &&
     !input.fingerprint.repoReasoningHeavy;
 
-  /**
-   * Aider is not DirectEdit.
-   *
-   * Without this guard a localized Aider task can accidentally inherit the
-   * one-call DirectEdit viability assumptions.
-   */
   const directEdit =
     !input.aiderWorker &&
     usesDirectEditEngine(input.fingerprint) &&
@@ -140,23 +114,12 @@ export function attemptLimitPolicy(
 
   const maxSteps = desiredSteps;
 
-  /**
-   * Planning estimate only.
-   *
-   * Aider's runtime token guard falls back to a conservative 3 bytes/token
-   * estimate when the routed model tokenizer is unavailable. Budget Aider with
-   * the same conversion here so TypeScript never declares an attempt viable
-   * using a looser 4 bytes/token estimate and then has the Python bridge reject
-   * it before the first provider call.
-   *
-   * Actual provider accounting remains authoritative inside the worker.
-   */
+  // handoffPlanner expresses Aider prompt estimates in the same four-byte
+  // planning units. The shared framing reserve above absorbs runtime framing
+  // variance while LiteLLM's exact tokenizer remains authoritative in bridge.py.
   const promptTokens = Math.max(
     256,
-    Math.ceil(
-      input.promptBytes /
-        (input.aiderWorker ? 3 : 4),
-    ),
+    Math.ceil(input.promptBytes / 4),
   );
 
   const perTurnOutput = input.boundedDiscovery
@@ -172,12 +135,6 @@ export function attemptLimitPolicy(
       ? 0
       : 900;
 
-  /**
-   * Cumulative provider input over the whole attempt.
-   *
-   * A multi-turn agent pays for the repeated conversation prefix on every
-   * provider call, so this is intentionally larger than a single request.
-   */
   const trajectoryPromptTokens =
     directEdit || input.boundedDiscovery
       ? Math.ceil(
@@ -219,14 +176,6 @@ export function attemptLimitPolicy(
       : 0,
   );
 
-  /**
-   * Minimum capacity needed for the largest single provider turn.
-   *
-   * This is deliberately NOT the cumulative trajectory. The previous code
-   * accidentally used this single-turn quantity as the whole attempt budget,
-   * which is why a six-turn agentic trajectory could be capped at 8,758
-   * tokens even though the policy had already forecast ~31k cumulative tokens.
-   */
   const peakProviderPromptTokens =
     directEdit ||
     input.boundedDiscovery ||
@@ -249,33 +198,15 @@ export function attemptLimitPolicy(
     peakProviderPromptTokens +
     peakProviderOutputTokens;
 
-  /**
-   * Desired cumulative budget for the whole provider trajectory.
-   *
-   * This is what maxTokens should try to fund. It is still bounded by the
-   * remaining run/stage capacity below.
-   */
   const desiredTrajectoryTokens =
     viablePromptTokens +
     viableOutputTokens;
 
-  /**
-   * Whole-attempt capacity.
-   *
-   * DO NOT clamp this with modelContextTokens.
-   */
   const attemptTokenCapacity = Math.min(
     input.remainingTokens,
     input.stageMaxTokens,
   );
 
-  /**
-   * ONE provider request must fit inside the model context.
-   *
-   * Do not compare the model context window with cumulative trajectory input;
-   * repeated prompts count against Koda's attempt budget, not simultaneously
-   * against one provider request's context window.
-   */
   const providerContextRequired =
     minimumViableTokens;
 
@@ -382,29 +313,21 @@ export function attemptLimitPolicy(
     localized,
     directEdit,
     complex,
-
     maxSteps,
     viableCalls,
-
     maxTokens,
     budgetUsd,
     timeoutMs,
-
     minimumViableTokens,
     desiredTrajectoryTokens,
-
     attemptTokenCapacity,
     providerContextRequired,
     providerContextCapacity,
-
     forecastProviderInputTokens:
       viablePromptTokens,
-
     forecastProviderOutputTokens:
       viableOutputTokens,
-
     minimumViableCostUsd,
-
     viable: !nonViableLimitKind,
     nonViableLimitKind,
   };
