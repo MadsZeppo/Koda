@@ -74,7 +74,7 @@ test("PROMISING is rejected when verification is weak", () => {
   );
 });
 
-test("operational recovery chooses cheapest quality-safe candidate, not a tier jump", () => {
+test("operational recovery chooses cheapest frozen approved candidate, not a tier jump", () => {
   const initial = candidate("free-model", "SUPPORTED", 0.91, 0);
   const cheapSafe = candidate("cheap-safe", "SUPPORTED", 0.905, 0.001, 0.02);
   const expensiveStrong = {
@@ -112,17 +112,17 @@ test("operational recovery chooses cheapest quality-safe candidate, not a tier j
   assert.equal(selected?.model.id, "cheap-safe");
 });
 
-test("recovery refuses a cheaper candidate below the frozen quality floor", () => {
+test("operational recovery trusts the frozen approved set instead of re-qualifying model quality", () => {
   const initial = candidate("initial", "SUPPORTED", 0.91, 0.002);
-  const tooWeak = candidate("too-weak", "PROVEN", 0.86, 0.0001);
+  const approvedPeer = candidate("approved-peer", "PROVEN", 0.86, 0.0001);
   const safe = candidate("safe", "SUPPORTED", 0.90, 0.003);
 
   const policy = {
     maxCodingAttempts: 4,
     requiredQuality: 0.89,
     taskFingerprint: fp,
-    approvedCandidateSet: [initial, tooWeak, safe],
-    operationalRecoveryModelIds: [tooWeak.model.id, safe.model.id],
+    approvedCandidateSet: [initial, approvedPeer, safe],
+    operationalRecoveryModelIds: [approvedPeer.model.id, safe.model.id],
   } as any;
 
   const selected = chooseAdaptiveRecovery(
@@ -136,5 +136,5 @@ test("recovery refuses a cheaper candidate below the frozen quality floor", () =
     new Set([initial.model.id]),
   );
 
-  assert.equal(selected?.model.id, "safe");
+  assert.equal(selected?.model.id, "approved-peer");
 });
