@@ -19,8 +19,8 @@ export type AttemptProgressPhase =
   | "VERIFICATION_ATTEMPTED"
   | "REPAIR";
 
-// Shared with handoffPlanner. This includes Aider/system framing plus a bounded
-// safety margin so planner admission and authoritative preflight agree.
+// Aider's own system/repository framing sits on top of the file/task packet
+// estimated by handoffPlanner. Keep one shared reserve so both layers agree.
 export const AIDER_PROMPT_OVERHEAD_TOKENS = 5_120;
 export const AIDER_PROMPT_HEADROOM_TOKENS = 0;
 
@@ -73,6 +73,191 @@ export function usesDirectEditEngine(
   );
 }
 
+function aiderAttemptLimitPolicy(
+  input: AttemptLimitPolicyInput,
+  localized: boolean,
+  complex: boolean,
+) {
+  const promptTokens = Math.max(
+    256,
+    Math.ceil(input.promptBytes / 4),
+  );
+
+  const outputReserve = Math.min(
+    input.maxOutputTokens,
+    4_096,
+  );
+
+  const providerInputTokens =
+    promptTokens +
+    AIDER_PROMPT_OVERHEAD_TOKENS +
+    AIDER_PROMPT_HEADROOM_TOKENS;
+
+  const providerContextRequired =
+    providerInputTokens +
+    outputReserve;
+
+  const providerContextCapacity =
+    input.modelContextTokens ?? Infinity;
+
+  // Aider is a coding SESSION, not a one-provider-call editor. One successful
+  // provider call is sufficient for viability, but a healthy attempt needs
+  // room for a follow-up call (for example after edit-format handling) without
+  // Koda killing the worker immediately after its first response.
+  const secondTurnInputTokens =
+    providerInputTokens +
+    outputReserve +
+    512;
+
+  const desiredTrajectoryTokens =
+    providerContextRequired +
+    secondTurnInputTokens +
+    outputReserve;
+
+  const minimumViableTokens =
+    providerContextRequired;
+
+  // stageMaxTokens remains the normal Mini-SWE/agentic stage bound, but it must
+  // not make a grounded Aider session impossible merely because its complete
+  // editable packet is larger than that historical cap. Aider can grow only to
+  // the estimated healthy two-turn trajectory and never past the run budget.
+  const attemptTokenCapacity =
+    Math.min(
+      input.remainingTokens,
+      Math.max(
+        input.stageMaxTokens,
+        Math.min(
+          input.remainingTokens,
+          desiredTrajectoryTokens,
+        ),
+      ),
+    );
+
+  const maxTokens =
+    Math.min(
+      attemptTokenCapacity,
+      Math.max(
+        minimumViableTokens,
+        desiredTrajectoryTokens,
+        input.learnedP90Tokens ?? 0,
+      ),
+    );
+
+  const firstTurnCostUsd =
+    input.promptPricePerMillion === undefined ||
+    input.completionPricePerMillion === undefined
+      ? undefined
+      : (
+          providerInputTokens *
+            input.promptPricePerMillion +
+          outputReserve *
+            input.completionPricePerMillion
+        ) /
+        1e6;
+
+  const secondTurnCostUsd =
+    input.promptPricePerMillion === undefined ||
+    input.completionPricePerMillion === undefined
+      ? undefined
+      : (
+          secondTurnInputTokens *
+            input.promptPricePerMillion +
+          outputReserve *
+            input.completionPricePerMillion
+        ) /
+        1e6;
+
+  const desiredSessionCostUsd =
+    firstTurnCostUsd === undefined ||
+    secondTurnCostUsd === undefined
+      ? undefined
+      : firstTurnCostUsd + secondTurnCostUsd;
+
+  const costCapacity =
+    Math.min(
+      input.remainingUsd,
+      input.stageMaxUsd,
+    );
+
+  const budgetUsd =
+    Math.min(
+      costCapacity,
+      Math.max(
+        Number.EPSILON,
+        input.plannedBudgetUsd,
+        firstTurnCostUsd ?? 0,
+        desiredSessionCostUsd ?? 0,
+      ),
+    );
+
+  const maxSteps = Math.max(
+    2,
+    Math.min(
+      input.maxIterations,
+      complex ? 4 : 3,
+    ),
+  );
+
+  const viableCalls = Math.min(
+    2,
+    maxSteps,
+  );
+
+  const timeoutMs =
+    Math.min(
+      input.configuredTimeoutMs,
+      input.remainingMs,
+      90_000,
+    );
+
+  const minimumViableMs =
+    localized
+      ? 15_000
+      : complex
+        ? 30_000
+        : 20_000;
+
+  const nonViableLimitKind:
+    | AttemptLimitKind
+    | undefined =
+    maxSteps < 1
+      ? "step_limit"
+      : input.remainingTokens < minimumViableTokens
+        ? "token_limit"
+        : providerContextCapacity < providerContextRequired
+          ? "context_limit"
+          : firstTurnCostUsd !== undefined &&
+              costCapacity < firstTurnCostUsd
+            ? "cost_limit"
+            : timeoutMs < minimumViableMs
+              ? "timeout"
+              : undefined;
+
+  return {
+    localized,
+    directEdit: false,
+    complex,
+    maxSteps,
+    viableCalls,
+    maxTokens,
+    budgetUsd,
+    timeoutMs,
+    minimumViableTokens,
+    desiredTrajectoryTokens,
+    attemptTokenCapacity,
+    providerContextRequired,
+    providerContextCapacity,
+    forecastProviderInputTokens:
+      providerInputTokens,
+    forecastProviderOutputTokens:
+      outputReserve,
+    minimumViableCostUsd:
+      firstTurnCostUsd,
+    viable: !nonViableLimitKind,
+    nonViableLimitKind,
+  };
+}
+
 export function attemptLimitPolicy(
   input: AttemptLimitPolicyInput,
 ) {
@@ -94,6 +279,14 @@ export function attemptLimitPolicy(
       input.fingerprint.repoReasoningHeavy ||
       input.fingerprint.crossComponent);
 
+  if (input.aiderWorker) {
+    return aiderAttemptLimitPolicy(
+      input,
+      localized,
+      complex,
+    );
+  }
+
   const desiredSteps = localized
     ? 10
     : complex
@@ -104,19 +297,14 @@ export function attemptLimitPolicy(
     ? 1
     : directEdit
       ? 1
-      : input.aiderWorker
-        ? 1
-        : localized
-          ? 4
-          : complex
-            ? 6
-            : 5;
+      : localized
+        ? 4
+        : complex
+          ? 6
+          : 5;
 
   const maxSteps = desiredSteps;
 
-  // handoffPlanner expresses Aider prompt estimates in the same four-byte
-  // planning units. The shared framing reserve above absorbs runtime framing
-  // variance while LiteLLM's exact tokenizer remains authoritative in bridge.py.
   const promptTokens = Math.max(
     256,
     Math.ceil(input.promptBytes / 4),
@@ -124,14 +312,13 @@ export function attemptLimitPolicy(
 
   const perTurnOutput = input.boundedDiscovery
     ? Math.min(input.maxOutputTokens, 1_024)
-    : directEdit || input.aiderWorker
+    : directEdit
       ? Math.min(input.maxOutputTokens, 4_096)
       : Math.min(input.maxOutputTokens, 512);
 
   const toolObservationTokens =
     directEdit ||
-    input.boundedDiscovery ||
-    input.aiderWorker
+    input.boundedDiscovery
       ? 0
       : 900;
 
@@ -141,46 +328,25 @@ export function attemptLimitPolicy(
           promptTokens *
             (input.boundedDiscovery ? 1.2 : 1),
         )
-      : input.aiderWorker
-        ? promptTokens
-        : Math.ceil(
-            promptTokens * viableCalls +
-              (perTurnOutput + toolObservationTokens) *
-                viableCalls *
-                (viableCalls - 1) /
-                2,
-          );
+      : Math.ceil(
+          promptTokens * viableCalls +
+            (perTurnOutput + toolObservationTokens) *
+              viableCalls *
+              (viableCalls - 1) /
+              2,
+        );
 
   const trajectoryOutputTokens =
     input.boundedDiscovery
       ? Math.min(input.maxOutputTokens, 1_024)
-      : directEdit || input.aiderWorker
+      : directEdit
         ? Math.min(input.maxOutputTokens, 4_096)
         : perTurnOutput * viableCalls;
 
-  const aiderPromptTokens = input.aiderWorker
-    ? promptTokens +
-      AIDER_PROMPT_OVERHEAD_TOKENS +
-      AIDER_PROMPT_HEADROOM_TOKENS
-    : 0;
-
-  const viablePromptTokens = Math.max(
-    trajectoryPromptTokens,
-    aiderPromptTokens,
-  );
-
-  const viableOutputTokens = Math.max(
-    trajectoryOutputTokens,
-    input.aiderWorker
-      ? Math.min(input.maxOutputTokens, 4_096)
-      : 0,
-  );
-
   const peakProviderPromptTokens =
     directEdit ||
-    input.boundedDiscovery ||
-    input.aiderWorker
-      ? viablePromptTokens
+    input.boundedDiscovery
+      ? trajectoryPromptTokens
       : Math.ceil(
           promptTokens +
             (perTurnOutput + toolObservationTokens) *
@@ -189,9 +355,8 @@ export function attemptLimitPolicy(
 
   const peakProviderOutputTokens =
     directEdit ||
-    input.boundedDiscovery ||
-    input.aiderWorker
-      ? viableOutputTokens
+    input.boundedDiscovery
+      ? trajectoryOutputTokens
       : perTurnOutput;
 
   const minimumViableTokens =
@@ -199,13 +364,14 @@ export function attemptLimitPolicy(
     peakProviderOutputTokens;
 
   const desiredTrajectoryTokens =
-    viablePromptTokens +
-    viableOutputTokens;
+    trajectoryPromptTokens +
+    trajectoryOutputTokens;
 
-  const attemptTokenCapacity = Math.min(
-    input.remainingTokens,
-    input.stageMaxTokens,
-  );
+  const attemptTokenCapacity =
+    Math.min(
+      input.remainingTokens,
+      input.stageMaxTokens,
+    );
 
   const providerContextRequired =
     minimumViableTokens;
@@ -218,32 +384,34 @@ export function attemptLimitPolicy(
       ? 16_000
       : 0;
 
-  const maxTokens = Math.min(
-    attemptTokenCapacity,
-    Math.max(
-      desiredTrajectoryTokens,
-      input.maxOutputTokens * 2,
-      boundedDiscoveryTokens,
-      input.learnedP90Tokens ?? 0,
-    ),
-  );
+  const maxTokens =
+    Math.min(
+      attemptTokenCapacity,
+      Math.max(
+        desiredTrajectoryTokens,
+        input.maxOutputTokens * 2,
+        boundedDiscoveryTokens,
+        input.learnedP90Tokens ?? 0,
+      ),
+    );
 
   const minimumViableCostUsd =
     input.promptPricePerMillion === undefined ||
     input.completionPricePerMillion === undefined
       ? undefined
       : (
-          viablePromptTokens *
+          trajectoryPromptTokens *
             input.promptPricePerMillion +
-          viableOutputTokens *
+          trajectoryOutputTokens *
             input.completionPricePerMillion
         ) /
         1e6;
 
-  const costCapacity = Math.min(
-    input.remainingUsd,
-    input.stageMaxUsd,
-  );
+  const costCapacity =
+    Math.min(
+      input.remainingUsd,
+      input.stageMaxUsd,
+    );
 
   const plannedBudgetUsd =
     input.boundedDiscovery
@@ -253,14 +421,15 @@ export function attemptLimitPolicy(
         )
       : input.plannedBudgetUsd;
 
-  const budgetUsd = Math.min(
-    costCapacity,
-    Math.max(
-      Number.EPSILON,
-      plannedBudgetUsd,
-      minimumViableCostUsd ?? 0,
-    ),
-  );
+  const budgetUsd =
+    Math.min(
+      costCapacity,
+      Math.max(
+        Number.EPSILON,
+        plannedBudgetUsd,
+        minimumViableCostUsd ?? 0,
+      ),
+    );
 
   const minimumViableMs =
     input.boundedDiscovery
@@ -283,27 +452,25 @@ export function attemptLimitPolicy(
         )
       : Infinity;
 
-  const timeoutMs = Math.min(
-    input.configuredTimeoutMs,
-    input.remainingMs,
-    45_000,
-    predictedDirectDeadline,
-  );
+  const timeoutMs =
+    Math.min(
+      input.configuredTimeoutMs,
+      input.remainingMs,
+      45_000,
+      predictedDirectDeadline,
+    );
 
   const nonViableLimitKind:
     | AttemptLimitKind
     | undefined =
     maxSteps < viableCalls
       ? "step_limit"
-      : attemptTokenCapacity <
-          minimumViableTokens
+      : attemptTokenCapacity < minimumViableTokens
         ? "token_limit"
-        : providerContextCapacity <
-            providerContextRequired
+        : providerContextCapacity < providerContextRequired
           ? "context_limit"
           : minimumViableCostUsd !== undefined &&
-              costCapacity <
-                minimumViableCostUsd
+              costCapacity < minimumViableCostUsd
             ? "cost_limit"
             : timeoutMs < minimumViableMs
               ? "timeout"
@@ -324,9 +491,9 @@ export function attemptLimitPolicy(
     providerContextRequired,
     providerContextCapacity,
     forecastProviderInputTokens:
-      viablePromptTokens,
+      trajectoryPromptTokens,
     forecastProviderOutputTokens:
-      viableOutputTokens,
+      trajectoryOutputTokens,
     minimumViableCostUsd,
     viable: !nonViableLimitKind,
     nonViableLimitKind,
