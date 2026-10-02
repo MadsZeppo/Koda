@@ -76,32 +76,48 @@ export function chooseExecutionStrategy(
   task: string,
   profile: RepoProfile,
 ): ExecutionStrategy {
+  // Constraints such as "do not refactor" describe excluded work, not task
+  // scope. Do not let their vocabulary manufacture decomposition pressure.
   const requestedWork = task
     .replace(/\b(?:do not|don't|must not|without)\b[^.!?;\n]*/gi, "")
     .replace(
       /\bno\s+(?:refactors?|migrations?|architectural changes?)\b[^.!?;\n]*/gi,
       "",
     );
+  // Tests and compatibility are acceptance criteria for the implementation,
+  // not independent workstreams just because they are separate clauses.
   const implementationWork = requestedWork
     .replace(/(?:\b(?:and|then|also)\s+|[.;\n]\s*|\+\s*)(?:add|write|include|create|update|change|modify|fix|repair)\s+(?:a\s+)?(?:focused\s+|regression\s+|unit\s+|integration\s+)*tests?\b[^.;\n]*/gi, "")
     .replace(/(?:\b(?:and|then|also)\s+|[.;\n]\s*|\+\s*)preserve\s+(?:existing\s+)?(?:behavior|compatibility|tests?)\b[^.;\n]*/gi, "");
 
   const sources = profile.files.filter(isSourcePath);
   const terms = taskTerms(task);
+
+  // A root path such as README.md can share its basename with nested files.
+  // Prefer exact repository-relative mentions; only fall back to a basename
+  // when that basename identifies one file in the repository.
   const exactPaths = explicitTaskPaths(task, profile);
+
   const basenameMatches = profile.files.filter((f) =>
     mentionedPath(task, posix.basename(f)),
   );
+
   const explicit = exactPaths.length
     ? exactPaths
     : basenameMatches.length === 1
       ? basenameMatches
       : [];
+  // Keep all concrete filename mentions for decomposition evidence. `explicit`
+  // stays narrow for direct execution, while `concreteMentions` lets us tell
+  // a genuinely multi-component request from broad lexical matches.
   const concreteMentions = exactPaths.length ? exactPaths : basenameMatches;
   const implementationSource = (file: string) =>
     isSourcePath(file) && !isTestPath(file);
   const exactSourceMentions = exactPaths.filter(implementationSource);
 
+  // Repository profiles contain files, not directory entries. Build the
+  // directory set so an explicitly named bounded directory can still act as
+  // scope evidence for Stable execution.
   const directories = [
     ...new Set(
       profile.files.flatMap((file) => {
@@ -182,13 +198,17 @@ export function chooseExecutionStrategy(
         ),
     );
 
-  if (explicitParallelWork) return planned("Explicit independent workstreams");
+  if (explicitParallelWork) {
+    return planned("Explicit independent workstreams");
+  }
 
   if (
     /\b(?:across|cross[- ](?:module|system)|migrat\w*|architect\w*|refactor\w*|multi[- ]component|depends? on|dependent on|schema migration|database migration)\b/i.test(
       requestedWork,
     )
-  ) return planned("Cross-component work requires decomposition");
+  ) {
+    return planned("Cross-component work requires decomposition");
+  }
 
   const actionVerbs = implementationWork.match(/(?:^|[.;]\s*|\band\s+)(?:fix|repair|implement|compose|regenerate|correct|create|build|update)\b/gi) ?? [];
   if (actionVerbs.length >= 2 &&
@@ -196,6 +216,8 @@ export function chooseExecutionStrategy(
       !/\b(?:one|single|same)\s+(?:bug|issue|fix|change)\b/i.test(implementationWork))
     return planned("Separate implementation actions");
 
+  // A bounded inspect -> fix -> verify workflow is one sequential workstream,
+  // even when the user scopes it to a directory rather than one exact file.
   if (
     stableTargets.length > 0 &&
     /\b(?:inspect|investigate|review|trace|find)\b/i.test(task) &&
@@ -214,6 +236,12 @@ export function chooseExecutionStrategy(
     };
   }
 
+  // Three or more repository-backed source paths are enough evidence that one
+  // repository-wide Stable worker would hide useful ownership boundaries. The
+  // planner can inspect their actual imports and focused tests, then either
+  // build a safe dependency DAG or retain a coupled plan. This is deliberately
+  // based on exact paths rather than lexical filename matches: incidental
+  // terms must not manufacture parallel work.
   if (exactSourceMentions.length >= 3) {
     return planned("Several explicit source targets require dependency-aware planning");
   }
@@ -231,12 +259,17 @@ export function chooseExecutionStrategy(
     };
   }
 
+  // Sentences, reproduction steps and code snippets are not independent
+  // mutation targets. Decompose only when the task establishes separable work.
   if (
     /\b(?:independent|separate|parallel)\b/i.test(implementationWork) &&
     concreteMentions.filter(implementationSource).length > 1
   ) return planned("Multiple independent implementation targets");
 
-  if (/\bclient\b/i.test(requestedWork) && /\bserver\b/i.test(requestedWork)) {
+  if (
+    /\bclient\b/i.test(requestedWork) &&
+    /\bserver\b/i.test(requestedWork)
+  ) {
     return planned("Client and server changes");
   }
 
@@ -244,6 +277,8 @@ export function chooseExecutionStrategy(
     return planned("Broad task scope");
   }
 
+  // A unique path named by the user is stronger task-scope evidence than
+  // lexical matches against symbols elsewhere in a large repository.
   if (explicit.length === 1) {
     return {
       execution_strategy: "direct",
@@ -265,6 +300,10 @@ export function chooseExecutionStrategy(
 
   const component = (f: string) => posix.dirname(f);
 
+  // Only concrete, user-named files are strong evidence that multiple
+  // components were actually requested. Lexical repo matches (for words such
+  // as "verification", "routing", or "planner") are localization hints, not
+  // independent workstreams and must not summon the planner by themselves.
   if (
     concreteMentions.filter(implementationSource).length >= 2 &&
     new Set(concreteMentions.filter(implementationSource).map(component)).size > 1 &&
@@ -273,6 +312,8 @@ export function chooseExecutionStrategy(
     return planned("Explicit distinct requested components");
   }
 
+  // Three separately named source stems joined as a list are independent
+  // repair targets even when the prompt omits their extensions/directories.
   const namedSourceStems = matched.filter((file) =>
     mentionedPath(requestedWork, posix.basename(file).replace(/\.[^.]+$/, "")),
   );
@@ -292,10 +333,15 @@ export function chooseExecutionStrategy(
   if (
     explicit.some((f) => !isSourcePath(f) && !isTestPath(f)) &&
     matched.length
-  ) return planned("Code and configuration changes");
+  ) {
+    return planned("Code and configuration changes");
+  }
 
   const targets = matched.length ? matched : explicit.filter(isSourcePath);
 
+  // A large-repository task with no precise file target needs localization, not
+  // decomposition. Stable can inspect and lock one bounded scope without paying
+  // for a planner DAG or granting a generic DIRECT worker the whole repository.
   if (!targets.length && sources.length > 8) {
     return {
       execution_strategy: "stable",
@@ -331,6 +377,8 @@ export function directWritePaths(
   profile: RepoProfile,
   task = "",
 ): string[] {
+  // A matching regression test is verification context, not write permission.
+  // Explicit requests to change tests retain a coupled implementation scope.
   const changeTests = requestsTestMutation(task);
   const implementation = files.filter((file) => !isTestPath(file));
   const stems = implementation.map((f) =>
