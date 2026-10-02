@@ -191,19 +191,34 @@ export function fastPathExploration(
   const broad = /\b(?:across|multiple|multi[- ]component|throughout|entire|refactor|migrat|architecture|client and server|independent|parallel)\b/i.test(task);
   if (
     broad ||
-    exact.length !== 1 ||
+    exact.length < 1 ||
+    exact.length > 4 ||
     strategy.execution_strategy !== "direct"
   ) return undefined;
-  const path = exact[0]!;
+
+  const changeTests = requestsTestMutation(task);
+  const editablePaths = exact.filter((path) => !isTestPath(path) || changeTests);
+  const relatedTests = exact.filter((path) => isTestPath(path) && !changeTests);
+
+  if (!editablePaths.length) return undefined;
+
   return {
     confidence: "high",
-    editableCandidates: [{ path, reason: "The task explicitly names this exact repository-relative file path." }],
+    editableCandidates: editablePaths.map((path) => ({
+      path,
+      reason: isTestPath(path)
+        ? "The task explicitly names this test file and explicitly requests test mutation."
+        : "The task explicitly names this exact repository-relative file path.",
+    })),
     readonlyFiles: [],
-    relatedTests: [],
+    relatedTests,
     dependencies: [],
-    evidence: [{ path, detail: profile.files.includes(path)
-      ? "Exact path supplied by the user and validated against the repository profile."
-      : "Exact new file path supplied by the user and validated as a safe repository-relative path." }],
+    evidence: exact.map((path) => ({
+      path,
+      detail: profile.files.includes(path)
+        ? "Exact path supplied by the user and validated against the repository profile."
+        : "Exact new file path supplied by the user and validated as a safe repository-relative path.",
+    })),
     unresolvedQuestions: [],
   };
 }
