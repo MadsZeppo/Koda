@@ -350,6 +350,24 @@ export async function planCodingHandoff(
         AIDER_PROMPT_OVERHEAD_TOKENS,
     );
 
+  // Optional read-only context must fit both the provider request and the
+  // current Koda attempt budget. Editable targets remain authoritative even
+  // when they exceed the attempt budget: attemptPolicy can reject the current
+  // model/attempt without changing the coding engine away from Aider.
+  const attemptInputCapacity =
+    Math.max(
+      0,
+      input.attemptTokenCapacity -
+        outputReserve -
+        AIDER_PROMPT_OVERHEAD_TOKENS,
+    );
+
+  const optionalContextCapacity =
+    Math.min(
+      providerInputCapacity,
+      attemptInputCapacity,
+    );
+
   const editableSet =
     new Set(editable);
 
@@ -357,12 +375,9 @@ export async function planCodingHandoff(
   let totalTokens =
     editableTokens;
 
-  // Read-only context is optional. Keep every authorized editable target even
-  // when the currently selected model is too small; attemptPolicy will reject
-  // that model by context_limit and model recovery can select a larger one.
   if (
     editableTokens <=
-    providerInputCapacity
+    optionalContextCapacity
   ) {
     for (
       const candidate
@@ -396,7 +411,7 @@ export async function planCodingHandoff(
 
       if (
         totalTokens + tokens >
-        providerInputCapacity
+        optionalContextCapacity
       ) {
         continue;
       }
