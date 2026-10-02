@@ -7,7 +7,11 @@ import { z } from "zod";
 
 import type { Gateway } from "../openrouter/client.js";
 import type { RepoProfile, Usage } from "../types.js";
-import { explicitTaskPaths, type ExecutionStrategy } from "../router/executionStrategy.js";
+import {
+  explicitTaskPaths,
+  requestsTestMutation,
+  type ExecutionStrategy,
+} from "../router/executionStrategy.js";
 import { extractFeatures } from "../router/features.js";
 import { snapshotTree, changesBetween } from "../workspace/files.js";
 import { isSourcePath, isTestPath } from "../context/compiler.js";
@@ -178,7 +182,6 @@ async function defaultRunner(python: string, invocation: OpenHandsInvocation) {
   }
 }
 
-/** The only no-agent fast path: one exact safe file path and an isolated task. */
 export function fastPathExploration(
   task: string,
   profile: RepoProfile,
@@ -264,10 +267,6 @@ async function validateExploration(root: string, profile: RepoProfile, raw: Repo
     ...editableCandidates.map(({ path }) => path),
   ]);
 
-  // Do not infer write scope from files inspected by OpenHands.
-  // OpenHands owns repository scope discovery; this layer only validates
-  // the scope it explicitly submitted.
-
   const editable = new Set(editableCandidates.map(({ path }) => path));
   const validateAuthorizedPath = (path: string) => {
     const normalized = path.replaceAll("\\", "/").split("/")
@@ -317,6 +316,23 @@ export function strategyWithExploration(
   initial: ExecutionStrategy,
   exploration: RepositoryExploration,
 ): ExecutionStrategy {
+  // Tests discovered as related context stay read-only unless the task actually
+  // asks for test mutation. When it does, promote that bounded repository
+  // evidence into the editable scope before DIRECT locking happens.
+  if (requestsTestMutation(task) && exploration.relatedTests.length) {
+    const existing = new Set(exploration.editableCandidates.map(({ path }) => path));
+    const promoted = exploration.relatedTests.filter((path) => !existing.has(path));
+    exploration.editableCandidates = [
+      ...exploration.editableCandidates,
+      ...promoted.map((path) => ({
+        path,
+        reason: "The task explicitly requires test mutation and repository exploration identified this related test.",
+      })),
+    ];
+    const promotedSet = new Set(promoted);
+    exploration.relatedTests = exploration.relatedTests.filter((path) => !promotedSet.has(path));
+  }
+
   const proposedEditable = exploration.editableCandidates.map(({ path }) => path);
   const editable = proposedEditable
     .filter((path) => isSourcePath(path) && !isTestPath(path));
@@ -332,15 +348,15 @@ export function strategyWithExploration(
   if (initial.execution_strategy === "stable") return {
     ...initial,
     likelyFiles: all,
-    preciseTarget: editable.length === 1 ? editable[0] : undefined,
+    preciseTarget: proposedEditable.length === 1 && editable.length === 1 ? editable[0] : undefined,
     strategy_reason: "OpenHands resolved the Stable workstream to evidence-backed files",
   };
   if (editable.length) return {
     execution_strategy: "direct",
-    execution_effort: initial.execution_effort === "tiny" && editable.length === 1 ? "tiny" : "normal",
+    execution_effort: initial.execution_effort === "tiny" && proposedEditable.length === 1 && editable.length === 1 ? "tiny" : "normal",
     strategy_reason: "OpenHands supplied evidence-backed implementation scope",
     likelyFiles: all,
-    preciseTarget: editable.length === 1 ? editable[0] : undefined,
+    preciseTarget: proposedEditable.length === 1 && editable.length === 1 ? editable[0] : undefined,
   };
   return { ...initial, likelyFiles: all, strategy_reason: "OpenHands did not establish editable repository evidence" };
 }
@@ -397,10 +413,6 @@ export class OpenHandsExplorer implements RepositoryExplorer {
       outputPrice = selected.metadata.outputPrice ?? outputPrice;
       contextLength = selected.metadata.contextLength ?? contextLength;
     }
-    // OpenHands exploration is iterative and may issue several model calls.
-    // usdCapacity is already bounded by Koda's stage, discovery and global
-    // implementation-reserve budgets, so reserve that cumulative capacity
-    // instead of estimating exploration as a single LLM call.
     const budgetUsd = usdCapacity;
     if (budgetUsd <= 0) throw new OpenHandsOperationalError("Selected exploration model has no usable budget");
     const reserve = this.gateway.budget.reserve(budgetUsd, tokenCapacity);
@@ -414,26 +426,18 @@ export class OpenHandsExplorer implements RepositoryExplorer {
       provider,
       budgetUsd,
       maxTokens: tokenCapacity,
-      // OpenHands enforces a 16k context-window minimum. This is per-call
-      // capacity; Koda's separate 12k reservation remains the cumulative run
-      // budget and the bridge never preloads repository contents.
       maxInputTokens: Math.min(
         contextLength - maxOutputTokens,
         Math.max(16_384, tokenCapacity - maxOutputTokens),
       ),
       maxOutputTokens,
-      // OpenHands is a fallback for genuinely uncertain work.
-      // Bound exploration so it cannot consume the whole run.
       maxIterations: 6,
-
       maxFilesRead: Math.min(24, this.gateway.config.context.scanFiles),
-
       timeoutMs: Math.min(
         this.gateway.config.stageMaxMinutes * 60_000,
         this.gateway.budget.remainingMs(),
         30_000,
       ),
-
       requestTimeoutMs: this.gateway.config.modelTimeoutMs.inspection,
       inputCostPerToken: inputPrice / 1e6,
       outputCostPerToken: outputPrice / 1e6,
@@ -496,7 +500,6 @@ export class OpenHandsExplorer implements RepositoryExplorer {
       });
       return result;
     } catch (error) {
-      // A settled/cancelled reservation ignores duplicate settlement.
       if (error instanceof OpenHandsOperationalError && error.providerDispatched)
         reserve.settleUncertain();
       else reserve.cancel();
