@@ -344,13 +344,12 @@ export async function compileContext(
   };
 
   for (const file of files) {
-    const pathAssigned = paths.some(
-        (p) =>
-          p !== "." && (file === p ||
-          file.startsWith(p.replace(/\/$/, "") + "/")),
-      );
-    if (pathAssigned && (!localizedTestTask || namedTests.has(file))) {
-      add(file, namedTests.has(file) ? 140 : isTestPath(file) ? 90 : 110);
+    const pathAssigned = assigned(file);
+    if (pathAssigned) {
+      // Locked write targets are authoritative context. In particular, naming
+      // a test file must never cause an assigned implementation file to be
+      // dropped before verification can prove the source -> test relationship.
+      add(file, namedTests.has(file) ? 160 : isTestPath(file) ? 150 : 155);
     }
 
     if (explicitlyNamed.has(file)) {
@@ -368,6 +367,7 @@ export async function compileContext(
 
   const ordered = [...files].sort(
     (a, b) =>
+      Number(assigned(b)) - Number(assigned(a)) ||
       (scores.get(b) ?? 0) - (scores.get(a) ?? 0) || a.localeCompare(b),
   );
 
@@ -380,8 +380,9 @@ export async function compileContext(
         manifest.test(f) ||
         (focused && !broadRootScope && isTestPath(f)),
     )
-    .filter((f) => !localizedTestTask || explicitlyNamed.has(f) ||
-      manifest.test(f))
+    .filter((f) =>
+      !localizedTestTask || assigned(f) || explicitlyNamed.has(f) || manifest.test(f),
+    )
     .slice(0, limits.scanFiles)) {
     if (
       !/\.(?:[cm]?[jt]sx?|py|go|rs|java|[ch](?:pp)?|rb|json|toml|yaml|yml)$/.test(
@@ -400,7 +401,7 @@ export async function compileContext(
         text.toLowerCase().includes(t),
       ).length;
 
-      if (hits && !focused && (!localizedTestTask || explicitlyNamed.has(file) || !isTestPath(file))) {
+      if (hits && !focused && (!localizedTestTask || assigned(file) || explicitlyNamed.has(file) || !isTestPath(file))) {
         add(file, Math.min(60, hits * 10));
       }
     } catch {}
@@ -476,7 +477,10 @@ export async function compileContext(
   };
 
   for (const [file] of [...scores].sort(
-    (a, b) => b[1] - a[1] || a[0].localeCompare(b[0]),
+    (a, b) =>
+      Number(assigned(b[0])) - Number(assigned(a[0])) ||
+      b[1] - a[1] ||
+      a[0].localeCompare(b[0]),
   )) {
     if (result.files.length >= limits.maxFiles) break;
 
@@ -498,20 +502,32 @@ export async function compileContext(
 
     const start = Math.max(0, hit - 3);
 
-    const snippet = truncateBytes(
-      lines
-        .slice(start, start + 100)
-        .map((line, i) => `${start + i + 1}: ${line}`)
-        .join("\n"),
-      limits.fileBytes,
-    );
+    const rendered = lines
+      .slice(start, start + 100)
+      .map((line, i) => `${start + i + 1}: ${line}`)
+      .join("\n");
 
-    const entry = { path: file, snippet };
+    let snippet = truncateBytes(rendered, limits.fileBytes);
+    let entry = { path: file, snippet };
 
     result.files.push(entry);
 
     if (Buffer.byteLength(JSON.stringify(result)) > limits.maxBytes) {
       result.files.pop();
+
+      // Optional context can be skipped, but an existing locked write target
+      // must remain visible. Shrink only its snippet to the remaining budget.
+      if (assigned(file)) {
+        const currentBytes = Buffer.byteLength(JSON.stringify(result));
+        const remaining = Math.max(0, limits.maxBytes - currentBytes - 256);
+        if (remaining >= 128) {
+          snippet = truncateBytes(rendered, Math.min(limits.fileBytes, remaining));
+          entry = { path: file, snippet };
+          result.files.push(entry);
+          if (Buffer.byteLength(JSON.stringify(result)) > limits.maxBytes)
+            result.files.pop();
+        }
+      }
     }
   }
 
