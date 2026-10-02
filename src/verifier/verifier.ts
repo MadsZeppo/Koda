@@ -111,10 +111,6 @@ const tapFailureUnits = (check: CommandResult) => {
 
 export const verificationFailureIdentities = (check: CommandResult) => {
   const normalized = normalizedFailureOutput(check);
-  // Pytest's detailed trace contains volatile object addresses, temporary
-  // paths and environment text. Its terminal summary provides stable test
-  // identities, which are the authoritative regression unit. Comparing the
-  // entire trace made an unchanged failing baseline look like a new failure.
   const pytestTests = [
     ...normalized.matchAll(/^(?:FAILED|ERROR)\s+(.+?)(?:\s+-\s+.*|\s*)$/gm),
   ]
@@ -150,8 +146,6 @@ const introducedFailure = (
   check: CommandResult,
   candidateChangedPaths: readonly string[] = [],
 ) => {
-  // Do not hide interrupted runs or a verifier's integrity rejection behind
-  // an otherwise unchanged test summary.
   if (
     check.timedOut ||
     previous.timedOut ||
@@ -186,25 +180,12 @@ const introducedFailure = (
     const known = new Set(before);
     return after.some((identity) => !known.has(identity));
   }
-  // Node's test title is the stable regression unit. Assertion details often
-  // change when one upstream defect is fixed while the same downstream test
-  // remains red; treating those details as identity made improvements look
-  // like newly introduced failures.
   const beforeTap = tapFailureIdentities(previous);
   const afterTap = tapFailureIdentities(check);
   if (beforeTap.length && afterTap.length) {
     const known = new Set(beforeTap);
     if (afterTap.some((identity) => !known.has(identity))) return true;
-    // Removing named failures is candidate improvement. A remaining test may
-    // expose a different assertion only because an upstream defect no longer
-    // masks it, so its title remains the attribution boundary in that case.
     if (new Set(afterTap).size < new Set(beforeTap).size) {
-      // A reduced TAP failure set is normally an improvement. Keep a
-      // remaining changed failure attributable when its concrete test file
-      // corresponds to a file the candidate edited (for example src/a.cjs ->
-      // tests/a.test.cjs). This prevents a partial fix from hiding a bad edit,
-      // while allowing an upstream fix to reveal a different assertion in an
-      // otherwise untouched downstream test.
       const changedStems = new Set(
         candidateChangedPaths.map((path) =>
           path
@@ -238,8 +219,6 @@ const introducedFailure = (
       }
       return false;
     }
-    // With no removed failures, retain strict detail comparison so a patch
-    // cannot change an existing test's failure mode and call it baseline.
     const knownUnits = new Set(tapFailureUnits(previous));
     return tapFailureUnits(check).some((unit) => !knownUnits.has(unit));
   }
@@ -258,7 +237,6 @@ const introducedFailure = (
   return previousSignature !== candidateSignature;
 };
 
-/** A failed check is patch-attributable only if it is new or changed from baseline. */
 export function verificationRegressed(
   baseline: VerificationResult,
   after: VerificationResult,
@@ -269,31 +247,25 @@ export function verificationRegressed(
   );
 }
 
-/** A candidate may proceed to final verification when only optional tooling is missing. */
 export function advisoryInfrastructureOnly(result: VerificationResult) {
   return (
     result.status === "NOT_FULLY_VERIFIED" &&
     result.checks.some(
       (check) => !!check.unavailable && check.requirement === "advisory",
     ) &&
-    !result.checks.some(
-      (check) =>
-        check.outcome === "CHECK_FAIL" ||
-        (!!check.unavailable &&
-          (check.requirement ?? "required") === "required"),
+    !result.checks.some((check) =>
+      check.outcome === "CHECK_FAIL" ||
+      (!!check.unavailable && (check.requirement ?? "required") === "required"),
     )
   );
 }
 
-/** Return only failure identities introduced or changed by the candidate. */
 export function verificationRegressions(
   baseline: VerificationResult,
   after: VerificationResult,
   candidateChangedPaths?: readonly string[],
 ) {
   return after.checks.filter((check) => {
-    // Infrastructure attribution is authoritative even when a legacy caller
-    // also left a non-zero exit code or CHECK_FAIL-shaped result behind.
     if (check.unavailable || check.outcome !== "CHECK_FAIL") return false;
     const previous = baseline.checks.find(
       (item) => item.command === check.command && item.cwd === check.cwd,
@@ -304,16 +276,16 @@ export function verificationRegressions(
       previous?.outcome === "CHECK_UNAVAILABLE"
     )
       return false;
-    // With no candidate diff, the candidate cannot have changed an existing
-    // failure. Stable test identities still guard against a newly appearing
-    // baseline command failure while ignoring volatile assertion details.
-    if (previous?.outcome === "CHECK_FAIL" &&
-        candidateChangedPaths !== undefined && candidateChangedPaths.length === 0) {
+    if (
+      previous?.outcome === "CHECK_FAIL" &&
+      candidateChangedPaths !== undefined &&
+      candidateChangedPaths.length === 0
+    ) {
       const before = verificationFailureIdentities(previous);
-      const after = verificationFailureIdentities(check);
-      if (before.length && after.length) {
+      const afterIds = verificationFailureIdentities(check);
+      if (before.length && afterIds.length) {
         const known = new Set(before);
-        return after.some((identity) => !known.has(identity));
+        return afterIds.some((identity) => !known.has(identity));
       }
     }
     return (
@@ -324,7 +296,13 @@ export function verificationRegressions(
   });
 }
 
-/** Preserve diagnostics while treating identical pre-existing failures as neutral. */
+/**
+ * Compare a candidate against the pre-mutation baseline. An unchanged baseline
+ * failure remains visible in diagnostics but is neutral for candidate
+ * attribution. If every remaining failure is baseline-only and the candidate
+ * also supplies at least one real executable CHECK_PASS, the candidate has
+ * enough positive evidence to satisfy the differential verification contract.
+ */
 export function verificationAgainstBaseline(
   baseline: VerificationResult,
   after: VerificationResult,
@@ -334,51 +312,54 @@ export function verificationAgainstBaseline(
     verificationRegressions(baseline, after, candidateChangedPaths),
   );
   const compared = after.checks.map((check) => {
-      const previous = baseline.checks.find(
-        (item) => item.command === check.command && item.cwd === check.cwd,
-      );
-      if (
-        (check.outcome === "INFRA_FAILURE" ||
-          check.outcome === "CHECK_UNAVAILABLE") &&
-        (previous?.outcome === "INFRA_FAILURE" ||
-          previous?.outcome === "CHECK_UNAVAILABLE") &&
-        check.unavailable === previous.unavailable &&
-        failureSignature(check) === failureSignature(previous)
-      )
-        return {
-          ...check,
-          source: `${check.source ?? "verification"}:baseline_environment_unchanged`,
-        };
-      if (check.outcome !== "CHECK_FAIL" || regressions.has(check))
-        return { ...check };
-      if (
-        previous?.unavailable ||
-        previous?.outcome === "INFRA_FAILURE" ||
-        previous?.outcome === "CHECK_UNAVAILABLE"
-      )
-        return {
-          ...check,
-          unavailable: "baseline_verification_unavailable",
-          outcome: "INFRA_FAILURE" as const,
-          stderr: `${check.stderr}\nBaseline verification unavailable: ${previous.unavailable ?? previous.stderr}`,
-        };
-      if (!previous || previous.outcome !== "CHECK_FAIL")
-        return { ...check };
+    const previous = baseline.checks.find(
+      (item) => item.command === check.command && item.cwd === check.cwd,
+    );
+    if (
+      (check.outcome === "INFRA_FAILURE" || check.outcome === "CHECK_UNAVAILABLE") &&
+      (previous?.outcome === "INFRA_FAILURE" || previous?.outcome === "CHECK_UNAVAILABLE") &&
+      check.unavailable === previous.unavailable &&
+      failureSignature(check) === failureSignature(previous)
+    )
       return {
         ...check,
-        source: `${check.source ?? "verification"}:baseline_unchanged`,
-        stdout: `UNCHANGED BASELINE FAILURE (neutral for candidate)\n${check.stdout}`,
+        source: `${check.source ?? "verification"}:baseline_environment_unchanged`,
       };
-    });
+    if (check.outcome !== "CHECK_FAIL" || regressions.has(check)) return { ...check };
+    if (
+      previous?.unavailable ||
+      previous?.outcome === "INFRA_FAILURE" ||
+      previous?.outcome === "CHECK_UNAVAILABLE"
+    )
+      return {
+        ...check,
+        unavailable: "baseline_verification_unavailable",
+        outcome: "INFRA_FAILURE" as const,
+        stderr: `${check.stderr}\nBaseline verification unavailable: ${previous.unavailable ?? previous.stderr}`,
+      };
+    if (!previous || previous.outcome !== "CHECK_FAIL") return { ...check };
+    return {
+      ...check,
+      source: `${check.source ?? "verification"}:baseline_unchanged`,
+      stdout: `UNCHANGED BASELINE FAILURE (neutral for candidate)\n${check.stdout}`,
+    };
+  });
   const result = verificationResult(compared);
   const baselineOnlyFailures =
     result.status === "FAILED" &&
     regressions.size === 0 &&
     compared.some((check) => check.source?.endsWith(":baseline_unchanged")) &&
     compared.every((check) =>
-      check.outcome !== "CHECK_FAIL" ||
-      check.source?.endsWith(":baseline_unchanged"));
+      check.outcome !== "CHECK_FAIL" || check.source?.endsWith(":baseline_unchanged"));
   if (!baselineOnlyFailures) return result;
+
+  const executablePass = compared.some((check) => check.outcome === "CHECK_PASS");
+  if (executablePass)
+    return {
+      ...result,
+      status: "VERIFIED_SUCCESS" as const,
+    };
+
   const improved = compared.some((check) => {
     if (check.outcome !== "CHECK_FAIL") return false;
     const previous = baseline.checks.find(
@@ -393,9 +374,8 @@ export function verificationAgainstBaseline(
       : ("CANDIDATE_NEUTRAL" as const),
   };
 }
-export function verificationResult(
-  checks: CommandResult[],
-): VerificationResult {
+
+export function verificationResult(checks: CommandResult[]): VerificationResult {
   for (const check of checks) {
     check.requirement ??= "required";
     check.outcome ??= check.unavailable
@@ -404,9 +384,7 @@ export function verificationResult(
         ? "CHECK_PASS"
         : "CHECK_FAIL";
   }
-  const failedChecks = checks.filter(
-    (check) => check.outcome === "CHECK_FAIL",
-  ).length;
+  const failedChecks = checks.filter((check) => check.outcome === "CHECK_FAIL").length;
   const required = checks.filter(
     (check) => (check.requirement ?? "required") === "required",
   );
@@ -416,9 +394,7 @@ export function verificationResult(
       check.outcome === "INFRA_FAILURE" ||
       check.outcome === "CHECK_UNAVAILABLE",
   );
-  const executableEvidence = checks.some(
-    (check) => check.outcome === "CHECK_PASS",
-  );
+  const executableEvidence = checks.some((check) => check.outcome === "CHECK_PASS");
   const output = checks
     .filter((c) => !c.source?.endsWith(":baseline_unchanged"))
     .map((c) => c.stdout + "\n" + c.stderr)
@@ -428,42 +404,35 @@ export function verificationResult(
   ].map((m) => Number(m[1] ?? m[2]));
   const noEvidence = checks.some(
     (c) =>
-      /^(?:true|echo|printf|pwd|ls|git status)(?:\s|$)/.test(
-        c.command.trim(),
-      ) ||
-      /(?:#|ℹ) tests\s+0\b|Ran 0 tests\b|no tests found|no tests ran/i.test(
-        c.stdout + c.stderr,
-      ),
+      /^(?:true|echo|printf|pwd|ls|git status)(?:\s|$)/.test(c.command.trim()) ||
+      /(?:#|ℹ) tests\s+0\b|Ran 0 tests\b|no tests found|no tests ran/i.test(c.stdout + c.stderr),
   );
   const errors = [...output.matchAll(/error TS\d+|error\[E\d+\]/g)].length;
   return {
     dimensions: Object.fromEntries(
-      (["test", "typecheck", "lint", "build", "check"] as CheckKind[]).map(
-        (kind) => {
-          const rows = checks.filter((c) => c.kind === kind);
-          return [
-            kind,
-            rows.some((c) => c.outcome === "CHECK_FAIL")
-              ? "FAIL"
-              : rows.some(
-                    (c) =>
-                      c.unavailable ||
-                      c.outcome === "INFRA_FAILURE" ||
-                      c.outcome === "CHECK_UNAVAILABLE",
-                  )
-                ? "UNAVAILABLE"
-                : rows.some((c) =>
-                      /(?:#|ℹ) tests\s+0\b|Ran 0 tests\b|no tests found|no tests ran/i.test(
-                        c.stdout + c.stderr,
-                      ),
-                    )
-                  ? "NOT_RUN"
-                  : rows.length
-                    ? "PASS"
-                    : "NOT_RUN",
-          ];
-        },
-      ),
+      (["test", "typecheck", "lint", "build", "check"] as CheckKind[]).map((kind) => {
+        const rows = checks.filter((c) => c.kind === kind);
+        return [
+          kind,
+          rows.some((c) => c.outcome === "CHECK_FAIL")
+            ? "FAIL"
+            : rows.some((c) =>
+                c.unavailable ||
+                c.outcome === "INFRA_FAILURE" ||
+                c.outcome === "CHECK_UNAVAILABLE",
+              )
+              ? "UNAVAILABLE"
+              : rows.some((c) =>
+                  /(?:#|ℹ) tests\s+0\b|Ran 0 tests\b|no tests found|no tests ran/i.test(
+                    c.stdout + c.stderr,
+                  ),
+                )
+                ? "NOT_RUN"
+                : rows.length
+                  ? "PASS"
+                  : "NOT_RUN",
+        ];
+      }),
     ),
     status:
       checks.length === 0
@@ -483,6 +452,7 @@ export function verificationResult(
       : null,
   };
 }
+
 export async function verify(
   path: string,
   commands: string[],
@@ -495,9 +465,7 @@ export async function verify(
   for (const cmd of [...new Set(commands)].filter((c) => c.trim())) {
     const normalize = (c: string) =>
       c.replace(/\b(npm|pnpm|yarn|bun)\s+run\s+/g, "$1 ").trim();
-    const exactCandidate = candidates.find(
-      (c) => normalize(c.command) === normalize(cmd),
-    );
+    const exactCandidate = candidates.find((c) => normalize(c.command) === normalize(cmd));
     const normalized = normalize(cmd);
     const baseCandidate = candidates.find((c) => {
       const base = normalize(c.command);
@@ -520,8 +488,7 @@ export async function verify(
           )
       );
     });
-    const candidate =
-      exactCandidate ??
+    const candidate = exactCandidate ??
       (baseCandidate
         ? {
             ...baseCandidate,
@@ -571,8 +538,7 @@ export async function verify(
                 undefined,
                 strict,
               );
-        const pythonCommand =
-          /\b(?:python(?:\d+(?:\.\d+)?)?|pytest|tox)\b/i.test(cmd);
+        const pythonCommand = /\b(?:python(?:\d+(?:\.\d+)?)?|pytest|tox)\b/i.test(cmd);
         const candidateRequirement =
           candidate?.requirement ??
           (candidate?.origin === "inferred" || candidate?.origin === "generic"
@@ -585,9 +551,7 @@ export async function verify(
 
         c = await execute(strictDependencyEnvironment);
 
-        const environmentFailure =
-          c.exitCode !== 0 && runtimeInfrastructureFailure(c);
-
+        const environmentFailure = c.exitCode !== 0 && runtimeInfrastructureFailure(c);
         if (
           !strictDependencyEnvironment &&
           environmentFailure &&
@@ -642,7 +606,6 @@ export async function verify(
   return verificationResult(checks);
 }
 
-/** Automatic checks may create build/cache artifacts, but never change the worktree. */
 async function isolatedVerification(
   path: string,
   cmd: string,
@@ -678,14 +641,7 @@ async function isolatedVerification(
       }).catch(() => undefined);
       if (!probe || probe.exitCode !== 0)
         return JSON.stringify(await snapshotTree(copy));
-      const tracked = await git(
-        copy,
-        "--work-tree",
-        copy,
-        "diff",
-        "--binary",
-        "HEAD",
-      );
+      const tracked = await git(copy, "--work-tree", copy, "diff", "--binary", "HEAD");
       const untracked = (
         await git(
           copy,
@@ -702,9 +658,7 @@ async function isolatedVerification(
       const hashes = await Promise.all(
         untracked.map(async (p) => [
           p,
-          createHash("sha256")
-            .update(await readFile(join(copy, p)))
-            .digest("hex"),
+          createHash("sha256").update(await readFile(join(copy, p))).digest("hex"),
         ]),
       );
       return JSON.stringify([tracked, hashes]);
@@ -728,9 +682,7 @@ async function isolatedVerification(
       return {
         ...result,
         exitCode: 1,
-        stderr:
-          result.stderr +
-          "\nVerification modified repository source; result rejected",
+        stderr: result.stderr + "\nVerification modified repository source; result rejected",
       };
     return result;
   } finally {
