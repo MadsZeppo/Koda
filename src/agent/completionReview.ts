@@ -84,17 +84,41 @@ export function parseCompletionReview(
   };
 }
 
+const isBaselineKnownFailure = (
+  check: VerificationResult["checks"][number],
+) =>
+  check.outcome === "CHECK_FAIL" &&
+  check.source?.endsWith(":baseline_unchanged") === true;
+
+/**
+ * The deterministic verifier owns regression attribution. Completion review is
+ * allowed to judge whether the requested behavior exists in the diff, but it
+ * must not reinterpret a baseline-known repository failure as a new candidate
+ * failure. Keep those failures visible as context while removing them from the
+ * blocking verification list shown to the reviewer.
+ */
 export function completionReviewMessages(input: CompletionReviewInput) {
-  const checks = input.verification.checks.map((check) => ({
-    command: check.command,
-    outcome: check.outcome,
-    exitCode: check.exitCode,
-  }));
+  const baselineKnownFailures = input.verification.checks
+    .filter(isBaselineKnownFailure)
+    .map((check) => ({
+      command: check.command,
+      exitCode: check.exitCode,
+      attribution: "BASELINE_FAILURE_UNCHANGED" as const,
+    }));
+
+  const checks = input.verification.checks
+    .filter((check) => !isBaselineKnownFailure(check))
+    .map((check) => ({
+      command: check.command,
+      outcome: check.outcome,
+      exitCode: check.exitCode,
+    }));
+
   return [
     {
       role: "system" as const,
       content:
-        "Independently review task completion from fresh evidence. Passing tests alone never prove an untested requirement. Mark a requirement satisfied only when the diff, changed paths, or a directly relevant verification result proves it. Return JSON only: {passed:boolean,requirements:[{id:string,satisfied:boolean,evidence:string}],summary:string}.",
+        "Independently review task completion from fresh evidence. Passing tests alone never prove an untested requirement. Mark a requirement satisfied only when the diff, changed paths, or a directly relevant verification result proves it. The deterministic verifier is authoritative for regression attribution: entries in baselineKnownFailures were already failing before this candidate and were not made worse by it. Do not mark a requirement unsatisfied solely because baselineKnownFailures is non-empty, unless the original task explicitly requires fixing that exact pre-existing failure. Return JSON only: {passed:boolean,requirements:[{id:string,satisfied:boolean,evidence:string}],summary:string}.",
     },
     {
       role: "user" as const,
@@ -108,7 +132,11 @@ export function completionReviewMessages(input: CompletionReviewInput) {
           exitStatus: input.workerExitStatus,
           terminationReason: input.workerTerminationReason ?? null,
         },
-        verification: { status: input.verification.status, checks },
+        verification: {
+          status: input.verification.status,
+          checks,
+          baselineKnownFailures,
+        },
         diff: input.diff.slice(0, 24_000),
       }),
     },
@@ -181,8 +209,15 @@ export function completionReviewGate(
   events: readonly Record<string, unknown>[],
 ) {
   const unresolved = unresolvedCompletionReviews(events);
+  const baselineRelativeSuccess =
+    finalStatus === "CANDIDATE_NEUTRAL" ||
+    finalStatus === "CANDIDATE_IMPROVEMENT";
   return {
-    status: unresolved.length ? "NOT_FULLY_VERIFIED" as const : finalStatus,
+    status: unresolved.length
+      ? "NOT_FULLY_VERIFIED" as const
+      : baselineRelativeSuccess
+        ? "VERIFIED_SUCCESS" as const
+        : finalStatus,
     unresolved,
   };
 }
