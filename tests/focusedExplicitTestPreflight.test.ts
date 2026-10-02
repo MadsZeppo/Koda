@@ -1,93 +1,125 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
+import { compileContext } from "../src/context/compiler.js";
 import { focusedVerificationCheck } from "../src/verifier/selection.js";
 
-test("explicit existing test target is a focused baseline even when source is trimmed from context", () => {
-  const profile = {
-    packageManager: "pnpm",
-    scripts: {
-      test: "tsx --test tests/*.test.ts",
-    },
-    files: [
-      "src/planner/taskCompiler.ts",
-      "tests/planner.test.ts",
-    ],
-    verificationCommands: ["pnpm run test"],
-    ecosystem: {
-      projectUnits: [],
-    },
-  } as any;
+const task =
+  "Add a normalizeTaskLabel helper in src/planner/taskCompiler.ts that trims surrounding whitespace and collapses repeated internal whitespace to a single space. Add deterministic tests for it in tests/planner.test.ts.";
 
-  const subtask = {
-    id: "direct",
-    title: "Add normalizeTaskLabel",
-    objective: "Add normalizeTaskLabel and deterministic tests",
-    dependsOn: [],
-    likelyReadPaths: ["tests/planner.test.ts"],
-    likelyWritePaths: [
-      "src/planner/taskCompiler.ts",
-      "tests/planner.test.ts",
-    ],
-    integrationContract: "Preserve existing public interfaces",
-    verificationCommands: [],
-    estimatedDifficulty: "normal",
-    parallelSafe: false,
-  } as any;
+const profile = {
+  files: [
+    "src/planner/taskCompiler.ts",
+    "tests/planner.test.ts",
+  ],
+  packageManager: "pnpm",
+  scripts: {
+    test: "tsx --test tests/*.test.ts",
+  },
+  verificationCommands: ["pnpm run test"],
+  ecosystem: undefined,
+} as any;
 
-  // Reproduce the real smoke: the compact worker context retained the test,
-  // but the source file was trimmed out by the context byte budget.
-  const context = {
-    files: [
+const subtask = {
+  id: "direct",
+  title: task,
+  objective: task,
+  dependsOn: [],
+  likelyReadPaths: [],
+  likelyWritePaths: [
+    "src/planner/taskCompiler.ts",
+    "tests/planner.test.ts",
+  ],
+  integrationContract: "Preserve existing public interfaces",
+  verificationCommands: [],
+  estimatedDifficulty: "normal",
+  parallelSafe: false,
+} as any;
+
+test("bounded source + test write targets both survive focused context compilation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-focused-context-"));
+
+  try {
+    await mkdir(join(root, "src/planner"), { recursive: true });
+    await mkdir(join(root, "tests"), { recursive: true });
+
+    await writeFile(
+      join(root, "src/planner/taskCompiler.ts"),
+      [
+        "export function compileTask() { return true; }",
+        ...Array.from({ length: 300 }, (_, index) =>
+          `export const filler${index} = ${index};`),
+      ].join("\n"),
+    );
+
+    await writeFile(
+      join(root, "tests/planner.test.ts"),
+      [
+        "import test from 'node:test';",
+        "import assert from 'node:assert/strict';",
+        "import { compileTask } from '../src/planner/taskCompiler.js';",
+        "test('compile task', () => assert.equal(compileTask(), true));",
+      ].join("\n"),
+    );
+
+    const context = await compileContext(
+      root,
+      task,
+      subtask.likelyWritePaths,
+      profile,
       {
-        path: "tests/planner.test.ts",
-        snippet: "import { normalizeTaskLabel } from '../src/planner/taskCompiler.js';\n",
-      },
-    ],
-    repoMap: ["tests/planner.test.ts"],
-    localDependencies: [],
-  } as any;
+        scanFiles: 32,
+        readBytes: 16_000,
+        fileBytes: 1_500,
+        maxFiles: 8,
+        maxBytes: 4_500,
+      } as any,
+      true,
+    );
 
-  assert.equal(
-    focusedVerificationCheck(subtask, profile, context),
-    "pnpm exec tsx --test 'tests/planner.test.ts'",
-  );
+    const paths = context.files.map((file) => file.path);
+    assert.ok(paths.includes("src/planner/taskCompiler.ts"));
+    assert.ok(paths.includes("tests/planner.test.ts"));
+
+    assert.equal(
+      focusedVerificationCheck(subtask, profile, context),
+      "pnpm exec tsx --test 'tests/planner.test.ts'",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("a not-yet-created explicit test target is not executed as baseline", () => {
-  const profile = {
-    packageManager: "pnpm",
-    scripts: {
-      test: "tsx --test tests/*.test.ts",
-    },
+  const missingProfile = {
+    ...profile,
     files: ["src/planner/taskCompiler.ts"],
-    verificationCommands: ["pnpm run test"],
-    ecosystem: {
-      projectUnits: [],
-    },
   } as any;
 
-  const subtask = {
-    id: "direct",
-    title: "Add helper and test",
-    objective: "Add helper and a new deterministic test",
-    dependsOn: [],
-    likelyReadPaths: [],
+  const missingSubtask = {
+    ...subtask,
     likelyWritePaths: [
       "src/planner/taskCompiler.ts",
       "tests/newPlanner.test.ts",
     ],
-    integrationContract: "Preserve existing public interfaces",
-    verificationCommands: [],
-    estimatedDifficulty: "normal",
-    parallelSafe: false,
   } as any;
 
   const context = {
-    files: [],
-    repoMap: [],
+    files: [
+      {
+        path: "src/planner/taskCompiler.ts",
+        snippet: "export function compileTask() { return true; }",
+      },
+    ],
+    repoMap: ["src/planner/taskCompiler.ts"],
     localDependencies: [],
   } as any;
 
-  assert.equal(focusedVerificationCheck(subtask, profile, context), undefined);
+  assert.equal(
+    focusedVerificationCheck(missingSubtask, missingProfile, context),
+    undefined,
+  );
 });
