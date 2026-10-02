@@ -53,6 +53,43 @@ test("completion review accepts only an explicit assessment for every requiremen
   assert.equal(review.passed, true);
 });
 
+test("completion review parses fenced JSON without failing the coding run", () => {
+  const requirements = [{ id: "R1", text: "Implement" }];
+  const review = parseCompletionReview([
+    "```json",
+    JSON.stringify({
+      passed: true,
+      requirements: [{ id: "R1", satisfied: true, evidence: "diff proves it" }],
+      summary: "complete",
+    }),
+    "```",
+  ].join("\n"), requirements);
+  assert.equal(review.passed, true);
+  assert.equal(review.requirements[0]?.satisfied, true);
+});
+
+test("completion review recovers requirement-labelled prose from providers", () => {
+  const requirements = [
+    { id: "R1", text: "Implement" },
+    { id: "R2", text: "Test" },
+  ];
+  const review = parseCompletionReview([
+    "R1: satisfied - implementation is present in the diff",
+    "R2: satisfied - focused deterministic tests are present",
+    "Overall: passed",
+  ].join("\n"), requirements);
+  assert.equal(review.passed, true);
+  assert.ok(review.requirements.every((item) => item.satisfied));
+});
+
+test("unstructured completion review becomes unresolved instead of throwing", () => {
+  const requirements = [{ id: "R1", text: "Implement" }];
+  const review = parseCompletionReview("Looks good to me.", requirements);
+  assert.equal(review.passed, false);
+  assert.equal(review.requirements[0]?.satisfied, false);
+  assert.match(review.summary, /not parseable/i);
+});
+
 test("independent review receives fresh task, diff, worker and verification evidence", () => {
   const messages = completionReviewMessages({
     task: "Implement and test feature",
