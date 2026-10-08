@@ -1,0 +1,61 @@
+{
+  "maxParallel": 3,
+  "budgetUsd": 1,
+  "maxTokens": 200000,
+  "maxIterations": 3,
+  "maxMinutes": 20,
+  "commandTimeoutMs": 120000,
+  "modelTimeoutMs": {
+    "inspection": 18000,
+    "planning": 30000,
+    "implementation": 45000,
+    "finalization": 12000
+  },
+  "phaseBudget": {
+    "discoveryMaxFraction": 0.25,
+    "planningMaxFraction": 0.25,
+    "implementationReserveFraction": 0.5,
+    "verificationReserveMs": 15000
+  },
+  "maxOutputTokens": 4096,
+  "maxInputPrice": 20,
+  "maxOutputPrice": 100,
+  "stageMaxTokens": 15000,
+  "stageMaxUsd": 1,
+  "stageMaxMinutes": 4,
+  "race": false,
+  "context": {
+    "maxBytes": 16000,
+    "maxFiles": 8,
+    "fileBytes": 2400,
+    "toolResultBytes": 4000,
+    "maxPromptBytes": 64000,
+    "scanFiles": 200,
+    "readBytes": 16000
+  },
+  "modelsFile": "./koda.models.json",
+  "routing": {
+    "minimumQuality": 0.9,
+    "costWeight": 0.55,
+    "latencyWeight": 0.45,
+    "priorStrength": 10,
+    "cacheTtlMs": 21600000,
+    "authority": "openrouter-auto",
+    "openRouterAuto": {
+      "referenceModel": "openai/gpt-5.6-sol",
+      "costTier": "auto",
+      "completionReserveFraction": 0.1
+    }
+  },
+  "planner": {
+    "minimumQuality": 0.9,
+    "qualityPrior": 0.95,
+    "priorStrength": 10,
+    "costWeight": 0.4,
+    "latencyWeight": 0.6,
+    "latencyTargetMs": 5000,
+    "costTargetUsd": 0.001,
+    "contextBytes": 6000,
+    "maxOutputTokens": 1800
+  }
+}

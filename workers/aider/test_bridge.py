@@ -16,9 +16,45 @@ from bridge import (
 
 
 class GuardTests(unittest.TestCase):
+    def test_truncated_reasoning_response_preserves_usage_and_output_limit(self):
+        response = types.SimpleNamespace(
+            choices=[types.SimpleNamespace(
+                finish_reason="length",
+                message=types.SimpleNamespace(content=None, reasoning="unfinished"),
+            )],
+            usage={"prompt_tokens": 20, "completion_tokens": 100, "cost": 0.00022},
+        )
+        self.guard.completion = lambda **kwargs: response
+        self.assertIs(self.call(), response)
+        self.assertTrue(self.state["outputLimitReached"])
+        self.assertEqual(self.state["inputTokens"], 20)
+        self.assertEqual(self.state["outputTokens"], 100)
+        self.assertEqual(self.state["tokens"], 120)
+        self.assertAlmostEqual(self.state["costUsd"], 0.00022)
+
+    def test_backend_transport_cannot_be_overridden_by_model_prefix_or_credentials(self):
+        self.request["providerMode"] = "backend"
+        self.request["baseUrl"] = "http://127.0.0.1:8787/v1"
+        with patch.dict(os.environ, {"KODA_PROVIDER_API_KEY": "koda-backend-client"}, clear=True):
+            self.call(custom_llm_provider="openrouter", api_base="https://direct.invalid/v1", api_key="untrusted")
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0]["custom_llm_provider"], "openai")
+        self.assertEqual(self.calls[0]["model"], "foo/bar")
+        self.assertEqual(self.calls[0]["api_base"], self.request["baseUrl"])
+        self.assertEqual(self.calls[0]["api_key"], "koda-backend-client")
+
+    def test_backend_preserves_publisher_prefix_on_wire_model(self):
+        self.request.update(providerMode="backend", model="openai/openai/selected-model", routedModel="openai/selected-model")
+        with patch.dict(os.environ, {"KODA_PROVIDER_API_KEY": "koda-backend-client"}, clear=True):
+            self.call(extra_body={"model": "untrusted/model", "provider": {"require_parameters": True}})
+        self.assertEqual(self.calls[0]["custom_llm_provider"], "openai")
+        self.assertEqual(self.calls[0]["extra_body"]["model"], "openai/selected-model")
+        self.assertEqual(self.calls[0]["extra_body"]["provider"], {"require_parameters": True})
+
     def setUp(self):
         self.request = dict(
             model="openrouter/foo/bar",
+            providerMode="direct-openrouter",
             maxSteps=2,
             deadline=time.time()
             * 1000
@@ -864,17 +900,18 @@ class GuardTests(unittest.TestCase):
                             "edit_format"
                         ]
 
-                    return (
-                        types.SimpleNamespace(
+                    coder = types.SimpleNamespace(
+                            root=str(root / "src"),
+                            abs_root_path_cache={"src/new.cjs": str(root / "src/src/new.cjs")},
                             edit_format=fmt,
                             num_malformed_responses=0,
-                            run=lambda **kwargs:
-                                llm.litellm.completion(
-                                    model=model,
-                                    messages=[],
-                                ),
                         )
-                    )
+                    def execute(**kwargs):
+                        self.assertEqual(coder.root, str(Path.cwd().resolve()))
+                        self.assertEqual(coder.abs_root_path_cache, {})
+                        return llm.litellm.completion(model=model, messages=[])
+                    coder.run = execute
+                    return coder
 
                 main.main = create
 

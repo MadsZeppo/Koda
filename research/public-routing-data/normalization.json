@@ -1,0 +1,30 @@
+{
+  "task_outcomes": 6710,
+  "trajectory_states": 337783,
+  "trajectories": 6877,
+  "unique_tasks": 6463,
+  "models": {
+    "claude-3-7-sonnet-20250219": 2348,
+    "qwen3.5-122b-a10b": 1909,
+    "minimax-m2.5": 1955,
+    "claude-3-5-sonnet-20241022": 498
+  },
+  "sources": {
+    "SWE-bench/SWE-smith-trajectories": 2846,
+    "nvidia/Open-SWE-Traces": 3864
+  },
+  "splits": {
+    "train": 4697,
+    "validation": 1361,
+    "test": 652
+  },
+  "audit": {
+    "unknown_outcome_excluded": 1136,
+    "duplicate_task_model": 156,
+    "conflicting_task_model_excluded": 11
+  },
+  "frozen_exclusion_ids": 100,
+  "paid_calls": 0,
+  "labels": "observable event proxies; escalation/capability counterfactuals unknown",
+  "task_digest": "1339e7ff1c86b1b2f2fa7d39957b9342aff54b2a1149b168869dab49bf572b51"
+}

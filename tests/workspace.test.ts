@@ -43,6 +43,108 @@ async function sandbox(prefix = "koda-workspace-") {
   return { parent, root, output };
 }
 
+test("explicit source plus test request establishes a runner and verifies the new test", async () => {
+  const f = await sandbox("koda-new-test-runner-");
+  await mkdir(join(f.root, "src"));
+  await writeFile(join(f.root, "src/value.cjs"), "module.exports = () => 1;\n");
+  await writeFile(join(f.root, "package.json"), JSON.stringify({ name: "fixture", scripts: {} }));
+  await git(f.root, "init", "-q");
+  await git(f.root, "add", ".");
+  await git(f.root, "-c", "user.name=Koda", "-c", "user.email=koda@localhost",
+    "commit", "-qm", "baseline");
+  const task = "In src/value.cjs, change the result to 2 and add a focused regression test.";
+  const requests: any[] = [];
+  const server = createServer(async (req, res) => {
+    let raw = "";
+    for await (const chunk of req) raw += chunk;
+    const body = JSON.parse(raw);
+    requests.push(body);
+    const writes = [
+      { path: "src/value.cjs", content: "module.exports = () => 2;\n" },
+      { path: "package.json", content: JSON.stringify({ name: "fixture", scripts: {
+        test: "node --test tests/*.test.js",
+      } }) },
+      { path: "tests/value.test.js", content: "const {test}=require('node:test');const assert=require('node:assert/strict');const value=require('../src/value.cjs');test('value is 2',()=>assert.equal(value(),2));\n" },
+    ];
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ id: "mock", model: body.model,
+      choices: [{ index: 0, finish_reason: "tool_calls", message: {
+        role: "assistant", content: null,
+        tool_calls: writes.map((write, index) => ({ id: `write-${index}`, type: "function",
+          function: { name: "write_file", arguments: JSON.stringify(write) } })),
+      } }], usage: { prompt_tokens: 100, completion_tokens: 30, cost: 0 } }));
+  });
+  try {
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const result = await run({ repo: f.root, task, output: f.output, quiet: true,
+      config: await config(undefined, { adaptiveCoding: false, specialistRouting: false,
+        models: {}, baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`,
+        budgetUsd: 10 }) });
+    assert.equal(result.status, "VERIFIED_SUCCESS");
+    const events = (await readFile(join(f.output, "events.jsonl"), "utf8"))
+      .trim().split("\n").map((line) => JSON.parse(line));
+    const scope = events.find((event) => event.type === "worker_scope");
+    assert.ok(scope?.allowed_write_paths.includes("tests/value.test.js"));
+    assert.ok(scope?.allowed_write_paths.includes("package.json"));
+    assert.ok(events.some((event) => event.type === "final_verification" &&
+      event.kind === "test" && event.outcome === "CHECK_PASS"));
+    assert.equal(await readFile(join(f.root, "src/value.cjs"), "utf8"),
+      "module.exports = () => 1;\n", "preview must leave the original untouched");
+    assert.ok(requests.length > 0);
+  } finally {
+    server.close();
+    await rm(f.parent, { recursive: true, force: true });
+  }
+});
+
+test("requested tests without an executable runner cannot become verified success", async () => {
+  const f = await sandbox("koda-missing-test-runner-");
+  await mkdir(join(f.root, "src"));
+  await writeFile(join(f.root, "src/value.cjs"), "module.exports = () => 1;\n");
+  await writeFile(join(f.root, "package.json"), JSON.stringify({ name: "fixture", scripts: {
+    lint: "node -e 'process.exit(0)'",
+  } }));
+  await git(f.root, "init", "-q");
+  await git(f.root, "add", ".");
+  await git(f.root, "-c", "user.name=Koda", "-c", "user.email=koda@localhost",
+    "commit", "-qm", "baseline");
+  const server = createServer(async (req, res) => {
+    let raw = "";
+    for await (const chunk of req) raw += chunk;
+    const body = JSON.parse(raw);
+    const writes = [
+      { path: "src/value.cjs", content: "module.exports = () => 2;\n" },
+      { path: "tests/value.test.js", content: "const {test}=require('node:test');const assert=require('node:assert/strict');const value=require('../src/value.cjs');test('value is 2',()=>assert.equal(value(),2));\n" },
+    ];
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ id: "mock", model: body.model,
+      choices: [{ index: 0, finish_reason: "tool_calls", message: {
+        role: "assistant", content: null,
+        tool_calls: writes.map((write, index) => ({ id: `write-${index}`, type: "function",
+          function: { name: "write_file", arguments: JSON.stringify(write) } })),
+      } }], usage: { prompt_tokens: 100, completion_tokens: 30, cost: 0 } }));
+  });
+  try {
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const result = await run({ repo: f.root,
+      task: "In src/value.cjs, change the result to 2 and add a focused regression test.",
+      output: f.output, quiet: true,
+      config: await config(undefined, { adaptiveCoding: false, specialistRouting: false,
+        models: {}, baseUrl: `http://127.0.0.1:${(server.address() as any).port}/v1`,
+        budgetUsd: 10 }) });
+    assert.notEqual(result.status, "VERIFIED_SUCCESS");
+    const events = (await readFile(join(f.output, "events.jsonl"), "utf8"))
+      .trim().split("\n").map((line) => JSON.parse(line));
+    assert.ok(events.some((event) => event.type === "final_verification" &&
+      event.command === "internal:requested-test-execution" && event.outcome === "CHECK_FAIL"));
+    assert.equal(await readFile(join(f.root, "src/value.cjs"), "utf8"),
+      "module.exports = () => 1;\n");
+  } finally {
+    server.close();
+    await rm(f.parent, { recursive: true, force: true });
+  }
+});
+
 test("DIRECT explicit test mutation codes despite related words and keeps final checks scoped", async () => {
   const f = await sandbox("koda-direct-test-mutation-");
   const testPath = "tests/controlPolicy.test.ts";
@@ -1934,4 +2036,23 @@ test("non-Git deterministic plan runs independent filesystem workers in parallel
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(f.parent, { recursive: true, force: true });
   }
+});
+
+test("empty Git repository without HEAD uses isolated filesystem creation and leaves original unchanged", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "koda-unborn-repo-"));
+  const root = join(parent, "repo");
+  try {
+    await mkdir(root);
+    await git(root, "init", "-q");
+    const profile = await profileRepo(root);
+    assert.equal(profile.commit, "");
+    assert.deepEqual(profile.files, []);
+    const backend = await createWorkspaceBackend(root, join(parent, "workspaces"), new Logger(join(parent, "logs"), "unborn", true), false);
+    assert.equal(backend.mode, "filesystem");
+    const integration = await backend.initialize();
+    await mkdir(join(integration.path, "src"));
+    await writeFile(join(integration.path, "src/answer.cjs"), "exports.answer=42;\n");
+    assert.deepEqual((await backend.changes(integration.path)).map((change) => change.path), ["src/answer.cjs"]);
+    assert.deepEqual(await listWorkspaceFiles(root), []);
+  } finally { await rm(parent, { recursive: true, force: true }); }
 });

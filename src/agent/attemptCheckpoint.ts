@@ -30,6 +30,26 @@ export class AttemptCheckpoint {
     return changesBetween(this.snapshot, current);
   }
 
+  /** Exact scoped before/after text for candidate-local review evidence. */
+  async textChanges(root: string, scope: WriteScope, maxBytes = 128 * 1024) {
+    const changes = await this.changed(root, scope);
+    const result: { path: string; before?: string; after?: string }[] = [];
+    let bytes = 0;
+    for (const change of changes) {
+      const original = this.saved.get(change.path)?.bytes;
+      let current: Buffer | undefined;
+      try { current = await readFile(join(root, change.path)); } catch {}
+      bytes += (original?.length ?? 0) + (current?.length ?? 0);
+      if (bytes > maxBytes) break;
+      result.push({
+        path: change.path,
+        ...(original ? { before: original.toString("utf8") } : {}),
+        ...(current ? { after: current.toString("utf8") } : {}),
+      });
+    }
+    return result;
+  }
+
   async restore(root: string, scope: WriteScope) {
     const changes = await this.changed(root, scope);
     for (const change of changes) {
@@ -47,8 +67,15 @@ export class AttemptCheckpoint {
         await chmod(target, original.mode);
       }
     }
-    if ((await this.changed(root, scope)).length)
+    if ((await this.changed(root, scope)).length) {
+      scope.logger.log("failure_evidence", {
+        subtaskId: scope.subtaskId,
+        observation: { type: "fault", source: "attempt_checkpoint", stage: "integration",
+          cause: "KODA_INTERNAL_FAILURE", established: true,
+          description: "Rollback completed but did not restore the accepted checkpoint" },
+      });
       throw Error("Attempt rollback did not restore the accepted checkpoint");
+    }
     return changes;
   }
 }

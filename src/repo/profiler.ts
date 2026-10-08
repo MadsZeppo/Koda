@@ -1,3 +1,4 @@
+import { discoveryNoise } from "./navigation.js";
 import { detectEcosystem } from "./ecosystem.js";
 import { readFile, readdir, lstat, realpath } from "node:fs/promises";
 import { resolve, extname, posix } from "node:path";
@@ -15,10 +16,12 @@ export async function profileRepo(root: string): Promise<RepoProfile> {
   }).catch(() => undefined);
   const isGit =
     probe?.exitCode === 0 && (await realpath(probe.stdout.trim())) === root;
+  const revision = isGit ? await execa("git", ["rev-parse", "--verify", "HEAD"], { cwd: root, reject: false }) : undefined;
+  const hasHead = revision?.exitCode === 0;
   const [commit, status, diff, files, top] = await Promise.all([
-    isGit ? git(root, "rev-parse", "HEAD") : "",
+    hasHead ? revision.stdout.trim() : "",
     isGit ? git(root, "status", "--porcelain", "--untracked-files=all") : "",
-    isGit ? git(root, "diff", "HEAD") : "",
+    isGit ? git(root, "diff", ...(hasHead ? ["HEAD"] : ["--cached"])) : "",
     listWorkspaceFiles(root),
     readdir(root),
   ]);
@@ -43,7 +46,7 @@ export async function profileRepo(root: string): Promise<RepoProfile> {
   );
   const profileFiles = files.filter(
     (file) =>
-      ![...reportRoots].some(
+      !discoveryNoise(file) && ![...reportRoots].some(
         (directory) => file === directory || file.startsWith(directory + "/"),
       ),
   );

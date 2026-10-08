@@ -1,5 +1,13 @@
+import { contradictoryPositiveEvidence } from "./router/history.js";
+import { RoutingV1History } from "./router/routingV1History.js";
+import { qualityLearningLabel } from "./router/routingV1.js";
+import { routerStateDirectory } from "./router/modelRouter.js";
+import { adaptHistoricalQualityOutcome } from "./router/knowledge/canonicalHistoryAdapter.js";
+import { CanonicalRoutingKnowledgeStore } from "./router/knowledge/canonical.js";
+import { canonicalRoutingTask } from "./router/canonicalTask.js";
+import { lexicalTask } from "./router/lexicalTask.js";
+import { collectFailureAttributions } from "./agent/failureAttributionRuntime.js";
 import { compileTaskSpec } from "./planner/taskSpec.js";
-import { MAX_CODING_PACKET_BYTES } from "./context/packetPolicy.js";
 import { prepareRepairChecks, newFailureIds } from "./verifier/repairFocus.js";
 import { verificationPlan } from "./verifier/plan.js";
 import type { PoolRouter } from "./router/modelRouter.js";
@@ -40,7 +48,18 @@ import { bestExecutablePlanner } from "./planner/routing.js";
 import { schedule } from "./orchestrator/scheduler.js";
 import { inferRepositoryDependencies } from "./orchestrator/dag.js";
 import { implement } from "./agent/codingExecutor.js";
-import { completionReviewMessages, parseCompletionReview, taskRequirementChecklist, completionReviewGate } from "./agent/completionReview.js";
+import {
+  completionReviewMessages,
+  completionReviewTool,
+  completionReviewResponseFormat,
+  completionReviewPayload,
+  completionReviewBatches,
+  completionReviewOutputTokens,
+  missingRequestedTestVerification,
+  parseCompletionReview,
+  taskRequirementChecklist,
+  completionReviewGate,
+} from "./agent/completionReview.js";
 import { currentDiff, safePath } from "./agent/tools.js";
 import { truncateBytes } from "./context/bounds.js";
 import { AttemptCheckpoint } from "./agent/attemptCheckpoint.js";
@@ -66,15 +85,19 @@ import type { Status, CommandResult, VerificationResult } from "./types.js";
 import type { EvidencePacket, Subtask } from "./planner/schemas.js";
 import {
   createWorkspaceBackend,
+  assertCandidateMatches,
+  rollbackAppliedRun,
   workspaceChangedPaths,
   type ApplyResult,
   type WorkspaceBackend,
   type WorkspaceInstance,
 } from "./workspace/backend.js";
-import { changeCode } from "./workspace/files.js";
+import { changeCode, type FileChange } from "./workspace/files.js";
+import { verifyAppliedRepository } from "./workspace/verification.js";
 import { nextCodingTier, type CodingTier } from "./router/codingDemand.js";
 import { taskRelevantMutationPaths } from "./agent/mutationInvariant.js";
 import {
+  canDeferRoutingBaseline,
   routingBaselinePreflight,
   stableNoChangePreflight,
 } from "./agent/stableNoChangePreflight.js";
@@ -90,15 +113,29 @@ import {
   profileTask,
   type DeterministicTaskProfile,
 } from "./router/taskProfiler.js";
+import { assessTask } from "./router/taskAssessment.js";
+import { buildVerificationContract } from "./verifier/contract.js";
 import { interpretTask } from "./router/taskInterpreter.js";
 import {
   OpenHandsExplorer,
   fastPathExploration,
+  boundedTextEditExploration,
+  deterministicRepositoryExploration,
+  modelFreeExplorationIsSufficient,
+  withInferredFrameworkCreationTargets,
   strategyWithExploration,
   type RepositoryExplorer,
   type RepositoryExploration,
 } from "./agent/openHandsExplorer.js";
 export interface RunOptions {
+  /** Reporting only; never consumed by routing or coding policies. */
+  taskAssessmentShadow?: boolean;
+  /** Observational only; current routing remains authoritative. */
+  routingV1Shadow?: boolean;
+  /** Reporting only; never consumed by routing, acceptance or recovery. */
+  failureAttributionShadow?: boolean;
+  /** Reporting only; never affects verification execution or acceptance. */
+  verificationContractShadow?: boolean;
   repo: string;
   /** Calibration may freeze source separately while reusing original installed dependencies. */
   dependencyRoot?: string;
@@ -108,8 +145,12 @@ export interface RunOptions {
   verify?: string[];
   output?: string;
   quiet?: boolean;
+  /** Synthetic dev/test runs are never model-performance evidence. */
+  syntheticTelemetry?: boolean;
+  /** Explicit isolated calibration: real provider usage, no production quality learning. */
+  offlineCalibration?: boolean;
   apply?: boolean;
-  /** Deterministic test seam. CLI/production never supplies a worker factory. */
+  /** Tests and explicit dev runs may inject a worker; normal CLI never does. */
   codingWorkerFactory?: (gateway: Gateway) => CodingWorker;
   /** Deterministic test seam. Production always constructs OpenHandsExplorer. */
   repositoryExplorerFactory?: (gateway: Gateway) => RepositoryExplorer;
@@ -174,23 +215,33 @@ function combineEvidence(packets: EvidencePacket[]) {
 
 function explorationPacket(exploration: RepositoryExploration): EvidencePacket {
   return {
-    relevantFiles: [...new Set([
-      ...exploration.editableCandidates.map(({ path }) => path),
-      ...exploration.readonlyFiles.map(({ path }) => path),
-      ...exploration.relatedTests,
-    ])],
+    relevantFiles: [
+      ...new Set([
+        ...exploration.editableCandidates.map(({ path }) => path),
+        ...exploration.readonlyFiles.map(({ path }) => path),
+        ...exploration.relatedTests,
+      ]),
+    ],
     symbols: [],
     reproduction: "",
     failingTests: exploration.relatedTests,
     likelyRootCause: exploration.editableCandidates
-      .map(({ path, reason }) => `${path}: ${reason}`).join("\n"),
+      .map(({ path, reason }) => `${path}: ${reason}`)
+      .join("\n"),
     dependencies: exploration.dependencies.map(
       (edge) => `${edge.from} -> ${edge.to} (${edge.kind})`,
     ),
-    uncertainty: exploration.confidence === "high" ? "low"
-      : exploration.confidence === "medium" ? "medium" : "high",
-    suggestedApproach: "Use the evidence-backed repository paths and preserve the declared write scope.",
-    evidence: exploration.evidence.map(({ path, detail }) => `${path}: ${detail}`),
+    uncertainty:
+      exploration.confidence === "high"
+        ? "low"
+        : exploration.confidence === "medium"
+          ? "medium"
+          : "high",
+    suggestedApproach:
+      "Use the evidence-backed repository paths and preserve the declared write scope.",
+    evidence: exploration.evidence.map(
+      ({ path, detail }) => `${path}: ${detail}`,
+    ),
   };
 }
 export async function run(options: RunOptions) {
@@ -205,10 +256,24 @@ export async function run(options: RunOptions) {
   );
   if (output === repo || output.startsWith(repo + "/"))
     throw Error("Report output must be outside the target repository");
-  const logger = new Logger(output, runId, options.quiet);
+  const logger = new Logger(
+    output,
+    runId,
+    options.quiet,
+    options.syntheticTelemetry,
+  );
+  if (options.routingV1Shadow === false)
+    logger.log("routing_v1_shadow_disabled", {});
   await mkdir(output, { recursive: true });
-  await writeFile(join(output, "task-spec.json"), JSON.stringify(taskSpec, null, 2));
+  await writeFile(
+    join(output, "task-spec.json"),
+    JSON.stringify(taskSpec, null, 2),
+  );
   let acceptedRepairState: string | undefined;
+  let verifiedChanges: FileChange[] | undefined;
+  let reusableDirectVerification: VerificationResult | undefined;
+  let reusableDirectChangeManifest: FileChange[] | undefined;
+  let applyRollback: { status: string; conflicts: string[] } | undefined;
   let status: Status = "FAILED",
     verification = verificationResult([]),
     error: string | undefined;
@@ -291,15 +356,43 @@ export async function run(options: RunOptions) {
     const gateway = new Gateway(options.config, logger, budget);
     const codingWorker = options.codingWorkerFactory?.(gateway);
     poolRouter = gateway.modelRouter;
+    poolRouter?.setContextualTaskText(options.task);
     await poolRouter?.freezeRunSnapshot();
     const initialStrategy = chooseExecutionStrategy(options.task, profile);
-    const repositoryExplorer = options.repositoryExplorerFactory?.(gateway) ??
+    const repositoryExplorer =
+      options.repositoryExplorerFactory?.(gateway) ??
       new OpenHandsExplorer(gateway);
-    const fastEvidence = fastPathExploration(
-      options.task,
-      profile,
-      initialStrategy,
-    );
+    let fastEvidence =
+      fastPathExploration(options.task, profile, initialStrategy) ??
+      (await boundedTextEditExploration(
+        integration.path,
+        options.task,
+        profile,
+      ));
+
+    // Before paying for semantic repository exploration, try the bounded local
+    // ranker. We only accept it when repository evidence plus an unambiguous
+    // framework convention proves the complete small scope. Injected explorers
+    // remain authoritative test/embedder seams.
+    if (!fastEvidence && !options.repositoryExplorerFactory) {
+      const localEvidence = withInferredFrameworkCreationTargets(
+        options.task,
+        profile,
+        await deterministicRepositoryExploration(
+          integration.path,
+          options.task,
+          profile,
+        ),
+      );
+      if (modelFreeExplorationIsSufficient(localEvidence, options.task))
+        fastEvidence = {
+          ...localEvidence,
+          confidence: "high",
+          // The sufficiency gate above has replaced a generic lexical
+          // ambiguity with stronger repository/framework proof.
+          unresolvedQuestions: [],
+        };
+    }
 
     let explorationDegraded = false;
     let exploration: RepositoryExploration;
@@ -349,15 +442,20 @@ export async function run(options: RunOptions) {
         };
       }
     }
+    exploration = withInferredFrameworkCreationTargets(
+      options.task,
+      profile,
+      exploration,
+    );
     if (fastEvidence)
       logger.log("repo_exploration_finish", {
         model: null,
         fast_path: true,
-        confidence: fastEvidence.confidence,
+        confidence: exploration.confidence,
         model_calls: 0,
         tool_calls: 0,
         files_inspected: [],
-        editable_files: fastEvidence.editableCandidates.map(({ path }) => path),
+        editable_files: exploration.editableCandidates.map(({ path }) => path),
         readonly_files: [],
         related_tests: [],
         input_tokens: 0,
@@ -366,8 +464,14 @@ export async function run(options: RunOptions) {
         wall_clock_ms: 0,
       });
     if (!exploration.editableCandidates.length)
-      throw Error("Repository exploration did not establish an editable implementation file");
-    strategy = strategyWithExploration(options.task, initialStrategy, exploration);
+      throw Error(
+        "Repository exploration did not establish an editable implementation file",
+      );
+    strategy = strategyWithExploration(
+      options.task,
+      initialStrategy,
+      exploration,
+    );
     logger.log("repo_scope_selected", {
       confidence: exploration.confidence,
       editable_files: exploration.editableCandidates.map(({ path }) => path),
@@ -381,32 +485,51 @@ export async function run(options: RunOptions) {
     });
     const initialTaskProfile = profileTask(options.task, profile, strategy);
     const routingBaselineStarted = Date.now();
-    let canonicalVerification = await routingBaselinePreflight(
-      integration.path,
-      profile,
-      initialTaskProfile.likelyPaths,
-      () => Math.min(options.config.commandTimeoutMs, budget.remainingMs()),
-      (check) => logger.log("verification", { subtaskId: "routing-preflight", ...check }),
+    const deferredRoutingBaseline = canDeferRoutingBaseline(
       options.task,
+      profile,
+      exploration,
+      strategy,
+      options.config.routing.authority === "openrouter-auto",
     );
+    let canonicalVerification = deferredRoutingBaseline
+      ? verificationResult([])
+      : await routingBaselinePreflight(
+          integration.path,
+          profile,
+          initialTaskProfile.likelyPaths,
+          () => Math.min(options.config.commandTimeoutMs, budget.remainingMs()),
+          (check) =>
+            logger.log("verification", {
+              subtaskId: "routing-preflight",
+              ...check,
+            }),
+          options.task,
+        );
 
-    const observedRoutingChecks = canonicalVerification.checks.filter((check) =>
-      check.outcome === "CHECK_PASS" || check.outcome === "CHECK_FAIL");
-    const canonicalTaskProfile: DeterministicTaskProfile = observedRoutingChecks.length
-      ? {
-          ...initialTaskProfile,
-          verificationStrength: "strong",
-          evidence: [
-            ...initialTaskProfile.evidence,
-            ...observedRoutingChecks.map((check) =>
-              `observed baseline ${String(check.outcome).toLowerCase()}: ${check.command}`),
-          ],
-        }
-      : initialTaskProfile;
+    const observedRoutingChecks = canonicalVerification.checks.filter(
+      (check) =>
+        check.outcome === "CHECK_PASS" || check.outcome === "CHECK_FAIL",
+    );
+    const canonicalTaskProfile: DeterministicTaskProfile =
+      observedRoutingChecks.length
+        ? {
+            ...initialTaskProfile,
+            verificationStrength: "strong",
+            evidence: [
+              ...initialTaskProfile.evidence,
+              ...observedRoutingChecks.map(
+                (check) =>
+                  `observed baseline ${String(check.outcome).toLowerCase()}: ${check.command}`,
+              ),
+            ],
+          }
+        : initialTaskProfile;
     logger.log("routing_baseline_verification", {
       status: canonicalVerification.status,
       checks: canonicalVerification.checks,
       elapsed_ms: Date.now() - routingBaselineStarted,
+      deferred_until_candidate_failure: deferredRoutingBaseline,
     });
     const semanticAssessment = await interpretTask(
       gateway,
@@ -415,15 +538,16 @@ export async function run(options: RunOptions) {
       canonicalTaskProfile,
       canonicalVerification,
     );
-    const interpretedTaskProfile: DeterministicTaskProfile =
-      semanticAssessment
-        ? { ...canonicalTaskProfile, semanticAssessment }
-        : canonicalTaskProfile;
-    const exploredPaths = [...new Set([
-      ...exploration.editableCandidates.map(({ path }) => path),
-      ...exploration.readonlyFiles.map(({ path }) => path),
-      ...exploration.relatedTests,
-    ])];
+    const interpretedTaskProfile: DeterministicTaskProfile = semanticAssessment
+      ? { ...canonicalTaskProfile, semanticAssessment }
+      : canonicalTaskProfile;
+    const exploredPaths = [
+      ...new Set([
+        ...exploration.editableCandidates.map(({ path }) => path),
+        ...exploration.readonlyFiles.map(({ path }) => path),
+        ...exploration.relatedTests,
+      ]),
+    ];
     const explorationEvidence = exploration.evidence.map(
       ({ path, detail }) => `${path}: ${detail}`,
     );
@@ -433,8 +557,75 @@ export async function run(options: RunOptions) {
       likelyTests: exploration.relatedTests,
       discoveryCandidates: exploration.readonlyFiles.map(({ path }) => path),
       scopeConfidence: exploration.confidence,
-      evidence: [...new Set([...interpretedTaskProfile.evidence, ...explorationEvidence])],
+      evidence: [
+        ...new Set([
+          ...interpretedTaskProfile.evidence,
+          ...explorationEvidence,
+        ]),
+      ],
     };
+    if (options.taskAssessmentShadow !== false) {
+      // Shadow-only: no new model request, no budget reservation, no mutation
+      // of the canonical profile used by today's production router.
+      try {
+        const assessment = assessTask({
+          task: originalTask,
+          taskSpec,
+          semantic: semanticAssessment,
+          facts: {
+            files: profile.files,
+            resolvedPaths: preparedTaskProfile.likelyPaths,
+            relatedTests: preparedTaskProfile.likelyTests,
+            components: preparedTaskProfile.likelyComponents,
+            localizationConfidence: preparedTaskProfile.scopeConfidence,
+            languages: preparedTaskProfile.languages,
+            frameworks: preparedTaskProfile.frameworks,
+            checks: canonicalVerification.checks.map((check) => ({
+              command: check.command,
+              kind: check.kind ?? "unknown",
+              outcome: check.outcome ?? "unknown",
+              taskSpecific:
+                check.kind === "test" &&
+                preparedTaskProfile.likelyTests.some((path) =>
+                  check.command.includes(path),
+                ) &&
+                !/[\*?]/.test(check.command),
+            })),
+          },
+        });
+        logger.log("task_assessment", { mode: "shadow", assessment });
+      } catch (error) {
+        logger.log("task_assessment_failure", {
+          mode: "shadow",
+          classification: "OPERATIONAL_FAILURE",
+          error: String(error),
+        });
+      }
+    }
+    if (options.verificationContractShadow !== false) {
+      try {
+        const contract = buildVerificationContract({
+          task: originalTask,
+          relatedTests: preparedTaskProfile.likelyTests,
+          resolvedPaths: preparedTaskProfile.likelyPaths,
+          assessment: logger.events.findLast(
+            (event) => event.type === "task_assessment",
+          )?.assessment as ReturnType<typeof assessTask> | undefined,
+          projectChecks: verificationPlan(
+            profile,
+            preparedTaskProfile.likelyPaths,
+            true,
+          ),
+        });
+        logger.log("verification_contract", { mode: "shadow", contract });
+      } catch (error) {
+        logger.log("verification_contract_failure", {
+          mode: "shadow",
+          classification: "OPERATIONAL_FAILURE",
+          error: String(error),
+        });
+      }
+    }
     const routingResume = await buildTaskResume(
       options.task,
       profile,
@@ -453,7 +644,9 @@ export async function run(options: RunOptions) {
       evidence: explorationEvidence,
     };
     routingResume.relevantPaths = exploredPaths;
-    routingResume.evidence = [...new Set([...routingResume.evidence, ...explorationEvidence])];
+    routingResume.evidence = [
+      ...new Set([...routingResume.evidence, ...explorationEvidence]),
+    ];
     routingResume.microScoutUsed = false;
     routingResume.researchCalls = 0;
     routingResume.researchCostUsd = 0;
@@ -473,7 +666,8 @@ export async function run(options: RunOptions) {
           .map((check) => check.command),
       ],
       likelyRootCause: exploration.editableCandidates
-        .map(({ path, reason }) => `${path}: ${reason}`).join("\n"),
+        .map(({ path, reason }) => `${path}: ${reason}`)
+        .join("\n"),
       dependencies: exploration.dependencies.map(
         (edge) => `${edge.from} -> ${edge.to} (${edge.kind})`,
       ),
@@ -490,7 +684,7 @@ export async function run(options: RunOptions) {
     let preselectedExecutionPlan: FrozenExecutionPlan | undefined;
     if (
       poolRouter &&
-      options.config.specialistRouting &&
+      (options.config.specialistRouting || options.config.routing.authority !== "legacy") &&
       !options.config.forceModel
     ) {
       const boundedWritePaths = directWritePaths(
@@ -513,8 +707,8 @@ export async function run(options: RunOptions) {
           likelyWritePaths: boundedWritePaths,
           integrationContract: "Produce an executable coding DAG",
           verificationCommands: [],
-          estimatedDifficulty: plannedPreview.complexity === "complex"
-            ? "high" : "normal",
+          estimatedDifficulty:
+            plannedPreview.complexity === "complex" ? "high" : "normal",
           parallelSafe: false,
         },
         profile,
@@ -540,22 +734,26 @@ export async function run(options: RunOptions) {
           routingResume.profile.semanticAssessment?.semanticDifficulty ??
             "easy",
         ) &&
-        boundedWritePaths.length >= 1 && boundedWritePaths.length <= 4;
+        boundedWritePaths.length >= 1 &&
+        boundedWritePaths.length <= 4;
       const strategies: ExecutionStrategy[] = allowedJointExecutionStrategies(
         strategy.execution_strategy,
         plannedExecutable,
         boundedDirectAlternative,
-      ).map((executionStrategy) => executionStrategy === strategy.execution_strategy
-        ? strategy
-        : {
-            ...strategy,
-            execution_strategy: executionStrategy,
-            execution_effort: "normal" as const,
-            strategy_reason: "Joint router alternative",
-            preciseTarget: executionStrategy === "direct" && boundedWritePaths.length === 1
-              ? boundedWritePaths[0]
-              : undefined,
-          });
+      ).map((executionStrategy) =>
+        executionStrategy === strategy.execution_strategy
+          ? strategy
+          : {
+              ...strategy,
+              execution_strategy: executionStrategy,
+              execution_effort: "normal" as const,
+              strategy_reason: "Joint router alternative",
+              preciseTarget:
+                executionStrategy === "direct" && boundedWritePaths.length === 1
+                  ? boundedWritePaths[0]
+                  : undefined,
+            },
+      );
       const variants = strategies.map((candidate) => {
         const routeSubtask: Subtask = {
           id: `route-${candidate.execution_strategy}`,
@@ -563,11 +761,12 @@ export async function run(options: RunOptions) {
           objective: options.task,
           dependsOn: [],
           likelyReadPaths: routingResume.relevantPaths,
-          likelyWritePaths: candidate.execution_strategy === "stable"
-            ? ["."]
-            : boundedWritePaths.length
-              ? boundedWritePaths
-              : ["."],
+          likelyWritePaths:
+            candidate.execution_strategy === "stable"
+              ? ["."]
+              : boundedWritePaths.length
+                ? boundedWritePaths
+                : ["."],
           integrationContract: "Preserve the task acceptance contract",
           verificationCommands: profile.verificationCommands,
           estimatedDifficulty: "normal",
@@ -597,11 +796,11 @@ export async function run(options: RunOptions) {
           strategy: candidate,
           prerequisiteCostUsd:
             candidate.execution_strategy === "planned"
-              ? plannerEstimate?.estimatedCallCost ?? 0
+              ? (plannerEstimate?.estimatedCallCost ?? 0)
               : 0,
           prerequisiteLatencyMs:
             candidate.execution_strategy === "planned"
-              ? plannerEstimate?.latency ?? 0
+              ? (plannerEstimate?.latency ?? 0)
               : 0,
         };
       });
@@ -617,15 +816,21 @@ export async function run(options: RunOptions) {
       logger.log("execution_strategy", {
         execution_strategy: strategy.execution_strategy,
         execution_effort: strategy.execution_effort,
-        strategy_reason: "quality-safe joint model + execution strategy economics",
+        strategy_reason:
+          "quality-safe joint model + execution strategy economics",
         model: joint.plan.initialModel,
       });
     }
-    const scopeBytes = (await Promise.all(exploration.editableCandidates.map(async ({ path: file }) => {
-      try { return (await readFile(join(integration!.path, file))).byteLength; } catch { return 0; }
-    }))).reduce((sum, size) => sum + size, 0);
-    if (taskSpec.parts.length > 1 || (scopeBytes > MAX_CODING_PACKET_BYTES && exploration.editableCandidates.length > 1)) {
-      strategy = { ...strategy, execution_strategy: "planned", strategy_reason: "bounded coding packet requires dependent decomposition" };
+    // A large localized file set is an execution-mode concern: the bounded
+    // Agentic worker can read it progressively. Decompose only when the task
+    // contract itself contains multiple bounded TaskSpec parts.
+    if (taskSpec.parts.length > 1) {
+      strategy = {
+        ...strategy,
+        execution_strategy: "planned",
+        strategy_reason:
+          "bounded coding packet requires dependent decomposition",
+      };
     }
     let taskVerificationCommands: string[] = [];
     let taskVerificationIsFocused = false;
@@ -652,12 +857,23 @@ export async function run(options: RunOptions) {
         true,
       );
       const explicitTestMutation =
-        /\b(?:add|create|write|update|change|extend|adjust)\w*\b[\s\S]{0,48}\b(?:test|tests|spec|specs|coverage)\w*\b|\b(?:test|tests|spec|specs|coverage)\w*\b[\s\S]{0,48}\b(?:add|create|write|update|change|extend|adjust)\w*\b/i
-          .test(options.task);
-      const stableWritePaths = [...new Set([
-        ...exploration.editableCandidates.map(({ path }) => path),
-        ...(explicitTestMutation ? exploration.relatedTests.filter((file) => taskSpec.explicitPaths.includes(file)) : []),
-      ])];
+        /\b(?:add|create|write|update|change|extend|adjust)\w*\b[\s\S]{0,48}\b(?:test|tests|spec|specs|coverage)\w*\b|\b(?:test|tests|spec|specs|coverage)\w*\b[\s\S]{0,48}\b(?:add|create|write|update|change|extend|adjust)\w*\b/i.test(
+          options.task,
+        );
+      const stableWritePaths = directWritePaths(
+        [
+          ...new Set([
+            ...exploration.editableCandidates.map(({ path }) => path),
+            ...(explicitTestMutation
+              ? exploration.relatedTests.filter((file) =>
+                  taskSpec.explicitPaths.includes(file),
+                )
+              : []),
+          ]),
+        ],
+        profile,
+        options.task,
+      );
       const subtask: Subtask = {
         id: "stable",
         title: options.task,
@@ -738,12 +954,11 @@ export async function run(options: RunOptions) {
               finalVerificationOnly: true,
               evidence: sharedRoutingEvidence,
               canonicalTaskProfile: routingResume.profile,
-              canonicalVerification:
-                preflight.verification.checks.length
+              canonicalVerification: preflight.verification.checks.length
+                ? preflight.verification
+                : requestsTestMutation(options.task)
                   ? preflight.verification
-                  : requestsTestMutation(options.task)
-                    ? preflight.verification
-                    : canonicalVerification,
+                  : canonicalVerification,
               executionPlan: preselectedExecutionPlan,
             },
           );
@@ -827,12 +1042,7 @@ export async function run(options: RunOptions) {
         const repairContext = await compileContext(
           integration.path,
           options.task,
-          [
-            ...new Set([
-              ...actualChangedPaths,
-              ...exploration.relatedTests,
-            ]),
-          ],
+          [...new Set([...actualChangedPaths, ...exploration.relatedTests])],
           repairProfile,
           options.config.context,
           true,
@@ -860,9 +1070,7 @@ export async function run(options: RunOptions) {
           evidence: [
             ...new Set([
               ...result.evidence.evidence,
-              ...actualChangedPaths.map(
-                (path) => `aider_changed_path:${path}`,
-              ),
+              ...actualChangedPaths.map((path) => `aider_changed_path:${path}`),
             ]),
           ],
         };
@@ -901,42 +1109,48 @@ export async function run(options: RunOptions) {
           ? "VERIFIED_SUCCESS"
           : "AWAITING_FINAL_VERIFICATION",
       });
-  } else if (strategy.execution_strategy === "direct") {
-    const directEvidencePaths = directWritePaths(
-      [...new Set([
-        ...exploration.editableCandidates.map(({ path }) => path),
-        ...explicitTaskPaths(options.task, profile),
-      ])],
-      profile,
-      options.task,
-    );
-    const context =
-      strategy.execution_effort === "tiny" && strategy.preciseTarget
-        ? await compileTargetContext(
-            integration.path,
-            strategy.preciseTarget,
+    } else if (strategy.execution_strategy === "direct") {
+      const directEvidencePaths = directWritePaths(
+        [
+          ...new Set([
+            ...exploration.editableCandidates.map(({ path }) => path),
+            ...explicitTaskPaths(options.task, profile),
+          ]),
+        ],
+        profile,
+        options.task,
+      );
+      const context =
+        strategy.execution_effort === "tiny" &&
+        strategy.preciseTarget &&
+        profile.files.includes(strategy.preciseTarget) &&
+        !requestsTestMutation(options.task)
+          ? await compileTargetContext(
+              integration.path,
+              strategy.preciseTarget,
               options.task,
               options.config.context,
             )
-        : await compileContext(
-            integration.path,
-            options.task,
-            directEvidencePaths.length ? directEvidencePaths : ["."],
-            profile,
-            options.config.context,
-            true,
-          );
+          : await compileContext(
+              integration.path,
+              options.task,
+              directEvidencePaths.length ? directEvidencePaths : ["."],
+              profile,
+              options.config.context,
+              true,
+            );
       const subtask: Subtask = {
         id: "direct",
         title: options.task,
         objective: options.task,
         dependsOn: [],
         likelyReadPaths: strategy.likelyFiles,
-      likelyWritePaths: strategy.preciseTarget
-        ? [strategy.preciseTarget]
-        : directEvidencePaths.length
-          ? directEvidencePaths
-          : ["."],
+        likelyWritePaths:
+          strategy.preciseTarget && !requestsTestMutation(options.task)
+            ? [strategy.preciseTarget]
+            : directEvidencePaths.length
+              ? directEvidencePaths
+              : ["."],
         integrationContract:
           "Satisfy the original task while preserving existing public interfaces",
         verificationCommands: [],
@@ -954,8 +1168,12 @@ export async function run(options: RunOptions) {
         {
           codingWorker,
           compiledContext: context,
-          tinyDirect: strategy.execution_effort === "tiny",
-          finalVerificationOnly: strategy.execution_effort === "tiny",
+          tinyDirect:
+            strategy.execution_effort === "tiny" &&
+            !requestsTestMutation(options.task),
+          finalVerificationOnly:
+            strategy.execution_effort === "tiny" &&
+            !requestsTestMutation(options.task),
           evidence: sharedRoutingEvidence,
           canonicalTaskProfile: routingResume.profile,
           canonicalRoutingVerification: canonicalVerification,
@@ -965,9 +1183,7 @@ export async function run(options: RunOptions) {
       // Preserve the authoritative DIRECT target even when the worker returns
       // no diff. Build a bounded post-mutation verification context so source
       // -> test relationships can be proven without running the aggregate suite.
-      const directVerificationProfile = await profileRepo(
-        integration.path,
-      );
+      const directVerificationProfile = await profileRepo(integration.path);
 
       const directVerificationContext = await compileContext(
         integration.path,
@@ -1027,6 +1243,8 @@ export async function run(options: RunOptions) {
         throw Error(`direct: ${status}`);
       }
       await assertWriteResponsibility(integration.path, subtask);
+      reusableDirectVerification = result.verification;
+      reusableDirectChangeManifest = await backend.changes(integration.path);
       const revision = await backend.finalizeWorker(
         integration,
         `agent: ${options.task}`,
@@ -1057,7 +1275,30 @@ export async function run(options: RunOptions) {
       );
       const normalized = normalizePlan(rawPlan);
       const plan = normalized.plan;
-      const inferredDependencies = inferRepositoryDependencies(plan, exploration.dependencies);
+      if (requestsTestMutation(options.task)) {
+        // The planner may localize the implementation correctly while leaving
+        // its coupled test read-only. Add only tests related to each owned
+        // source path; never grant the same path to parallel workers twice.
+        const owned = new Set(
+          plan.subtasks.flatMap((task) => task.likelyWritePaths),
+        );
+        for (const task of plan.subtasks.filter((task) => !task.readOnly)) {
+          const coupled = directWritePaths(
+            task.likelyWritePaths,
+            profile,
+            options.task,
+          ).filter((path) => isTestPath(path) || path === "package.json");
+          for (const path of coupled) {
+            if (owned.has(path)) continue;
+            task.likelyWritePaths.push(path);
+            owned.add(path);
+          }
+        }
+      }
+      const inferredDependencies = inferRepositoryDependencies(
+        plan,
+        exploration.dependencies,
+      );
       for (const edge of inferredDependencies)
         logger.log("dependency_edge", edge);
       plannedSubtasks = normalized.before;
@@ -1174,6 +1415,8 @@ export async function run(options: RunOptions) {
                   plan.subtasks.length === 1 && !suffix
                     ? preselectedExecutionPlan
                     : undefined,
+                deferVerificationToIntegration:
+                  candidateTask.id.startsWith("bounded-"),
                 evidence: combineEvidence([
                   nodeRoutingEvidence,
                   ...inheritedEvidence,
@@ -1337,9 +1580,8 @@ export async function run(options: RunOptions) {
       );
     }
     const finalProfile = await profileRepo(integration.path);
-    const changed = (await backend.changes(integration.path)).map(
-      (c) => c.path,
-    );
+    const finalChangeManifest = await backend.changes(integration.path);
+    const changed = finalChangeManifest.map((c) => c.path);
     const verificationPaths = finalVerificationScope(
       changed,
       stableRepairContext?.subtask.likelyWritePaths ?? [],
@@ -1386,12 +1628,7 @@ export async function run(options: RunOptions) {
       ? await compileContext(
           integration.path,
           options.task,
-          [
-            ...new Set([
-              ...verificationPaths,
-              ...exploration.relatedTests,
-            ]),
-          ],
+          [...new Set([...verificationPaths, ...exploration.relatedTests])],
           finalProfile,
           options.config.context,
           true,
@@ -1399,21 +1636,13 @@ export async function run(options: RunOptions) {
       : undefined;
 
     const verificationRelationships = impactContext
-      ? verificationImpactRelationships(
-          verificationPaths,
-          impactContext,
-        )
+      ? verificationImpactRelationships(verificationPaths, impactContext)
       : [];
 
     const verificationSubtask =
-      stableRepairContext?.subtask ??
-      directRepairContext?.subtask;
+      stableRepairContext?.subtask ?? directRepairContext?.subtask;
 
-    if (
-      !taskVerificationIsFocused &&
-      verificationSubtask &&
-      impactContext
-    ) {
+    if (!taskVerificationIsFocused && verificationSubtask && impactContext) {
       const finalFocusedCheck = focusedVerificationCheck(
         {
           ...verificationSubtask,
@@ -1478,17 +1707,63 @@ export async function run(options: RunOptions) {
         : candidate,
     );
     let finalBaseline: VerificationResult | undefined;
+    let reusableRepairVerification: VerificationResult | undefined;
+    let reusableRepairChangeManifest: FileChange[] | undefined;
     const runFinalVerification = async () => {
       const finalVerificationStarted = Date.now();
-      let executable = await verify(
+      const currentManifest = JSON.stringify(
+        await backend!.changes(integration!.path),
+      );
+      const reusableSource =
+        reusableRepairVerification &&
+        JSON.stringify(reusableRepairChangeManifest) === currentManifest
+          ? reusableRepairVerification
+          : reusableDirectVerification &&
+              JSON.stringify(reusableDirectChangeManifest) === currentManifest
+            ? reusableDirectVerification
+            : undefined;
+      const reusable =
+        reusableSource?.checks.filter((check) => {
+          const expectedCwd =
+            finalCandidates.find(
+              (candidate) => candidate.command === check.command,
+            )?.cwd ?? ".";
+          return (
+            check.outcome === "CHECK_PASS" &&
+            finalCommands.includes(check.command) &&
+            (check.cwd ?? ".") === expectedCwd
+          );
+        }) ?? [];
+      const reusedCommands = new Set(reusable.map((check) => check.command));
+      const pendingCommands = finalCommands.filter(
+        (command) => !reusedCommands.has(command),
+      );
+      const pendingCandidates = finalCandidates.filter((candidate) =>
+        pendingCommands.includes(candidate.command),
+      );
+      if (reusable.length)
+        logger.log("verification_reused", {
+          phase: "final",
+          commands: [...reusedCommands],
+          reason:
+            "the verified candidate manifest is byte-identical to the final integration state",
+        });
+      for (const check of reusable)
+        logger.log("final_verification", {
+          ...check,
+          reused: true,
+          source: `${check.source ?? "candidate_verification"}:byte_identical_reuse`,
+        });
+      const pending = await verify(
         integration!.path,
-        finalCommands,
+        pendingCommands,
         () => Math.min(options.config.commandTimeoutMs, budget.remainingMs()),
         (c) => logger.log("final_verification", c as any),
         undefined,
-        finalCandidates,
+        pendingCandidates,
       );
-      if (executable.checks.some((check) => check.outcome !== "CHECK_PASS")) {
+      let executable = verificationResult([...reusable, ...pending.checks]);
+      if (executable.checks.some((check) => check.outcome === "CHECK_FAIL")) {
         finalBaseline ??= await verify(
           backend!.baselinePath,
           finalCommands,
@@ -1513,6 +1788,31 @@ export async function run(options: RunOptions) {
           phase: "final",
           checks: unavailableChecks,
         });
+      const currentChangedPaths = (
+        await backend!.changes(integration!.path)
+      ).map((change) => change.path);
+      const testGap = missingRequestedTestVerification(
+        options.task,
+        currentChangedPaths,
+        executable,
+        finalProfile.scripts?.test,
+      );
+      if (testGap) {
+        const check = {
+          command: "internal:requested-test-execution",
+          source: "deterministic:requested-test-contract",
+          kind: "test" as const,
+          outcome: "CHECK_FAIL" as const,
+          exitCode: 1,
+          stdout: "",
+          stderr: testGap,
+          wallClockMs: 0,
+          timedOut: false,
+          requirement: "required" as const,
+        };
+        logger.log("final_verification", check);
+        executable = verificationResult([...executable.checks, check]);
+      }
       if (!tinyDocs) {
         logger.log("latency", {
           final_verification_ms: Date.now() - finalVerificationStarted,
@@ -1575,21 +1875,47 @@ export async function run(options: RunOptions) {
             previousExploration: exploration,
             continuationReason: `Verification revealed missing repository context:\n${truncateBytes(diagnostics, 4_000)}`,
           });
-          const existing = new Set(exploration.editableCandidates.map(({ path }) => path));
-          const added = continued.editableCandidates.filter(({ path }) => !existing.has(path));
+          const existing = new Set(
+            exploration.editableCandidates.map(({ path }) => path),
+          );
+          const added = continued.editableCandidates.filter(
+            ({ path }) => !existing.has(path),
+          );
           if (added.length) {
             exploration = {
               confidence: continued.confidence,
-              editableCandidates: [...exploration.editableCandidates, ...added].slice(0, 12),
-              readonlyFiles: [...exploration.readonlyFiles, ...continued.readonlyFiles]
-                .filter(({ path }, index, values) => values.findIndex((item) => item.path === path) === index)
+              editableCandidates: [
+                ...exploration.editableCandidates,
+                ...added,
+              ].slice(0, 12),
+              readonlyFiles: [
+                ...exploration.readonlyFiles,
+                ...continued.readonlyFiles,
+              ]
+                .filter(
+                  ({ path }, index, values) =>
+                    values.findIndex((item) => item.path === path) === index,
+                )
                 .slice(0, 16),
-              relatedTests: [...new Set([...exploration.relatedTests, ...continued.relatedTests])].slice(0, 12),
-              dependencies: [...exploration.dependencies, ...continued.dependencies].slice(0, 24),
-              evidence: [...exploration.evidence, ...continued.evidence].slice(0, 24),
+              relatedTests: [
+                ...new Set([
+                  ...exploration.relatedTests,
+                  ...continued.relatedTests,
+                ]),
+              ].slice(0, 12),
+              dependencies: [
+                ...exploration.dependencies,
+                ...continued.dependencies,
+              ].slice(0, 24),
+              evidence: [...exploration.evidence, ...continued.evidence].slice(
+                0,
+                24,
+              ),
               unresolvedQuestions: continued.unresolvedQuestions,
             };
-            const expanded = exploration.editableCandidates.map(({ path }) => path);
+            const expanded = exploration.editableCandidates.map(
+              ({ path }) => path,
+            );
             logger.log("scope_expansion_required", {
               reason: "verification_missing_context",
               requested_paths: added.map(({ path }) => path),
@@ -1597,11 +1923,13 @@ export async function run(options: RunOptions) {
             });
             if (stableRepairContext) {
               stableRepairContext.subtask.likelyWritePaths = expanded;
-              stableRepairContext.subtask.likelyReadPaths = [...new Set([
-                ...expanded,
-                ...exploration.readonlyFiles.map(({ path }) => path),
-                ...exploration.relatedTests,
-              ])];
+              stableRepairContext.subtask.likelyReadPaths = [
+                ...new Set([
+                  ...expanded,
+                  ...exploration.readonlyFiles.map(({ path }) => path),
+                  ...exploration.relatedTests,
+                ]),
+              ];
               stableRepairContext.context = await compileContext(
                 integration.path,
                 options.task,
@@ -1614,11 +1942,13 @@ export async function run(options: RunOptions) {
             }
             if (directRepairContext) {
               directRepairContext.subtask.likelyWritePaths = expanded;
-              directRepairContext.subtask.likelyReadPaths = [...new Set([
-                ...expanded,
-                ...exploration.readonlyFiles.map(({ path }) => path),
-                ...exploration.relatedTests,
-              ])];
+              directRepairContext.subtask.likelyReadPaths = [
+                ...new Set([
+                  ...expanded,
+                  ...exploration.readonlyFiles.map(({ path }) => path),
+                  ...exploration.relatedTests,
+                ]),
+              ];
               directRepairContext.context = await compileContext(
                 integration.path,
                 options.task,
@@ -1990,6 +2320,10 @@ export async function run(options: RunOptions) {
           throw Error(
             "Stable repair removed all task changes; baseline restoration is not verified completion",
           );
+        reusableRepairVerification = targeted;
+        reusableRepairChangeManifest = JSON.parse(
+          verifiedRepairState,
+        ) as FileChange[];
         const finalRepairVerification = await runFinalVerification().catch(
           async (error) => {
             await repairCheckpoint.restore(integration!.path, repairScope);
@@ -2145,27 +2479,96 @@ export async function run(options: RunOptions) {
           break;
       }
     }
-    if (strategy.execution_strategy === "planned" &&
-      logger.events.some((event) => event.type === "bounded_task_decomposition")) {
+    if (
+      strategy.execution_strategy === "planned" &&
+      logger.events.some((event) => event.type === "bounded_task_decomposition")
+    ) {
       const changed = await backend.changes(integration.path);
       const diff = truncateBytes(await currentDiff(integration.path), 8_000);
-      const reviewModel = preselectedExecutionPlan?.initialModel ?? options.config.registry.STRONG_MODEL;
+      const reviewModel =
+        preselectedExecutionPlan?.initialModel ??
+        options.config.registry.STRONG_MODEL;
       const reviewGroups = taskSpec.parts.flatMap((part) => {
         const requirements = compileTaskSpec(part).requirements;
-        return Array.from({ length: Math.ceil(requirements.length / 8) }, (_, index) =>
-          requirements.slice(index * 8, (index + 1) * 8).join("\n"));
+        return Array.from(
+          { length: Math.ceil(requirements.length / 8) },
+          (_, index) =>
+            requirements.slice(index * 8, (index + 1) * 8).join("\n"),
+        );
       });
       for (const [index, part] of reviewGroups.entries()) {
-        const requirements = taskRequirementChecklist({ task: part, objective: "", integrationContract: "", acceptanceCriteria: [] });
-        const message = await gateway.call(reviewModel, completionReviewMessages({ task: part, requirements, diff,
-          changedPaths: changed.map((change) => change.path), changedSymbols: [], workerExitStatus: "completed",
-          verification }), `bounded-final-${index}`, "completion-review", 0, undefined, { maxOutputTokens: 1000 });
-        const review = parseCompletionReview(String(message.content ?? ""), requirements);
-        logger.log("completion_review", { subtaskId: `bounded-final-${index}`, ...review });
-        if (!review.passed) throw Error("Decomposed task failed final requirement review");
+        const requirements = taskRequirementChecklist({
+          task: part,
+          objective: "",
+          integrationContract: "",
+          acceptanceCriteria: [],
+        });
+        for (const [batchIndex, batch] of completionReviewBatches(
+          requirements,
+          options.config.maxOutputTokens,
+        ).entries()) {
+          let review = parseCompletionReview("", batch);
+          for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+              const message = await gateway.call(
+                reviewModel,
+                completionReviewMessages({
+                  task: part,
+                  requirements: batch,
+                  diff,
+                  changedPaths: changed.map((change) => change.path),
+                  changedSymbols: [],
+                  workerExitStatus: "completed",
+                  verification,
+                }),
+                `bounded-final-${index}-${batchIndex}`,
+                "completion-review",
+                attempt,
+                attempt === 0 ? [completionReviewTool(batch)] : undefined,
+                {
+                  maxOutputTokens: completionReviewOutputTokens(
+                    batch.length,
+                    options.config.maxOutputTokens,
+                    attempt > 0,
+                  ),
+                  requireTool: attempt === 0,
+                  responseFormat:
+                    attempt > 0
+                      ? completionReviewResponseFormat(batch)
+                      : undefined,
+                  disableReasoning: true,
+                  timeoutMs: 30_000,
+                },
+              );
+              review = parseCompletionReview(
+                completionReviewPayload(message),
+                batch,
+              );
+              if (!review.protocolFailure) break;
+            } catch (error) {
+              if (attempt === 1)
+                throw Error(
+                  `INFRA_FAILURE: completion reviewer request failed: ${String(error)}`,
+                );
+            }
+          }
+          if (review.protocolFailure)
+            throw Error(
+              "INFRA_FAILURE: completion reviewer protocol failed after structured retry",
+            );
+          logger.log("completion_review", {
+            subtaskId: `bounded-final-${index}-${batchIndex}`,
+            ...review,
+          });
+          if (!review.passed)
+            throw Error("Decomposed task failed final requirement review");
+        }
       }
     }
-    const completionGate = completionReviewGate(verification.status, logger.events);
+    const completionGate = completionReviewGate(
+      verification.status,
+      logger.events,
+    );
     if (completionGate.unresolved.length) {
       status = completionGate.status;
       logger.log("completion_requirements_unresolved", {
@@ -2174,12 +2577,16 @@ export async function run(options: RunOptions) {
       });
       throw Error(
         `Completion requirements remain unresolved: ${completionGate.unresolved
-          .map(({ subtaskId, requirementIds }) =>
-            `${subtaskId} (${requirementIds.join(", ")})`)
+          .map(
+            ({ subtaskId, requirementIds }) =>
+              `${subtaskId} (${requirementIds.join(", ")})`,
+          )
           .join("; ")}`,
       );
     }
     status = completionGate.status;
+    if (status === "VERIFIED_SUCCESS")
+      verifiedChanges = await backend.changes(integration.path);
     const unavailable = verification.checks.find(
       (check) =>
         (check.requirement ?? "required") === "required" &&
@@ -2199,7 +2606,11 @@ export async function run(options: RunOptions) {
     }
   } catch (e) {
     const message = String(e);
-    if (/Verification infrastructure unavailable/i.test(message))
+    if (
+      /Verification infrastructure unavailable|INFRA_FAILURE: completion reviewer/i.test(
+        message,
+      )
+    )
       status = "NOT_FULLY_VERIFIED";
     else if (status === "VERIFIED_SUCCESS") status = "FAILED";
     error = message;
@@ -2212,6 +2623,11 @@ export async function run(options: RunOptions) {
         changes: await backend.persistCandidate(output, integration),
       };
       if (
+        status === "VERIFIED_SUCCESS" &&
+        JSON.stringify(applyResult.changes) !== JSON.stringify(verifiedChanges)
+      )
+        throw Error("Verified candidate changed after final verification");
+      if (
         acceptedRepairState !== undefined &&
         JSON.stringify(applyResult.changes) !== acceptedRepairState
       ) {
@@ -2222,22 +2638,82 @@ export async function run(options: RunOptions) {
         output,
         integration,
         status === "VERIFIED_SUCCESS",
+        verifiedChanges,
       );
       if (
         options.apply &&
         status === "VERIFIED_SUCCESS" &&
         applyResult.status !== "applied"
       )
-        throw Error("Verified state was not applied to the target repository");
+        throw Error(
+          `APPLY_CONFLICT: Verified state was not applied: ${applyResult.conflicts.join(", ")}`,
+        );
+      if (applyResult.status === "applied") {
+        verification = await verifyAppliedRepository(
+          repo,
+          verification,
+          options.config.commandTimeoutMs,
+          (check) => logger.log("applied_verification", check as any),
+          applyResult.changes,
+        );
+        await assertCandidateMatches(repo, applyResult.changes);
+        status = verification.status;
+        if (status !== "VERIFIED_SUCCESS") {
+          applyResult.status = "verification_failed";
+          error =
+            "Verification of applied changes in the original repository did not pass";
+        }
+        const artifactPath = join(output, "workspace.json");
+        const artifact = JSON.parse(await readFile(artifactPath, "utf8"));
+        await writeFile(
+          artifactPath,
+          JSON.stringify(
+            {
+              ...artifact,
+              applyStatus: applyResult.status,
+              appliedVerification: verification,
+            },
+            null,
+            2,
+          ),
+        );
+        if (status !== "VERIFIED_SUCCESS") {
+          applyRollback = await rollbackAppliedRun(output);
+          logger.log("apply_rollback", applyRollback);
+        }
+      }
     } catch (e) {
       status = "FAILED";
       error = `${error ? error + "; " : ""}Apply preparation failed: ${String(e)}`;
-      applyResult = {
-        requested: !!options.apply,
-        status: "not_verified",
-        conflicts: [],
-        changes: applyResult.changes,
-      };
+      if (applyResult.status === "applied") {
+        applyResult.status = "verification_failed";
+        const artifactPath = join(output, "workspace.json");
+        const artifact = JSON.parse(await readFile(artifactPath, "utf8"));
+        await writeFile(
+          artifactPath,
+          JSON.stringify(
+            {
+              ...artifact,
+              applyStatus: "verification_failed",
+              applyError: String(e),
+            },
+            null,
+            2,
+          ),
+        );
+        applyRollback = await rollbackAppliedRun(output);
+        logger.log("apply_rollback", applyRollback);
+      }
+      applyResult =
+        applyResult.status === "conflict" ||
+        applyResult.status === "verification_failed"
+          ? applyResult
+          : {
+              requested: !!options.apply,
+              status: "not_verified",
+              conflicts: [],
+              changes: applyResult.changes,
+            };
       logger.log("apply", { status: "not_verified", error: String(e) });
     }
     logger.log("changes", {
@@ -2260,7 +2736,221 @@ export async function run(options: RunOptions) {
   const candidatePatchPath = candidateProduced
     ? join(output, "candidate.patch")
     : null;
+  let failureAttribution: ReturnType<typeof collectFailureAttributions> | null =
+    null;
+  if (options.failureAttributionShadow !== false) {
+    try {
+      failureAttribution = collectFailureAttributions(logger.events, runId);
+      for (const attribution of failureAttribution.attributions)
+        logger.log("failure_attribution", { mode: "shadow", attribution });
+      await writeFile(
+        join(output, "failure-attribution.json"),
+        JSON.stringify(failureAttribution, null, 2),
+      );
+    } catch (attributionError) {
+      logger.log("failure_attribution_error", {
+        mode: "shadow",
+        classification: "OPERATIONAL_FAILURE",
+        error: String(attributionError),
+      });
+    }
+  }
+  if (
+    poolRouter &&
+    options.routingV1Shadow !== false &&
+    !options.syntheticTelemetry &&
+    !options.offlineCalibration
+  ) {
+    try {
+      const shadowHistory = new RoutingV1History(
+        routerStateDirectory(options.config),
+      );
+      const decisions = logger.events.filter(
+        (e) => e.type === "routing_v1_shadow_decision",
+      );
+      for (const [index, row] of poolRouter.history
+        .readEfficiency()
+        .filter((r) => r.runId === runId)
+        .entries()) {
+        const decision = (
+          decisions.findLast((e) => e.subtaskId === row.subtaskId) ??
+          decisions.findLast(
+            (e) =>
+              e.decision.fingerprint.executionStrategy ===
+              row.fingerprint?.executionStrategy,
+          )
+        )?.decision;
+        if (!decision || !row.fingerprint) continue;
+        // Match attribution by stable event identity and the actual worker model.
+        const related = failureAttribution?.attributions.filter((a) =>
+          a.evidence.some((proof) => {
+            const eventIndex = Number(proof.eventId?.split(":event:")[1]);
+            if (!Number.isInteger(eventIndex)) return false;
+            const event = logger.events[eventIndex];
+            if (event?.subtaskId !== row.subtaskId) return false;
+            const worker = logger.events
+              .slice(0, eventIndex + 1)
+              .findLast(
+                (e) =>
+                  e.type === "coding_worker_start" &&
+                  e.subtaskId === row.subtaskId,
+              );
+            return worker?.model === row.modelRequested;
+          }),
+        );
+        const invocations = logger.events.filter(
+          (e) =>
+            e.type === "coding_worker_start" &&
+            e.subtaskId === row.subtaskId &&
+            e.model === row.modelRequested,
+        );
+        const attribution =
+          related?.length === 1 && invocations.length === 1
+            ? related[0]
+            : undefined;
+        const success = qualityLearningLabel(
+          row.verification === "VERIFIED_SUCCESS" &&
+            (status !== "VERIFIED_SUCCESS" ||
+              contradictoryPositiveEvidence(row))
+            ? "NOT_FULLY_VERIFIED"
+            : row.verification,
+          attribution,
+        );
+        logger.log("routing_v1_learning", {
+          mode: "shadow",
+          model: row.modelRequested,
+          disposition:
+            success === null ? "CENSORED" : success ? "POSITIVE" : "NEGATIVE",
+          attribution,
+        });
+        if (success === null || row.costUsd === null) continue;
+        shadowHistory.record({
+          id: `${runId}:${row.subtaskId}:${index}`,
+          taskId: runId,
+          model: row.modelServed ?? row.modelRequested,
+          modelFamily: (row.modelServed ?? row.modelRequested).split("/")[0]!,
+          taskFamily: decision.family,
+          complexity: decision.assessment.implementationComplexity,
+          engine: row.fingerprint.executionStrategy,
+          source: "local",
+          provenance: `${output}/summary.json`,
+          success,
+          outcome: success ? "VERIFIED_SUCCESS" : "FAILED",
+          attribution,
+          costUsd: row.costUsd,
+          wallClockMs: row.wallClockMs,
+        });
+      }
+    } catch (error) {
+      logger.log("routing_v1_learning_failure", {
+        mode: "shadow",
+        error: String(error),
+      });
+    }
+  }
+  if (
+    poolRouter &&
+    options.routingV1Shadow !== false &&
+    !options.syntheticTelemetry &&
+    !options.offlineCalibration &&
+    !options.codingWorkerFactory &&
+    !options.repositoryExplorerFactory
+  ) {
+    try {
+      const rows = poolRouter.history
+        .readEfficiency()
+        .filter((r) => r.runId === runId);
+      const invocations = logger.events.filter(
+        (e) => e.type === "coding_worker_start",
+      );
+      for (const row of rows) {
+        if (!row.fingerprint || !row.modelServed) continue;
+        const related = failureAttribution?.attributions.filter((a) =>
+          a.evidence.some((proof) => {
+            const index = Number(proof.eventId?.split(":event:")[1]);
+            const e = logger.events[index];
+            return (
+              e?.subtaskId === row.subtaskId &&
+              logger.events
+                .slice(0, index + 1)
+                .findLast(
+                  (e) =>
+                    e.type === "coding_worker_start" &&
+                    e.subtaskId === row.subtaskId,
+                )?.model === row.modelRequested
+            );
+          }),
+        );
+        const attribution =
+          related?.length === 1 && invocations.length === 1
+            ? related[0]
+            : undefined;
+        const proven =
+          status === "VERIFIED_SUCCESS" &&
+          !contradictoryPositiveEvidence(row) &&
+          invocations.length === 1 &&
+          logger.events.some(
+            (e) =>
+              e.type === "completion_review" &&
+              e.subtaskId === row.subtaskId &&
+              e.independentRequirementProof === true &&
+              e.passed === true,
+          );
+        const observation = adaptHistoricalQualityOutcome(row, {
+          task: canonicalRoutingTask({
+            text: options.task,
+            semantic: lexicalTask(options.task),
+            fingerprint: row.fingerprint,
+            harness: "koda",
+          }),
+          provenance: join(output, "summary.json"),
+          exactRevision: row.modelServed,
+          proof: proven
+            ? { independent: true, requirementLevel: true }
+            : undefined,
+          attribution,
+        });
+        if (observation)
+          new CanonicalRoutingKnowledgeStore().record(observation);
+        logger.log("routing_contextual_learning", {
+          mode: "shadow",
+          disposition: observation ? "ADMITTED" : "CENSORED",
+          model: row.modelServed,
+        });
+      }
+    } catch (error) {
+      logger.log("routing_contextual_learning_failure", {
+        mode: "shadow",
+        classification: "OPERATIONAL_FAILURE",
+        error: String(error),
+      });
+    }
+  }
   const summary = {
+    routingV1:
+      options.routingV1Shadow === false
+        ? null
+        : {
+            mode: "shadow",
+            decisions: logger.events.filter(
+              (e) =>
+                e.type === "routing_v1_shadow_decision" ||
+                e.type === "routing_v1_shadow_joint_decision",
+            ),
+            learning: logger.events.filter(
+              (e) => e.type === "routing_v1_learning",
+            ),
+          },
+    failureAttribution,
+    verificationContract:
+      logger.events.findLast((event) => event.type === "verification_contract")
+        ?.contract ?? null,
+    taskAssessment:
+      logger.events.findLast((event) => event.type === "task_assessment")
+        ?.assessment ?? null,
+    ...(options.syntheticTelemetry
+      ? { synthetic: true, provider: "scripted-local" }
+      : {}),
     ...summarize(
       logger,
       status,
@@ -2289,8 +2979,14 @@ export async function run(options: RunOptions) {
     applyRequested: applyResult.requested,
     applyResult: applyResult.status,
     applyConflicts: applyResult.conflicts,
-    revertStatus: "not_requested",
-    revertConflicts: [],
+    applyVerificationTimeoutMs: options.config.commandTimeoutMs,
+    ...(applyRollback ? { applyRollback } : {}),
+    revertStatus: applyRollback
+      ? applyRollback.status === "REVERTED"
+        ? "reverted"
+        : "conflict"
+      : "not_requested",
+    revertConflicts: applyRollback?.conflicts ?? [],
     integration: integration
       ? { path: integration.path, branch: integration.branch }
       : undefined,

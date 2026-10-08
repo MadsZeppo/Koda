@@ -210,22 +210,24 @@ test("10 generic test requests retain related tests as readonly context", async 
   assert.ok(evidence.relatedTests.includes("tests/planner.test.ts"));
 });
 
-test("11 OpenHands receives twelve iterations instead of the historical six", async (t) => {
+test("11 OpenHands exploration is bounded so coding and review retain the run budget", async (t) => {
   const f = await fixture(t);
   let invocation: OpenHandsInvocation | undefined;
   await new OpenHandsExplorer(f.gateway, {
     runner: async (value) => { invocation = value; return report(); },
   }).explore({ repoPath: f.root, task: "Locate task summary normalization", profile: f.profile });
-  assert.equal(invocation?.maxIterations, 12);
+  assert.equal(invocation?.maxIterations, 6);
+  assert.equal(invocation?.maxFilesRead, 16);
 });
 
-test("12 OpenHands total timeout is no longer capped at thirty seconds", async (t) => {
+test("12 OpenHands total timeout is bounded below the coding critical path", async (t) => {
   const f = await fixture(t);
   let invocation: OpenHandsInvocation | undefined;
   await new OpenHandsExplorer(f.gateway, {
     runner: async (value) => { invocation = value; return report(); },
   }).explore({ repoPath: f.root, task: "Locate task summary normalization", profile: f.profile });
-  assert.ok((invocation?.timeoutMs ?? 0) > 30_000);
+  assert.ok((invocation?.timeoutMs ?? 0) <= 45_000);
+  assert.ok((invocation?.timeoutMs ?? 0) >= 30_000);
 });
 
 test("13 injected OpenHands operational failure stays operational and never fabricates root scope", async (t) => {

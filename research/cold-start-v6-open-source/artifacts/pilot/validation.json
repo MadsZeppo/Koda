@@ -1,0 +1,25 @@
+{
+  "phase": "post-evaluation implementation audit, not a pre-evaluation freeze",
+  "sources": {
+    "research/cold-start-v6-open-source/src/twin.py": "73b12a9422af0ee306a1b4c8e2dc2b4400ea7dbc51ccf070f00eb6302d3be455",
+    "research/cold-start-v6-open-source/src/replay.ts": "e3ad4a4900b1db393b58f340e482407918731be28f3e1b0256daf7204abffbe6",
+    "research/cold-start-v6-open-source/src/experiment.py": "5c851ff08920a8c64f544d60ba13b46f99c8ef8886cc1f9299c0de1e2c6a8e91",
+    "research/cold-start-v6-open-source/src/sources.py": "e0c76271d876328ee9c63ba59137e44bedf6e773a8f72d77017e1b3164df7fd2",
+    "research/cold-start-v6-open-source/src/encode.ts": "93ced98d83154373a02e7ee58cf309c1deebd16b83111722a6860b2497c625c6",
+    "research/cold-start-v6-open-source/src/test_v6.py": "beee2694961d4fe5e82de95f83f6293454de0c9dab0c35a0433b211cd6d52baa"
+  },
+  "tests": {
+    "focusedTS": 46,
+    "newV6TS": 19,
+    "researchPython": 8,
+    "full": {
+      "total": 1098,
+      "passed": 1097,
+      "skipped": 1,
+      "failed": 0
+    },
+    "typecheck": "PASS"
+  },
+  "paidCalls": 0,
+  "productionAuthority": "unchanged"
+}

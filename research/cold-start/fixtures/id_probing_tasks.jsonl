@@ -1,0 +1,6 @@
+{"task_id": "probing-0", "split": "probing", "source_split": "train", "dimension": "arithmetic", "prompt": "compute sum integer math example 0"}
+{"task_id": "probing-1", "split": "probing", "source_split": "train", "dimension": "arithmetic", "prompt": "compute sum integer math example 1"}
+{"task_id": "probing-2", "split": "probing", "source_split": "train", "dimension": "arithmetic", "prompt": "compute sum integer math example 2"}
+{"task_id": "probing-3", "split": "probing", "source_split": "train", "dimension": "text_processing", "prompt": "parse string text tokens example 3"}
+{"task_id": "probing-4", "split": "probing", "source_split": "train", "dimension": "text_processing", "prompt": "parse string text tokens example 4"}
+{"task_id": "probing-5", "split": "probing", "source_split": "train", "dimension": "text_processing", "prompt": "parse string text tokens example 5"}

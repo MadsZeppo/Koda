@@ -27,9 +27,13 @@ async function fixture(t: any) {
   const root = await mkdtemp(join(tmpdir(), "koda-aider-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const previous = process.env.OPENROUTER_API_KEY;
+  const previousMode = process.env.KODA_PROVIDER_MODE;
+  process.env.KODA_PROVIDER_MODE = 'direct-openrouter';
   process.env.OPENROUTER_API_KEY = "test-secret-not-paid";
   t.after(() => { if (previous === undefined) delete process.env.OPENROUTER_API_KEY;
-    else process.env.OPENROUTER_API_KEY = previous; });
+    else process.env.OPENROUTER_API_KEY = previous;
+    if (previousMode === undefined) delete process.env.KODA_PROVIDER_MODE;
+    else process.env.KODA_PROVIDER_MODE = previousMode; });
   await mkdir(join(root, "src"));
   await writeFile(join(root, "src/value.cjs"), "module.exports = 1;\n");
   await writeFile(join(root, "src/other.cjs"), "module.exports = 1;\n");
@@ -97,6 +101,69 @@ test("Aider's explicit output-limit warning is recognized without a bridge flag"
   }).run(input(root));
   assert.equal(result.limitKind, "output_limit");
   assert.notEqual(result.terminationReason, "no_mutation");
+});
+
+test("provider output-limit evidence overrides a later Aider runtime wrapper failure", async (t) => {
+  const root = await fixture(t);
+  const result = await worker(root, async (_cwd, invocation) => {
+    await report(invocation, "diff", "runtime");
+    await writeFile(invocation.ledgerPath, JSON.stringify({ costUsd: .001,
+      inputTokens: 8909, outputTokens: 4096, tokens: 13005, steps: 1,
+      outputLimitReached: true }));
+    return { ...success, exitCode: 1,
+      stderr: "KODA_AIDER_RUNTIME_ERROR Backend mode prohibits browser/OAuth authentication" };
+  }).run(input(root));
+  assert.equal(result.exitStatus, "failed");
+  assert.equal(result.terminationReason, "output_limit");
+  assert.equal(result.limitKind, "output_limit");
+});
+
+test("output limit without a frozen fallback retries the same model through bounded Agentic context", async (t) => {
+  const root = await fixture(t);
+  await mkdir(join(root, "tests"));
+  await writeFile(join(root, "tests/value.test.cjs"),
+    "const {test}=require('node:test');const a=require('node:assert/strict');test('value',()=>a.equal(require('../src/value.cjs'),3));\n");
+  const cfg = await config(undefined, { forceModel: "foo/bar", maxIterations: 1,
+    modelPool: { provider: "openrouter", models: [
+      { id: "foo/bar", tier: "cheap", qualityPrior: .99, strengths: ["coding", "tool_use"] },
+    ] } });
+  const logger = new Logger(join(root, ".koda"), "same-model-output-recovery", true);
+  let calls = 0;
+  const codingWorker: CodingWorker = { engine: "aider", async run(workerInput) {
+    calls++;
+    if (calls === 1) return {
+      exitStatus: "failed" as const, model: workerInput.model, engine: "aider" as const,
+      engineVersion: "test",
+      changedPaths: [], wallClockMs: 1, inputTokens: 100, outputTokens: 1000,
+      terminationReason: "output_limit", limitKind: "output_limit" as const,
+      exactLimitFired: "provider_output_limit",
+    };
+    assert.equal(workerInput.model, "foo/bar");
+    assert.deepEqual(workerInput.context?.implementationRecovery, { reason: "output_limit" });
+    await writeFile(join(root, "src/value.cjs"), "module.exports = 3;\n");
+    return {
+      exitStatus: "completed" as const, model: workerInput.model, engine: "agentic" as const,
+      engineVersion: "test",
+      changedPaths: ["src/value.cjs"], wallClockMs: 1, inputTokens: 20, outputTokens: 20,
+      terminationReason: "first_mutation",
+    };
+  } };
+  const gateway: any = { config: cfg, logger, budget: new Budget(1, 100000, 60000) };
+  const subtask: any = { id: "direct", title: "Fix value", objective: "Make value equal 3",
+    likelyReadPaths: ["src/value.cjs"], likelyWritePaths: ["src/value.cjs"], dependsOn: [],
+    integrationContract: "value equals 3", verificationCommands: ["node --test tests/value.test.cjs"],
+    estimatedDifficulty: "normal", parallelSafe: false };
+  const result = await implement(gateway, root, subtask.objective, subtask,
+    { acceptanceCriteria: ["value equals 3"] },
+    { files: ["src/value.cjs", "tests/value.test.cjs"], verificationCommands: subtask.verificationCommands } as any,
+    { model: "foo/bar", codingWorker, compiledContext: {
+      files: [{ path: "src/value.cjs", snippet: "module.exports = 1" }],
+      localDependencies: [], completePaths: ["src/value.cjs"], repoMap: ["src/value.cjs"],
+    } as any });
+  assert.equal(calls, 2);
+  assert.equal(result.verification.status, "VERIFIED_SUCCESS");
+  assert.ok(logger.events.some((event) => event.type === "complete_packet_execution_mode_fallback" &&
+    event.from === "aider" && event.to === "agentic"));
 });
 
 test("Aider file handoff keeps grounded source editable and tests/read context read-only", () => {
@@ -325,6 +392,37 @@ test("Aider receives native identifiers, temporary metadata, controlled secondar
   await assert.rejects(readFile(scratchFile));
 });
 
+test('Aider backend mode sends only the public SDK credential and backend endpoint to its bridge', async (t) => {
+  const root = await fixture(t);
+  const priorUrl = process.env.KODA_API_URL;
+  process.env.KODA_PROVIDER_MODE = 'backend';
+  process.env.KODA_API_URL = 'http://127.0.0.1:8787';
+  delete process.env.OPENROUTER_API_KEY;
+  t.after(() => { if (priorUrl === undefined) delete process.env.KODA_API_URL; else process.env.KODA_API_URL = priorUrl; });
+  let dispatched = false;
+  const result = await worker(root, async (cwd, invocation) => {
+    dispatched = true;
+    assert.equal(invocation.env.OPENROUTER_API_KEY, undefined);
+    assert.equal(invocation.env.KODA_PROVIDER_API_KEY, 'koda-backend-client');
+    assert.equal(invocation.env.OPENAI_API_KEY, 'koda-backend-client');
+    assert.equal(invocation.env.OPENAI_API_BASE, 'http://127.0.0.1:8787/v1');
+    assert.equal(invocation.model, 'openai/foo/bar');
+    for (const flag of ['--model', '--weak-model', '--editor-model'])
+      assert.equal(invocation.args[invocation.args.indexOf(flag) + 1], 'openai/foo/bar');
+    const request = JSON.parse(await readFile(invocation.args[2]!, 'utf8'));
+    assert.equal(request.baseUrl, 'http://127.0.0.1:8787/v1');
+    assert.equal(request.model, 'openai/foo/bar');
+    assert.equal(request.routedModel, 'foo/bar');
+    assert.equal(request.providerMode, 'backend');
+    assert.equal(JSON.stringify(request).includes('test-secret-not-paid'), false);
+    await writeFile(join(cwd, 'src/value.cjs'), 'module.exports = 3;\n');
+    await report(invocation, 'diff'); return success;
+  }).run({ ...input(root), baseUrl: 'https://openrouter.ai/api/v1' });
+  assert.equal(dispatched, true);
+  assert.equal(result.exitStatus, 'completed');
+  assert.deepEqual(result.changedPaths, ['src/value.cjs']);
+});
+
 for (const first of ["diff", "whole"] as const) test(`${first} retries exactly once with the alternate format on malformed edits`, async (t) => {
   const root = await fixture(t);
   const formats: string[] = [];
@@ -546,7 +644,7 @@ test("completion review keeps the full write scope and continues partial work in
         ["src/outcome.cjs", "src/wiring.cjs", "tests/outcome.test.cjs"]);
       assert.match(workerInput.context?.diagnostics ?? "", /unresolved requirements/);
       assert.equal(workerInput.context?.completionRepair?.mutationRequiredBeforeDiscovery, true);
-      assert.ok(workerInput.context?.completionRepair?.unresolvedRequirementIds.includes("R2"));
+      assert.ok(workerInput.context?.completionRepair?.unresolvedRequirementIds.includes("R3"));
       assert.equal(workerInput.context?.completionRepair?.unresolvedRequirementIds.includes("R1"), false);
       assert.match(workerInput.context?.previousFailedDiff ?? "", /outcome\.cjs/);
       await writeFile(join(root, "src/wiring.cjs"), "module.exports = require('./outcome.cjs');\n");
@@ -568,18 +666,58 @@ test("completion review keeps the full write scope and continues partial work in
     { files: ["src/wiring.cjs", "tests/outcome.test.cjs"], verificationCommands: ["node --test tests/outcome.test.cjs"] } as any,
     { model: "foo/bar", codingWorker, completionReviewer: async (reviewInput) => {
       reviews++;
-      return { passed: reviews > 1,
+      return { passed: true,
         requirements: reviewInput.requirements.map((requirement, index) => ({
-          id: requirement.id, satisfied: reviews > 1 || index === 0,
-          evidence: reviews > 1 ? "full diff and focused test" : index === 0 ? "module created" : "missing from first diff",
-        })), summary: reviews > 1 ? "complete" : "partial" };
+          id: requirement.id, satisfied: true,
+          evidence: "full diff and focused test",
+        })), summary: "complete" };
     } },
   );
   assert.equal(calls, 2);
-  assert.equal(reviews, 2);
+  assert.equal(reviews, 1, "the first missing-test gap is proven from the diff without a model review");
   assert.equal(output.verification.status, "VERIFIED_SUCCESS");
   assert.ok(logger.events.some((event) => event.type === "completion_continuation"));
   assert.ok(logger.events.some((event) => event.type === "completion_review" && event.passed === true));
+});
+
+test("agentic token preflight resumes the same grounded scope once before exhausting the plan", async (t) => {
+  const root = await fixture(t);
+  await mkdir(join(root, "tests"));
+  await writeFile(join(root, "tests/value.test.cjs"),
+    "const {test}=require('node:test');const a=require('node:assert/strict');test('value',()=>a.equal(require('../src/value.cjs'),3));\n");
+  const cfg = await config(undefined, { maxIterations: 1, maxInputPrice: 1, maxOutputPrice: 1 });
+  cfg.forceModel = cfg.modelPool!.models[0]!.id;
+  const logger = new Logger(join(root, ".koda"), "agentic-preflight-resume", true);
+  let calls = 0;
+  const codingWorker: CodingWorker = { engine: "agentic", async run(workerInput) {
+    calls++;
+    if (calls === 1) return { exitStatus: "failed", model: workerInput.model, engine: "agentic",
+      engineVersion: "test", changedPaths: [], wallClockMs: 1, limitKind: "token_preflight",
+      progressPhase: "DISCOVERY", terminationReason: "attempt_budget_exhausted",
+      discoveryEvidence: "read_file src/value.cjs: module.exports = 1", discoveryProgress: 1,
+      inputTokens: 1_000, outputTokens: 100 };
+    assert.equal(workerInput.context?.implementationRecovery?.reason, "agentic_token_preflight");
+    assert.deepEqual(workerInput.writeScope, ["src/value.cjs"]);
+    assert.match(workerInput.context?.diagnostics ?? "", /Prior worker discovery evidence/);
+    await writeFile(join(root, "src/value.cjs"), "module.exports = 3;\n");
+    return { exitStatus: "completed", model: workerInput.model, engine: "agentic",
+      engineVersion: "test", changedPaths: ["src/value.cjs"], wallClockMs: 1 };
+  } };
+  const subtask: any = { id: "stable", title: "Value", objective: "Change value to 3",
+    likelyReadPaths: ["src/value.cjs", "tests/value.test.cjs"], likelyWritePaths: ["src/value.cjs"],
+    dependsOn: [], integrationContract: "the value test passes",
+    verificationCommands: ["node --test tests/value.test.cjs"], estimatedDifficulty: "normal", parallelSafe: false };
+  const output = await implement({ config: cfg, logger, budget: new Budget(1, 100_000, 60_000) } as any,
+    root, subtask.objective, subtask, { acceptanceCriteria: ["the value test passes"] },
+    { files: ["src/value.cjs", "tests/value.test.cjs"], verificationCommands: subtask.verificationCommands } as any,
+    { model: "foo/bar", codingWorker, completionReviewer: async (reviewInput) => ({
+      passed: true, requirements: reviewInput.requirements.map((requirement) => ({
+        id: requirement.id, satisfied: true, evidence: "focused value test passes",
+      })), summary: "complete",
+    }) });
+  assert.equal(calls, 2);
+  assert.equal(output.verification.status, "VERIFIED_SUCCESS");
+  assert.equal(logger.events.filter((event) => event.type === "agentic_bounded_continuation").length, 1);
 });
 
 test("a killed Aider attempt with a passing partial mutation is never verified", async (t) => {
@@ -799,4 +937,49 @@ def main(args, return_coder=False):
   assert.equal(result.engineVersion, "mock-installed");
   assert.ok(Math.abs(result.costUsd! - .00003) < 1e-12);
   assert.equal(result.consumedTokens, 30);
+});
+
+test("scope diagnostics are not misclassified as provider authentication failures", async (t) => {
+  const root = await fixture(t);
+  const result = await worker(root, async (_cwd, invocation) => {
+    await report(invocation, "diff");
+    return { ...success, exitCode: 1, stdout: "Provider response received", stderr: "WRITE_SCOPE_VIOLATION: Rejected src/src/value.cjs" };
+  }).run(input(root));
+  assert.equal(result.terminationReason, "write_scope_violation");
+  assert.deepEqual(result.changedPaths, []);
+});
+
+test("verification repair reviews preserved source and test mutations together", async (t) => {
+  const root = await fixture(t);
+  await mkdir(join(root, "tests"));
+  await writeFile(join(root, "package.json"), JSON.stringify({ scripts: { test: "node --test tests/*.test.cjs", typecheck: "node --check src/value.cjs" } }));
+  await writeFile(join(root, "tests/value.test.cjs"), "const {test}=require('node:test');test('baseline',()=>{});\n");
+  await execa("git", ["add", "."], { cwd: root });
+  await execa("git", ["-c", "user.name=Koda", "-c", "user.email=koda@localhost", "commit", "-qm", "tests baseline"], { cwd: root });
+  const cfg = await config(undefined, { maxIterations: 1 });
+  const logger = new Logger(join(root, ".koda"), "retained-review", true);
+  cfg.forceModel = cfg.modelPool!.models[0]!.id;
+  const { profileRepo } = await import("../src/repo/profiler.js");
+  let calls = 0, reviews = 0;
+  const task = "Change src/value.cjs to export 3 and add regression tests in tests/value.test.cjs";
+  const result = await implement({ config: cfg, logger, budget: new Budget(10, 100000, 300000) } as any,
+    root, task, { id: "direct", title: "Value", objective: task, likelyReadPaths: ["src/value.cjs", "tests/value.test.cjs"], likelyWritePaths: ["src/value.cjs", "tests/value.test.cjs"], dependsOn: [], integrationContract: task, verificationCommands: [], estimatedDifficulty: "low", parallelSafe: false },
+    { acceptanceCriteria: ["Export 3", "Add regression tests"] }, await profileRepo(root), {
+      codingWorker: { engine: "aider", async run(i) {
+        calls++;
+        await writeFile(join(root, "src/value.cjs"), `module.exports = ${calls === 1 ? 2 : 3};\n`);
+        if (calls === 1) await writeFile(join(root, "tests/value.test.cjs"), "const {test}=require('node:test');const a=require('node:assert/strict');test('value',()=>a.equal(require('../src/value.cjs'),3));\n");
+        return { engine: "aider", engineVersion: "test", model: i.model, exitStatus: "completed", changedPaths: calls === 1 ? ["src/value.cjs", "tests/value.test.cjs"] : ["src/value.cjs"], wallClockMs: 1 };
+      } },
+      completionReviewer: async (i) => {
+        reviews++;
+        assert.ok(i.changedPaths.includes("tests/value.test.cjs"));
+        assert.match(i.fileChanges!.find(c => c.path === "src/value.cjs")!.before!, /exports = 1/);
+        assert.match(i.fileChanges!.find(c => c.path === "src/value.cjs")!.after!, /exports = 3/);
+        return { passed: true, requirements: i.requirements.map(r => ({ id: r.id, satisfied: true, evidence: "Candidate tests prove required export" })), summary: "PASS" };
+      },
+    });
+  assert.equal(calls, 2, JSON.stringify({result, events: logger.events.filter(e => /verification|exhaust|infra/.test(e.type))}));
+  assert.equal(reviews, 1);
+  assert.equal(result.verification.status, "VERIFIED_SUCCESS");
 });

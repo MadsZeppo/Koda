@@ -97,6 +97,19 @@ cli
       pairwiseEvidence: snapshot.pairwiseEvidence?.length ?? 0,
       sources: snapshot.sources }, null, 2));
   });
+cli.command("dev-run")
+  .description("Run a scripted local provider; requires NODE_ENV=test or development")
+  .requiredOption("--repo <path>")
+  .requiredOption("--task <task>")
+  .requiredOption("--script <path>", "fake-provider JSON script")
+  .requiredOption("--output <path>")
+  .option("--apply", "apply only verified scripted changes to the original folder")
+  .option("--verify <commands...>", "additional real verification commands")
+  .action(async (o) => {
+    const { runFakeProvider } = await import("./dev/fakeProvider.js");
+    const result = await runFakeProvider(o);
+    if (result.status !== "VERIFIED_SUCCESS") process.exitCode = 1;
+  });
 cli
   .command("run")
   .requiredOption("--repo <path>")
@@ -117,7 +130,6 @@ cli
     "evaluate a configured candidate without switching models",
   )
   .action(async (o) => {
-    if (!process.env.OPENROUTER_API_KEY) throw Error("Set OPENROUTER_API_KEY");
     if (o.routing !== "auto")
       throw Error(
         "Only --routing auto is supported; use --force-model for evaluation",
@@ -170,7 +182,6 @@ cli
   .option("--models-file <path>")
   .option("--output <path>")
   .action(async (o) => {
-    if (!process.env.OPENROUTER_API_KEY) throw Error("Set OPENROUTER_API_KEY");
     const result = await calibrateModels({
       repo: o.repo,
       task: o.task,
@@ -190,7 +201,6 @@ cli
   .option("--config <path>")
   .option("--output <path>", "results directory", ".koda/benchmarks")
   .action(async (o) => {
-    if (!process.env.OPENROUTER_API_KEY) throw Error("Set OPENROUTER_API_KEY");
     const results = await benchmark(
       resolve(o.manifest),
       await config(o.config),

@@ -1,0 +1,44 @@
+{
+  "pareto-router": {
+    "repository": "Keyan-sm/pareto-router",
+    "commit": "4648cdcec71e3a7398b4485549e0850fe2812554",
+    "tag": null,
+    "license": "MIT",
+    "inspectedPaths": [
+      "pareto_router/data.py",
+      "pareto_router/predictor.py",
+      "pareto_router/router.py"
+    ],
+    "licenseSHA256": "a79079b7d9e0d71682f65b3f686133b427ac3287cacd7c79252789c9e5fa26d0",
+    "adaptation": "independent implementation of documented mechanics; no source copied"
+  },
+  "weave": {
+    "repository": "weave-os/router",
+    "commit": "25a10d8a01e7baf1e14ef84297284b7118be94ba",
+    "tag": "router-v0.2.29",
+    "license": "Apache-2.0",
+    "inspectedPaths": [
+      "internal/router/planner/policy.go",
+      "internal/router/cluster/scorer.go",
+      "internal/router/handover/summarizer.go",
+      "cmd/router/atomic_classifier.go"
+    ],
+    "licenseSHA256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "adaptation": "independent implementation of documented mechanics; no source copied"
+  },
+  "dataset": {
+    "archiveBytes": 1283503080,
+    "archiveSha256": "b79f8cde1a6f029c2efa663a3a3b6f7748defb22341fe59f328cebef6648c8f1",
+    "auditFingerprint": "86e64cdcf1aa529834bdf7ad25328574be0d8228d170992f57bd731b68779994",
+    "canonicalFingerprint": "bdf588c3d9710b38aa95b44ca3da65a8fdb4b6796f5d96e861a7abb146822d6b",
+    "fingerprint": "62a671aa7536a934203a340b24cdd3f2d7d482f2bb261b6dd2c5ed947f6bc69e",
+    "ignoredArchiveMembers": 1443,
+    "localArchive": "/Users/madsflyvholm/Desktop/Koda.ai/research/cold-start-v2/.cache/bench-release.tar.gz",
+    "paidCalls": 0,
+    "project": "https://github.com/ynulihao/LLMRouterBench",
+    "releaseRepository": "NPULH/LLMRouterBench",
+    "revision": "0e5af1b84bf73437a01a1849c0f1d2468baa93fc",
+    "revisionProvenance": "official immutable Hugging Face revision used for download; archive matches published SHA256",
+    "url": "https://huggingface.co/datasets/NPULH/LLMRouterBench/resolve/0e5af1b84bf73437a01a1849c0f1d2468baa93fc/bench-release.tar.gz"
+  }
+}

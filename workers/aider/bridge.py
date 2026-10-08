@@ -23,7 +23,7 @@ def _safe_error(exc):
     text = f"{type(exc).__name__}: {exc}"
 
     secret = os.environ.get(
-        "OPENROUTER_API_KEY",
+        "KODA_PROVIDER_API_KEY",
         "",
     )
 
@@ -218,13 +218,41 @@ class CallGuard:
             )
         )
 
-        payload_bytes = len(json.dumps({"model": kwargs.get("model"), "messages": messages,
-            "tools": kwargs.get("tools"), "extra_body": kwargs.get("extra_body"),
-            "response_format": kwargs.get("response_format"), "max_tokens": r["maxOutputTokens"]},
-            ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-        prompt_bound = max(prompt, payload_bytes + 512)
+        # _count_prompt_tokens() already owns the message-token estimate:
+        #
+        # - use LiteLLM's exact tokenizer when available
+        # - otherwise use Koda's conservative bytes/3 fallback
+        #
+        # Do NOT serialize `messages` again here. Doing that counts the same
+        # repository/task text twice and turns an 8k-token attempt into a
+        # false preflight failure.
+        provider_framing_bytes = len(
+            json.dumps(
+                {
+                    "model": kwargs.get("model"),
+                    "tools": kwargs.get("tools"),
+                    "extra_body": kwargs.get("extra_body"),
+                    "response_format": kwargs.get("response_format"),
+                    "max_tokens": r["maxOutputTokens"],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+
+        provider_framing_tokens = max(
+            32,
+            math.ceil(provider_framing_bytes / 3) + 64,
+        )
+
+        prompt_bound = (
+            prompt
+            + provider_framing_tokens
+        )
+
         state["lastPromptTokens"] = prompt
         state["lastPromptBound"] = prompt_bound
+
         if prompt_bound > r.get("maxInputTokens", 32768):
             self.save()
             raise StopExecution("provider_input_preflight")
@@ -241,11 +269,12 @@ class CallGuard:
         remaining_tokens = (
             r["maxTokens"]
             - state["tokens"]
-            - prompt_bound
+            - prompt
         )
 
         output = min(
             r["maxOutputTokens"],
+            4096,
             max(
                 0,
                 remaining_tokens,
@@ -279,7 +308,7 @@ class CallGuard:
                 ) from None
 
         prompt_cost = (
-            prompt_bound
+            prompt
             * prices[0]
             / 1e6
         )
@@ -324,7 +353,7 @@ class CallGuard:
             )
 
         reserved_cost = (
-            prompt_bound * prices[0]
+            prompt * prices[0]
             + output * prices[1]
         ) / 1e6
 
@@ -332,7 +361,7 @@ class CallGuard:
         state["steps"] += 1
 
         state["tokens"] += (
-            prompt_bound + output
+            prompt + output
         )
 
         state["costUsd"] += (
@@ -355,9 +384,9 @@ class CallGuard:
             stream=False,
             max_tokens=output,
             num_retries=0,
-            api_key=os.environ[
-                "OPENROUTER_API_KEY"
-            ],
+            api_key=(os.environ["KODA_PROVIDER_API_KEY"]
+                if r.get("providerMode", "backend") == "backend"
+                else os.environ["OPENROUTER_API_KEY"]),
             api_base=r["baseUrl"],
             timeout=max(
                 0.001,
@@ -388,6 +417,11 @@ class CallGuard:
                 None,
             )
 
+        if r.get("providerMode", "backend") == "backend":
+            # A model prefix must not override the Koda compatible endpoint.
+            kwargs["custom_llm_provider"] = "openai"
+            kwargs["model"] = r.get("routedModel") or r["model"].split("/", 1)[-1]
+
         body = dict(
             kwargs.get(
                 "extra_body"
@@ -407,6 +441,11 @@ class CallGuard:
                 key,
                 None,
             )
+
+        if r.get("providerMode", "backend") == "backend":
+            # LiteLLM also strips recognized prefixes from explicit compatible
+            # models. Koda alone sets the final wire model after that parsing.
+            body["model"] = r.get("routedModel") or r["model"].split("/", 1)[-1]
 
         if body:
             kwargs[
@@ -500,7 +539,7 @@ class CallGuard:
                 >= 0
             ):
                 reserved_tokens = (
-                    prompt_bound + output
+                    prompt + output
                 )
 
                 actual_tokens = (
@@ -661,6 +700,14 @@ def run(
     request,
     args,
 ):
+    if request.get("providerMode", "backend") == "backend":
+        # The sandbox broker forwards only the dedicated credential. Restore
+        # compatible-client settings from the authoritative packet before SDK
+        # imports, which can otherwise fetch remote model metadata.
+        os.environ["OPENAI_API_KEY"] = os.environ["KODA_PROVIDER_API_KEY"]
+        os.environ["OPENAI_API_BASE"] = request["baseUrl"]
+        os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+
     # Aider touches Path.home() during
     # import/startup, so isolate before import.
     _install_isolated_home(
@@ -732,6 +779,33 @@ def run(
         from aider.repomap import (
             RepoMap,
         )
+
+        if request.get("providerMode", "backend") == "backend":
+            # Aider performs onboarding before CallGuard sees any completion.
+            # Make startup use the compatible client, and fail closed on OAuth.
+            import webbrowser
+            from aider import onboarding
+
+            def disabled_oauth(*args, **kwargs):
+                return None
+
+            def forbidden_browser(*args, **kwargs):
+                raise RuntimeError("Backend mode prohibits browser/OAuth authentication")
+
+            # Aider may offer onboarding after an otherwise valid provider
+            # response (including output truncation). Backend mode already has
+            # a syntactic compatible-client credential, so decline onboarding
+            # without turning the provider outcome into a runtime failure.
+            main.offer_openrouter_oauth = disabled_oauth
+            onboarding.offer_openrouter_oauth = disabled_oauth
+            onboarding.start_openrouter_oauth_flow = disabled_oauth
+            # Keep the final side-effect boundary fail closed: no code path may
+            # actually launch a browser from backend mode.
+            webbrowser.open = forbidden_browser
+            webbrowser.open_new = forbidden_browser
+            webbrowser.open_new_tab = forbidden_browser
+            if not request["model"].startswith("openai/"):
+                raise RuntimeError("Backend Aider requires the compatible model transport")
 
         report[
             "version"
@@ -896,6 +970,13 @@ def run(
                     ).__name__
                 )
             )
+
+        # With no Git root and only a nested new file, Aider infers its parent
+        # as the project root. Koda's packet paths are relative to the actual
+        # subprocess workspace, not that inferred common file directory.
+        coder.root = str(Path.cwd().resolve())
+        if hasattr(coder, "abs_root_path_cache"):
+            coder.abs_root_path_cache.clear()
 
         report["format"] = (
             getattr(

@@ -4,7 +4,8 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { routingBaselinePreflight, stableNoChangePreflight } from "../src/agent/stableNoChangePreflight.js";
+import { canDeferRoutingBaseline, routingBaselinePreflight, stableNoChangePreflight } from "../src/agent/stableNoChangePreflight.js";
+import type { RepositoryExploration } from "../src/agent/openHandsExplorer.js";
 import { profileRepo } from "../src/repo/profiler.js";
 
 for (const hasRunner of [true, false]) {
@@ -106,4 +107,48 @@ test("routing preflight skips a full suite without a focused test target", async
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("high-confidence bounded mutations defer redundant structural baseline", async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-deferred-preflight-"));
+  try {
+    await mkdir(join(root, "src"));
+    await writeFile(join(root, "src/theme.css"), "body { color: black }\n");
+    await writeFile(join(root, "package.json"), JSON.stringify({ scripts: {
+      typecheck: 'node -e "process.exit(0)"',
+    } }));
+    const profile = await profileRepo(root);
+    const localized: RepositoryExploration = {
+      confidence: "high",
+      editableCandidates: [{ path: "src/theme.css", reason: "proved local target" }],
+      readonlyFiles: [], relatedTests: [], dependencies: [], evidence: [], unresolvedQuestions: [],
+    };
+    assert.equal(canDeferRoutingBaseline("Make all pages on the site black", profile, localized, {
+      execution_strategy: "direct", execution_effort: "normal", strategy_reason: "localized",
+      likelyFiles: ["src/theme.css"], preciseTarget: "src/theme.css",
+    }), true);
+    assert.equal(canDeferRoutingBaseline("Add a unit test", profile, {
+      ...localized, relatedTests: ["tests/theme.test.ts"],
+    }, {
+      execution_strategy: "direct", execution_effort: "normal", strategy_reason: "localized",
+      likelyFiles: ["src/theme.css"], preciseTarget: "src/theme.css",
+    }), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Auto can defer a bounded new-source baseline without accepting unknown/test scope", async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-auto-preflight-"));
+  try {
+    await writeFile(join(root, "package.json"), JSON.stringify({scripts:{typecheck:'node -e "process.exit(0)"'}}));
+    const profile = await profileRepo(root);
+    const exploration: RepositoryExploration = {confidence:"high",editableCandidates:[{path:"src/new.ts",reason:"explicit new source"}],readonlyFiles:[],relatedTests:[],dependencies:[],evidence:[],unresolvedQuestions:[]};
+    const strategy = {execution_strategy:"direct" as const,execution_effort:"normal" as const,strategy_reason:"explicit local target",likelyFiles:["src/new.ts"]};
+    assert.equal(canDeferRoutingBaseline("Implement src/new.ts",profile,exploration,strategy),false);
+    assert.equal(canDeferRoutingBaseline("Implement src/new.ts",profile,exploration,strategy,true),true);
+    assert.equal(canDeferRoutingBaseline("Implement src/new.ts",profile,{...exploration,confidence:"low"},strategy,true),false);
+    assert.equal(canDeferRoutingBaseline("Add a unit test",profile,exploration,strategy,true),false);
+    assert.equal(canDeferRoutingBaseline("Implement",profile,{...exploration,editableCandidates:[{path:".",reason:"unknown"}]},strategy,true),false);
+  } finally {await rm(root,{recursive:true,force:true});}
 });

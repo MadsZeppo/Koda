@@ -29,8 +29,14 @@ const safeTestArguments = (argumentsText: string) =>
 
 /** Literal globs from a discovered direct runner, never a guessed test location. */
 export function discoveredTestGlobs(script: string): string[] {
-  if (!/^(?:node|tsx)\s+--test\s+/.test(script.trim()) || /[;&|`$]/.test(script)) return [];
-  return script.trim().split(/\s+/).slice(2)
+  if (/[;&|`$]/.test(script)) return [];
+  const [runner, ...args] = script.trim().split(/\s+/);
+  if (runner !== "node" && runner !== "tsx") return [];
+  const testIndex = args.indexOf("--test");
+  if (testIndex < 0 || args.slice(0, testIndex).some((flag) =>
+    runner !== "node" || !["--experimental-strip-types", "--enable-source-maps", "--no-warnings"].includes(flag)))
+    return [];
+  return args.slice(testIndex + 1)
     .map((arg) => arg.replace(/^['"]|['"]$/g, ""))
     .filter((arg) => !arg.startsWith("-") && /\.[cm]?[jt]s$/.test(arg));
 }

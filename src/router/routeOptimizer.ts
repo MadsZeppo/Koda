@@ -548,7 +548,15 @@ export function optimizeSpecialists(
     const modelCalls = operations.filter(
       (row) =>
         row.stage === "implement" &&
-        (row.modelServed ?? row.modelRequested) === model.id,
+        (row.modelServed ?? row.modelRequested) === model.id &&
+        // Latency belongs to the execution scaffold as well as the model.
+        // A bounded Agentic recovery can spend many turns after an Aider
+        // packet failed. Reusing that wall time as the latency prior for a
+        // fresh Aider edit made healthy models look deadline-infeasible and
+        // removed them from the frozen recovery board. Keep legacy/fixture
+        // providers comparable, but never transfer latency across Koda's
+        // explicitly named worker engines.
+        row.provider !== "agentic" && row.provider !== "direct-edit",
     );
     const bucketCalls = modelCalls.filter(
       (row) => row.taskBucket === taskBucket(features),
@@ -594,8 +602,13 @@ export function optimizeSpecialists(
       ? config.codingAttemptTimeoutMs
       : Infinity;
     const requestDeadlineMs = Math.min(implementationTimeout, attemptTimeout);
+    // A hard request timeout asks whether a normal call can execute at all.
+    // A long-tail p90 is still a scoring/risk penalty, but treating it as a
+    // compatibility failure removed otherwise healthy recovery models after
+    // a few historical slow calls. The median/learned central estimate is the
+    // executability bound; plan scoring continues to account for p90/p99.
     const deadlineFeasible = !latencyEvidenceKnown ||
-      expectedFiniteLatency(latency, p50, p90) <= requestDeadlineMs;
+      expectedFiniteLatency(latency, p50) <= requestDeadlineMs;
     // Attempts may contain multiple model calls. Learn their token/time totals
     // at current prices; provider errors never enter the quality posterior.
     const engine = "aider";

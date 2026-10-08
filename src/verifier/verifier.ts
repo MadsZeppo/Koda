@@ -1,12 +1,10 @@
 import { safeVerificationScript } from "../repo/ecosystem.js";
 import { cp, mkdtemp, rm, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, dirname, basename } from "node:path";
 import { tmpdir } from "node:os";
 import { constants } from "node:fs";
-import { createHash } from "node:crypto";
-import { git } from "../repo/commands.js";
 import { execa } from "execa";
-import { snapshotTree } from "../workspace/files.js";
+import { snapshotTree, changesBetween } from "../workspace/files.js";
 import type { VerificationCandidate, CheckKind } from "../repo/ecosystem.js";
 import type { WriteScope } from "../repo/writeScope.js";
 import { command } from "../repo/commands.js";
@@ -18,8 +16,27 @@ import {
 export const runtimeInfrastructureFailure = (check: CommandResult) => {
   const output = `${check.stdout}\n${check.stderr}`;
   if (
+    /No module named ['"]?(?:pytest|tox|mypy|ruff|flake8)(?:['"]|\s|$)/.test(
+      output,
+    )
+  )
+    return "verification_tool_unavailable";
+  if (/Verification modified repository source/.test(output))
+    return "verification_source_mutation";
+  if (
+    /Symlink .*node_modules.*is invalid.*points out of the filesystem root/i.test(
+      output,
+    )
+  )
+    return "verification_dependency_mount_environment";
+  if (
+    /next\/font\/google queries have exactly one entry/i.test(output) &&
+    /Error while looking up import map|Execution of .* failed/i.test(output)
+  )
+    return "verification_tool_internal_error";
+  if (
     !/\b(?:AssertionError|assert\s|FAILED\s+\S+::)/i.test(output) &&
-    /Temporary failure in name resolution|Network is unreachable|No route to host|Name or service not known|nodename nor servname provided|socket\.gaierror|ProxyError:.*(?:proxy|connect)/i.test(
+    /Temporary failure in name resolution|Network is unreachable|No route to host|Name or service not known|nodename nor servname provided|socket\.gaierror|ProxyError:.*(?:proxy|connect)|There was an issue establishing a connection while requesting https?:\/\//i.test(
       output,
     )
   )
@@ -60,6 +77,51 @@ export const runtimeInfrastructureFailure = (check: CommandResult) => {
     return "verification_git_worktree_environment";
   return undefined;
 };
+
+export async function retryOperationalVerification(
+  initial: CommandResult,
+  execute: (strictPythonEnvironment: boolean) => Promise<CommandResult>,
+  options: {
+    strictPythonEnvironment: boolean;
+    pythonCommand: boolean;
+    remainingMs: number;
+  },
+): Promise<CommandResult> {
+  const failure =
+    initial.exitCode !== 0 && runtimeInfrastructureFailure(initial);
+  if (
+    options.remainingMs <= 100 ||
+    (failure !== "verification_tool_internal_error" &&
+      (options.strictPythonEnvironment ||
+        !options.pythonCommand ||
+        !failure ||
+        failure === "verification_network_environment"))
+  )
+    return initial;
+  const retried = await execute(
+    failure === "verification_tool_internal_error"
+      ? options.strictPythonEnvironment
+      : true,
+  );
+  retried.infrastructureRecoveryAttempts = 1;
+  return retried;
+}
+
+/** Next switches its generated route-type reference between dev and build.
+ * Every other byte remains protected, even though this file may be tracked. */
+export function nextGeneratedTypeRefresh(before: string, after: string) {
+  return (
+    before.includes('/// <reference types="next" />') &&
+    before.includes('/// <reference types="next/image-types/global" />') &&
+    before.includes("// NOTE: This file should not be edited") &&
+    before.includes('import "./.next/dev/types/routes.d.ts";') &&
+    after ===
+      before.replace(
+        'import "./.next/dev/types/routes.d.ts";',
+        'import "./.next/types/routes.d.ts";',
+      )
+  );
+}
 const normalizedFailureOutput = (check: CommandResult) =>
   `${check.stdout}\n${check.stderr}`
     .replace(/\x1b\[[\d;]*m/g, "")
@@ -253,9 +315,11 @@ export function advisoryInfrastructureOnly(result: VerificationResult) {
     result.checks.some(
       (check) => !!check.unavailable && check.requirement === "advisory",
     ) &&
-    !result.checks.some((check) =>
-      check.outcome === "CHECK_FAIL" ||
-      (!!check.unavailable && (check.requirement ?? "required") === "required"),
+    !result.checks.some(
+      (check) =>
+        check.outcome === "CHECK_FAIL" ||
+        (!!check.unavailable &&
+          (check.requirement ?? "required") === "required"),
     )
   );
 }
@@ -312,12 +376,16 @@ export function verificationAgainstBaseline(
     verificationRegressions(baseline, after, candidateChangedPaths),
   );
   const compared = after.checks.map((check) => {
+    if (check.unavailable === "verification_source_mutation")
+      return { ...check, requirement: "required" as const };
     const previous = baseline.checks.find(
       (item) => item.command === check.command && item.cwd === check.cwd,
     );
     if (
-      (check.outcome === "INFRA_FAILURE" || check.outcome === "CHECK_UNAVAILABLE") &&
-      (previous?.outcome === "INFRA_FAILURE" || previous?.outcome === "CHECK_UNAVAILABLE") &&
+      (check.outcome === "INFRA_FAILURE" ||
+        check.outcome === "CHECK_UNAVAILABLE") &&
+      (previous?.outcome === "INFRA_FAILURE" ||
+        previous?.outcome === "CHECK_UNAVAILABLE") &&
       check.unavailable === previous.unavailable &&
       failureSignature(check) === failureSignature(previous)
     )
@@ -325,7 +393,8 @@ export function verificationAgainstBaseline(
         ...check,
         source: `${check.source ?? "verification"}:baseline_environment_unchanged`,
       };
-    if (check.outcome !== "CHECK_FAIL" || regressions.has(check)) return { ...check };
+    if (check.outcome !== "CHECK_FAIL" || regressions.has(check))
+      return { ...check };
     if (
       previous?.unavailable ||
       previous?.outcome === "INFRA_FAILURE" ||
@@ -349,11 +418,16 @@ export function verificationAgainstBaseline(
     result.status === "FAILED" &&
     regressions.size === 0 &&
     compared.some((check) => check.source?.endsWith(":baseline_unchanged")) &&
-    compared.every((check) =>
-      check.outcome !== "CHECK_FAIL" || check.source?.endsWith(":baseline_unchanged"));
+    compared.every(
+      (check) =>
+        check.outcome !== "CHECK_FAIL" ||
+        check.source?.endsWith(":baseline_unchanged"),
+    );
   if (!baselineOnlyFailures) return result;
 
-  const executablePass = compared.some((check) => check.outcome === "CHECK_PASS");
+  const executablePass = compared.some(
+    (check) => check.outcome === "CHECK_PASS",
+  );
   if (executablePass)
     return {
       ...result,
@@ -375,7 +449,9 @@ export function verificationAgainstBaseline(
   };
 }
 
-export function verificationResult(checks: CommandResult[]): VerificationResult {
+export function verificationResult(
+  checks: CommandResult[],
+): VerificationResult {
   for (const check of checks) {
     check.requirement ??= "required";
     check.outcome ??= check.unavailable
@@ -384,7 +460,9 @@ export function verificationResult(checks: CommandResult[]): VerificationResult 
         ? "CHECK_PASS"
         : "CHECK_FAIL";
   }
-  const failedChecks = checks.filter((check) => check.outcome === "CHECK_FAIL").length;
+  const failedChecks = checks.filter(
+    (check) => check.outcome === "CHECK_FAIL",
+  ).length;
   const required = checks.filter(
     (check) => (check.requirement ?? "required") === "required",
   );
@@ -394,7 +472,9 @@ export function verificationResult(checks: CommandResult[]): VerificationResult 
       check.outcome === "INFRA_FAILURE" ||
       check.outcome === "CHECK_UNAVAILABLE",
   );
-  const executableEvidence = checks.some((check) => check.outcome === "CHECK_PASS");
+  const executableEvidence = checks.some(
+    (check) => check.outcome === "CHECK_PASS",
+  );
   const output = checks
     .filter((c) => !c.source?.endsWith(":baseline_unchanged"))
     .map((c) => c.stdout + "\n" + c.stderr)
@@ -404,35 +484,42 @@ export function verificationResult(checks: CommandResult[]): VerificationResult 
   ].map((m) => Number(m[1] ?? m[2]));
   const noEvidence = checks.some(
     (c) =>
-      /^(?:true|echo|printf|pwd|ls|git status)(?:\s|$)/.test(c.command.trim()) ||
-      /(?:#|ℹ) tests\s+0\b|Ran 0 tests\b|no tests found|no tests ran/i.test(c.stdout + c.stderr),
+      /^(?:true|echo|printf|pwd|ls|git status)(?:\s|$)/.test(
+        c.command.trim(),
+      ) ||
+      /(?:#|ℹ) tests\s+0\b|Ran 0 tests\b|no tests found|no tests ran/i.test(
+        c.stdout + c.stderr,
+      ),
   );
   const errors = [...output.matchAll(/error TS\d+|error\[E\d+\]/g)].length;
   return {
     dimensions: Object.fromEntries(
-      (["test", "typecheck", "lint", "build", "check"] as CheckKind[]).map((kind) => {
-        const rows = checks.filter((c) => c.kind === kind);
-        return [
-          kind,
-          rows.some((c) => c.outcome === "CHECK_FAIL")
-            ? "FAIL"
-            : rows.some((c) =>
-                c.unavailable ||
-                c.outcome === "INFRA_FAILURE" ||
-                c.outcome === "CHECK_UNAVAILABLE",
-              )
-              ? "UNAVAILABLE"
-              : rows.some((c) =>
-                  /(?:#|ℹ) tests\s+0\b|Ran 0 tests\b|no tests found|no tests ran/i.test(
-                    c.stdout + c.stderr,
-                  ),
-                )
-                ? "NOT_RUN"
-                : rows.length
-                  ? "PASS"
-                  : "NOT_RUN",
-        ];
-      }),
+      (["test", "typecheck", "lint", "build", "check"] as CheckKind[]).map(
+        (kind) => {
+          const rows = checks.filter((c) => c.kind === kind);
+          return [
+            kind,
+            rows.some((c) => c.outcome === "CHECK_FAIL")
+              ? "FAIL"
+              : rows.some(
+                    (c) =>
+                      c.unavailable ||
+                      c.outcome === "INFRA_FAILURE" ||
+                      c.outcome === "CHECK_UNAVAILABLE",
+                  )
+                ? "UNAVAILABLE"
+                : rows.some((c) =>
+                      /(?:#|ℹ) tests\s+0\b|Ran 0 tests\b|no tests found|no tests ran/i.test(
+                        c.stdout + c.stderr,
+                      ),
+                    )
+                  ? "NOT_RUN"
+                  : rows.length
+                    ? "PASS"
+                    : "NOT_RUN",
+          ];
+        },
+      ),
     ),
     status:
       checks.length === 0
@@ -465,7 +552,9 @@ export async function verify(
   for (const cmd of [...new Set(commands)].filter((c) => c.trim())) {
     const normalize = (c: string) =>
       c.replace(/\b(npm|pnpm|yarn|bun)\s+run\s+/g, "$1 ").trim();
-    const exactCandidate = candidates.find((c) => normalize(c.command) === normalize(cmd));
+    const exactCandidate = candidates.find(
+      (c) => normalize(c.command) === normalize(cmd),
+    );
     const normalized = normalize(cmd);
     const baseCandidate = candidates.find((c) => {
       const base = normalize(c.command);
@@ -488,7 +577,8 @@ export async function verify(
           )
       );
     });
-    const candidate = exactCandidate ??
+    const candidate =
+      exactCandidate ??
       (baseCandidate
         ? {
             ...baseCandidate,
@@ -538,7 +628,8 @@ export async function verify(
                 undefined,
                 strict,
               );
-        const pythonCommand = /\b(?:python(?:\d+(?:\.\d+)?)?|pytest|tox)\b/i.test(cmd);
+        const pythonCommand =
+          /\b(?:python(?:\d+(?:\.\d+)?)?|pytest|tox)\b/i.test(cmd);
         const candidateRequirement =
           candidate?.requirement ??
           (candidate?.origin === "inferred" || candidate?.origin === "generic"
@@ -551,17 +642,11 @@ export async function verify(
 
         c = await execute(strictDependencyEnvironment);
 
-        const environmentFailure = c.exitCode !== 0 && runtimeInfrastructureFailure(c);
-        if (
-          !strictDependencyEnvironment &&
-          environmentFailure &&
-          environmentFailure !== "verification_network_environment" &&
-          pythonCommand &&
-          limit - (Date.now() - started) > 100
-        ) {
-          c = await execute(true);
-          c.infrastructureRecoveryAttempts = 1;
-        }
+        c = await retryOperationalVerification(c, execute, {
+          strictPythonEnvironment: strictDependencyEnvironment,
+          pythonCommand,
+          remainingMs: limit - (Date.now() - started),
+        });
       } catch (error) {
         c = {
           command: cmd,
@@ -600,6 +685,8 @@ export async function verify(
       c.kind = /--test|\bpytest\b/.test(cmd) ? "test" : "check";
       c.requirement = "required";
     }
+    if (c.unavailable === "verification_source_mutation")
+      c.requirement = "required";
     checks.push(c);
     onResult?.(c);
   }
@@ -633,37 +720,60 @@ async function isolatedVerification(
         timedOut: true,
         wallClockMs: Date.now() - start,
       };
-    const snapshot = async () => {
-      const probe = await execa("git", ["rev-parse", "--show-toplevel"], {
+    const trackedResult = await execa(
+      "git",
+      ["--work-tree", copy, "ls-files", "--cached", "-z"],
+      {
         cwd: copy,
         reject: false,
         env: { GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" },
-      }).catch(() => undefined);
-      if (!probe || probe.exitCode !== 0)
-        return JSON.stringify(await snapshotTree(copy));
-      const tracked = await git(copy, "--work-tree", copy, "diff", "--binary", "HEAD");
-      const untracked = (
-        await git(
-          copy,
-          "--work-tree",
-          copy,
-          "ls-files",
-          "--others",
-          "--exclude-standard",
-          "-z",
-        )
-      )
-        .split("\0")
-        .filter(Boolean);
-      const hashes = await Promise.all(
-        untracked.map(async (p) => [
-          p,
-          createHash("sha256").update(await readFile(join(copy, p))).digest("hex"),
-        ]),
-      );
-      return JSON.stringify([tracked, hashes]);
+      },
+    ).catch(() => undefined);
+    const tracked = new Set(
+      trackedResult?.exitCode === 0
+        ? trackedResult.stdout.split("\0").filter(Boolean)
+        : [],
+    );
+    const snapshot = async () => {
+      const files = await snapshotTree(copy, undefined, tracked);
+      for (const path of Object.keys(files.files)) {
+        // tsc --noEmit still writes incremental compiler caches. Only a
+        // recognizable, untracked cache is disposable verification output.
+        // Tracked files and arbitrary files with this extension stay protected.
+        if (!tracked.has(path) && path.endsWith(".tsbuildinfo")) {
+          try {
+            const data = JSON.parse(await readFile(join(copy, path), "utf8"));
+            const program = data.program ?? data;
+            if (
+              typeof data.version === "string" &&
+              Array.isArray(program.fileNames) &&
+              program.fileNames.every(
+                (name: unknown) => typeof name === "string",
+              )
+            )
+              delete files.files[path];
+          } catch {
+            /* Invalid cache content is a protected mutation. */
+          }
+        }
+      }
+      return files;
     };
-    const before = await snapshot();
+    const beforeFiles = await snapshot();
+    const nextTypeInputs = new Map<string, string>();
+    for (const path of Object.keys(beforeFiles.files).filter(
+      (path) => basename(path) === "next-env.d.ts",
+    )) {
+      try {
+        const packageJson = JSON.parse(
+          await readFile(join(copy, dirname(path), "package.json"), "utf8"),
+        );
+        if (packageJson.dependencies?.next || packageJson.devDependencies?.next)
+          nextTypeInputs.set(path, await readFile(join(copy, path), "utf8"));
+      } catch {
+        /* An undeclared framework cannot authorize generated source changes. */
+      }
+    }
     await inheritDependencyEnvironment(path, copy);
     const result = await command(
       copy,
@@ -678,11 +788,33 @@ async function isolatedVerification(
       false,
       nodeProjectRoot,
     );
-    if ((await snapshot()) !== before)
+    const afterFiles = await snapshot();
+    const changes = changesBetween(beforeFiles, afterFiles);
+    const changedPaths: string[] = [];
+    for (const change of changes) {
+      const beforeType = nextTypeInputs.get(change.path);
+      if (
+        change.type === "modify" &&
+        change.beforeMode === change.afterMode &&
+        beforeType !== undefined &&
+        nextGeneratedTypeRefresh(
+          beforeType,
+          await readFile(join(copy, change.path), "utf8"),
+        )
+      )
+        continue;
+      changedPaths.push(change.path);
+    }
+    if (changedPaths.length)
       return {
         ...result,
         exitCode: 1,
-        stderr: result.stderr + "\nVerification modified repository source; result rejected",
+        stderr:
+          result.stderr +
+          "\nVerification modified repository source; result rejected" +
+          `\nVerification changed paths: ${changedPaths.join(", ") || "tracked repository state"}`,
+        unavailable: "verification_source_mutation",
+        outcome: "INFRA_FAILURE" as const,
       };
     return result;
   } finally {

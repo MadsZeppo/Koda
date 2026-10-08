@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { config } from "../src/config.js";
+import { compileContext } from "../src/context/compiler.js";
 import { Budget } from "../src/openrouter/usage.js";
 import { Gateway } from "../src/openrouter/client.js";
 import { Logger } from "../src/telemetry/logger.js";
@@ -13,6 +14,9 @@ import {
   OpenHandsExplorer,
   OpenHandsOperationalError,
   fastPathExploration,
+  boundedTextEditExploration,
+  withInferredFrameworkCreationTargets,
+  modelFreeExplorationIsSufficient,
   deterministicRepositoryExploration,
   strategyWithExploration,
   type OpenHandsInvocation,
@@ -34,7 +38,64 @@ test("local fallback prefers imported implementation over standalone patch scrip
   assert.ok(explicit.editableCandidates.some((file) => file.path === "update_budget.py"),
     "an explicitly requested script must remain a valid implementation target");
 });
-import { chooseExecutionStrategy } from "../src/router/executionStrategy.js";
+
+test("failed exploration can localize a new route plus its existing navigation owner", async (t) => {
+  const f = await fixture(t);
+  await mkdir(join(f.root, "src/app"), { recursive: true });
+  await mkdir(join(f.root, "src/components/site"), { recursive: true });
+  await writeFile(join(f.root, "package.json"), JSON.stringify({ dependencies: { next: "16.0.0" } }));
+  await writeFile(join(f.root, "src/app/page.tsx"),
+    "import { SiteHeader } from '../components/site/header'; export default function Home(){return <SiteHeader/>}\n");
+  await writeFile(join(f.root, "src/components/site/header.tsx"),
+    "export function SiteHeader(){const links=[{href:'/',label:'Home'}];return <nav>{links.map(x=><a key={x.href} href={x.href}>{x.label}</a>)}</nav>}\n");
+  await writeFile(join(f.root, "src/components/contact-link-form.tsx"),
+    "export const contactLink = 'contact link contact link';\n");
+  const profile = await profileRepo(f.root);
+  const task = "Create a real page at /contact with heading Contact us. Add a Contact link to the existing navigation. Preserve the other links.";
+  const localized = withInferredFrameworkCreationTargets(task, profile,
+    await deterministicRepositoryExploration(f.root, task, profile));
+  assert.deepEqual(localized.editableCandidates.map(({ path }) => path), [
+    "src/components/site/header.tsx", "src/app/contact/page.tsx",
+  ]);
+  assert.equal(modelFreeExplorationIsSufficient(localized, task), true);
+});
+
+test("a new page without a named URL scopes its route and existing header, not a lexical API match", async (t) => {
+  const f = await fixture(t);
+  await mkdir(join(f.root, "src/app/api/billing"), { recursive: true });
+  await mkdir(join(f.root, "src/components/site"), { recursive: true });
+  await writeFile(join(f.root, "package.json"), JSON.stringify({ dependencies: { next: "16.0.0" } }));
+  await writeFile(join(f.root, "src/app/page.tsx"),
+    "import { SiteHeader } from '../components/site/header'; export default function Home(){return <SiteHeader/>}\n");
+  await writeFile(join(f.root, "src/components/site/header.tsx"),
+    "export function SiteHeader(){return <nav><a href='/pricing'>Pricing</a></nav>}\n");
+  await writeFile(join(f.root, "src/app/api/billing/route.ts"),
+    "export const GET=()=>Response.json({link:'billing'});\n");
+  const profile = await profileRepo(f.root);
+  for (const [task, route] of [
+    ["Lav en ny side hvor du skriver om hvad virksomheden laver præcist. link til den i headeren ved pricing sektionen.",
+      "src/app/hvad-virksomheden-laver-praecist/page.tsx"],
+    ["Create a new Company overview page and link to it in the header near Pricing.",
+      "src/app/company-overview/page.tsx"],
+  ] as const) {
+    const localized = withInferredFrameworkCreationTargets(task, profile,
+      await deterministicRepositoryExploration(f.root, task, profile));
+    const paths = localized.editableCandidates.map(({ path }) => path);
+    assert.ok(paths.includes(route), `${route} must be writable before coding`);
+    assert.ok(paths.includes("src/components/site/header.tsx"), "existing navigation owner must be writable");
+    assert.equal(paths.includes("src/app/api/billing/route.ts"), false);
+    assert.equal(modelFreeExplorationIsSufficient(localized, task), true,
+      "repository-backed two-file scope should avoid paid repository rediscovery");
+  }
+  const ambiguous = "Create a new Company page and a new Pricing page.";
+  const localized = withInferredFrameworkCreationTargets(ambiguous, profile,
+    await deterministicRepositoryExploration(f.root, ambiguous, profile));
+  assert.equal(localized.editableCandidates.some(({ path }) =>
+    /src\/app\/[^/]+\/page\.tsx$/.test(path)), false,
+  "multiple unnamed pages must not silently share one inferred route");
+});
+import { chooseExecutionStrategy, directWritePaths } from "../src/router/executionStrategy.js";
+import { compileTaskSpec } from "../src/planner/taskSpec.js";
 import { selectAiderFiles } from "../src/agent/aiderExecutor.js";
 import { inferRepositoryDependencies } from "../src/orchestrator/dag.js";
 import { schedule } from "../src/orchestrator/scheduler.js";
@@ -109,6 +170,293 @@ test("exact missing file path uses the zero-call fast path and remains exact sco
   assert.equal(route.preciseTarget, path);
   assert.deepEqual(result?.editableCandidates.map(({ path }) => path), [path]);
   assert.equal(result?.confidence, "high");
+});
+
+test("unquoted Danish logo replacement uses a bounded local read without model exploration", async (t) => {
+  const f = await fixture(t);
+  await mkdir(join(f.root, "src/components"), { recursive: true });
+  await writeFile(join(f.root, "src/components/brand-logo.tsx"),
+    "export const BrandLogo=()=> <span>zeppo</span>;\n");
+  const profile = await profileRepo(f.root);
+  const task = "Gør så der på logoet i hjørnet står yeppo i stedet for zeppo";
+  const result = await boundedTextEditExploration(f.root, task, profile);
+  assert.equal(result?.confidence, "high");
+  assert.deepEqual(result?.editableCandidates.map(({ path }) => path), [
+    "src/components/brand-logo.tsx",
+  ]);
+  assert.match(result?.evidence[0]?.detail ?? "", /no model exploration required/i);
+});
+
+test("explicit new Next App Router route enters the initial editable scope", async (t) => {
+  const f = await fixture(t);
+  await mkdir(join(f.root, "src/app"), { recursive: true });
+  await mkdir(join(f.root, "src/components"), { recursive: true });
+  await writeFile(join(f.root, "src/app/page.tsx"), "export default function Home(){return null}\n");
+  await writeFile(join(f.root, "src/app/layout.tsx"), "export default function Layout({children}:any){return children}\n");
+  await writeFile(join(f.root, "src/app/globals.css"), "body { color: white; }\n");
+  await writeFile(join(f.root, "src/components/header.tsx"), "export const Header=()=>null\n");
+  await writeFile(join(f.root, "package.json"), JSON.stringify({ dependencies: { next: "16.0.0", react: "19.0.0" } }));
+  const profile = await profileRepo(f.root);
+  const localized = exploration({
+    editableCandidates: [
+      { path: "src/app/globals.css", reason: "global theme" },
+      { path: "src/components/header.tsx", reason: "navigation" },
+    ],
+    readonlyFiles: [{ path: "src/app/page.tsx", reason: "home context" }],
+    relatedTests: [], dependencies: [], evidence: [],
+  });
+  const task = compileTaskSpec(
+    "Gør hele appens UI sort. Opret en rigtig side på routen /how-it-works og opdatér navigationens link.",
+  ).routingPrompt;
+  const result = withInferredFrameworkCreationTargets(
+    task,
+    profile,
+    localized,
+  );
+  assert.deepEqual(result.editableCandidates.map(({ path }) => path), [
+    "src/app/globals.css",
+    "src/components/header.tsx",
+    "src/app/page.tsx",
+    "src/app/how-it-works/page.tsx",
+  ]);
+  assert.ok(result.evidence.some(({ path }) => path === "src/app/how-it-works/page.tsx"));
+  assert.deepEqual(directWritePaths(result.editableCandidates.map(({ path }) => path), profile, task), [
+    "src/app/globals.css",
+    "src/components/header.tsx",
+    "src/app/page.tsx",
+    "src/app/how-it-works/page.tsx",
+  ]);
+});
+
+test("localized visual task receives global CSS as read-only cascade evidence", async (t) => {
+  const f = await fixture(t);
+  await mkdir(join(f.root, "src/app"), { recursive: true });
+  await writeFile(join(f.root, "src/app/page.tsx"),
+    "export default function Home(){return <section className='bg-white'>Hello</section>}\n");
+  await writeFile(join(f.root, "src/app/globals.css"),
+    "body * { background-color: white !important; }\n");
+  await writeFile(join(f.root, "package.json"), JSON.stringify({ dependencies: { next: "16.0.0" } }));
+  const profile = await profileRepo(f.root);
+  const result = withInferredFrameworkCreationTargets(
+    "Make the homepage hero background dark navy and visible in the browser.",
+    profile,
+    exploration({
+      editableCandidates: [{ path: "src/app/page.tsx", reason: "renders hero" }],
+      readonlyFiles: [], relatedTests: [], dependencies: [], evidence: [],
+    }),
+  );
+  assert.deepEqual(result.editableCandidates.map(({ path }) => path), ["src/app/page.tsx"]);
+  assert.deepEqual(result.readonlyFiles.map(({ path }) => path), ["src/app/globals.css"]);
+  const context = await compileContext(f.root, "Make the hero background dark navy",
+    ["src/app/page.tsx", "src/app/globals.css"], profile, f.gateway.config.context, true);
+  assert.match(context.files.find(({ path }) => path === "src/app/globals.css")?.snippet ?? "", /!important/);
+});
+
+test("site-wide theme controls make the proven global stylesheet writable", async (t) => {
+  const f = await fixture(t);
+  await mkdir(join(f.root, "src/app"), { recursive: true });
+  await mkdir(join(f.root, "src/components"), { recursive: true });
+  await writeFile(join(f.root, "package.json"), JSON.stringify({ dependencies: { next: "16.0.0" } }));
+  await writeFile(join(f.root, "src/app/layout.tsx"),
+    "import './globals.css'; export default function Layout({children}:any){return children}\n");
+  await writeFile(join(f.root, "src/app/page.tsx"),
+    "import { Header } from '../components/header'; export default function Home(){return <><Header/><main className='bg-white'>Home</main></>}\n");
+  await writeFile(join(f.root, "src/app/globals.css"), ":root { --background: white; }\n");
+  await writeFile(join(f.root, "src/components/header.tsx"),
+    "export function Header(){return <nav><a href='/'>Home</a></nav>}\n");
+  const profile = await profileRepo(f.root);
+  const localized = exploration({
+    editableCandidates: [{ path: "src/components/header.tsx", reason: "theme control" }],
+    readonlyFiles: [{ path: "src/app/globals.css", reason: "theme context" }],
+    relatedTests: [], dependencies: [], evidence: [],
+  });
+  for (const task of [
+    "Add a dark mode toggle to the website header and preserve the choice between pages.",
+    "Tilføj en mørk tilstand til hjemmesiden med en knap i headeren. Bevar valget mellem sider.",
+  ]) {
+    const result = withInferredFrameworkCreationTargets(task, profile, localized);
+    const paths = result.editableCandidates.map(({ path }) => path);
+    assert.ok(paths.includes("src/app/globals.css"), "shared theme CSS must be writable");
+    assert.ok(paths.includes("src/app/page.tsx"), "hardcoded page colors require a writable owner");
+    assert.equal(result.readonlyFiles.some(({ path }) => path === "src/app/globals.css"), false);
+  }
+  const restricted = withInferredFrameworkCreationTargets(
+    "Only modify src/components/header.tsx. Add a dark mode toggle to the website header.",
+    profile, localized);
+  assert.deepEqual(restricted.editableCandidates.map(({ path }) => path),
+    ["src/components/header.tsx"]);
+  assert.ok(restricted.readonlyFiles.some(({ path }) => path === "src/app/globals.css"));
+});
+
+test("route inference stays bounded by convention, ambiguity and explicit restrictions", async (t) => {
+  const f = await fixture(t);
+  await mkdir(join(f.root, "src/app"), { recursive: true });
+  await writeFile(join(f.root, "src/app/page.tsx"), "export default function Home(){return null}\n");
+  await writeFile(join(f.root, "package.json"), JSON.stringify({ dependencies: { next: "16.0.0" } }));
+  const profile = await profileRepo(f.root);
+  const localized = exploration({ relatedTests: [], dependencies: [], evidence: [] });
+  const unchanged = (task: string) => withInferredFrameworkCreationTargets(task, profile, localized)
+    .editableCandidates.map(({ path }) => path);
+  assert.deepEqual(unchanged("Update the navigation link to /docs."), ["src/budget.ts"]);
+  assert.deepEqual(unchanged("Create pages for /docs and /pricing."), ["src/budget.ts"]);
+  assert.deepEqual(unchanged("Create a page at /docs. Only modify src/budget.ts."), ["src/budget.ts"]);
+  assert.deepEqual(unchanged("Create a page at /docs/[slug]."), ["src/budget.ts"]);
+});
+
+test("explicit Next API endpoint receives a bounded new route write target", async (t) => {
+  const f = await fixture(t);
+  await mkdir(join(f.root, "src/app/api/bridge/webhook"), { recursive: true });
+  await writeFile(join(f.root, "src/app/page.tsx"), "export default function Home(){return null}\n");
+  await writeFile(join(f.root, "src/app/api/bridge/webhook/route.ts"),
+    "export const POST=()=>Response.json({ok:true});\n");
+  await writeFile(join(f.root, "package.json"), JSON.stringify({ dependencies: { next: "16.0.0" } }));
+  const profile = await profileRepo(f.root);
+  const localized = exploration({
+    editableCandidates: [{ path: "src/app/api/bridge/webhook/route.ts", reason: "related existing webhook" }],
+    readonlyFiles: [], relatedTests: [], dependencies: [], evidence: [],
+  });
+  const task = "Implementér et sikkert webhook-endpoint i backend på /api/webhooks/events.";
+  const result = withInferredFrameworkCreationTargets(task, profile, localized);
+  assert.deepEqual(result.editableCandidates.map(({ path }) => path), [
+    "src/app/api/bridge/webhook/route.ts",
+    "src/app/api/webhooks/events/route.ts",
+  ]);
+  assert.deepEqual(directWritePaths(result.editableCandidates.map(({ path }) => path), profile, task),
+    result.editableCandidates.map(({ path }) => path));
+  assert.equal(result.editableCandidates.some(({ path }) => path.endsWith("/page.tsx")), false);
+  assert.deepEqual(withInferredFrameworkCreationTargets(
+    "Only modify src/app/api/bridge/webhook/route.ts. Implement /api/webhooks/events.", profile, localized,
+  ).editableCandidates, localized.editableCandidates);
+  assert.deepEqual(withInferredFrameworkCreationTargets(
+    "Create endpoints /api/webhooks/events and /api/webhooks/status.", profile, localized,
+  ).editableCandidates, localized.editableCandidates);
+});
+
+test("fallback localization covers distinct quoted navigation and global-theme requirements", async (t) => {
+  const f = await fixture(t);
+  await mkdir(join(f.root, "src/app"), { recursive: true });
+  await mkdir(join(f.root, "src/components"), { recursive: true });
+  await writeFile(join(f.root, "src/app/page.tsx"),
+    "import { Header } from '../components/header'; export default function Home(){return <Header/>}\n");
+  await writeFile(join(f.root, "src/app/layout.tsx"),
+    "import './globals.css'; export default function Layout({children}:any){return children}\n");
+  await writeFile(join(f.root, "src/app/globals.css"), "body { background: white; }\n");
+  await writeFile(join(f.root, "src/components/header.tsx"),
+    "export const Header=()=> <a href='#how-it-works'>How it works</a>\n");
+  await writeFile(join(f.root, "package.json"), JSON.stringify({ dependencies: { next: "16.0.0", react: "19.0.0" } }));
+  const profile = await profileRepo(f.root);
+  const task = "Make the whole app UI black. Create a page at /how-it-works and update the 'How it works' navigation link.";
+  const localized = await deterministicRepositoryExploration(f.root, task, profile);
+  const result = withInferredFrameworkCreationTargets(task, profile, localized);
+  assert.ok(result.editableCandidates.some(({ path }) => path === "src/components/header.tsx"));
+  assert.ok(result.editableCandidates.some(({ path }) => path === "src/app/globals.css"));
+  assert.ok(result.editableCandidates.some(({ path }) => path === "src/app/page.tsx"));
+  assert.ok(result.editableCandidates.some(({ path }) => path === "src/app/how-it-works/page.tsx"));
+  assert.equal(modelFreeExplorationIsSufficient(result), true,
+    "an explicit static route plus repository-backed targets needs no model exploration");
+});
+
+test("existing route content and navigation labels keep both literal owners in bounded local scope", async (t) => {
+  const f = await fixture(t);
+  await mkdir(join(f.root, "src/app/how-it-works"), { recursive: true });
+  await mkdir(join(f.root, "src/components/landing"), { recursive: true });
+  await writeFile(join(f.root, "src/app/page.tsx"),
+    "import {Header} from '../components/landing/header';export default function Home(){return <Header/>}\n");
+  await writeFile(join(f.root, "src/app/globals.css"), "body { background: white; }\n");
+  await writeFile(join(f.root, "src/app/how-it-works/page.tsx"),
+    "export default function Page(){return <><h1>How It Works</h1><p>jeg elsker betalinger</p></>}\n");
+  await writeFile(join(f.root, "src/components/landing/header.tsx"),
+    "export const Header=()=> <a href='/how-it-works'>How it works</a>\n");
+  await writeFile(join(f.root, "package.json"), JSON.stringify({ dependencies: { next: "16.0.0" } }));
+  const profile = await profileRepo(f.root);
+  const task = "Gør hele appens UI sort. Opret /how-it-works med teksten 'jeg elsker betalinger'. Opdatér 'How it works'-linket til /how-it-works.";
+  const result = withInferredFrameworkCreationTargets(task, profile,
+    await deterministicRepositoryExploration(f.root, task, profile));
+  assert.ok(result.editableCandidates.some(({ path }) => path === "src/app/how-it-works/page.tsx"));
+  assert.ok(result.editableCandidates.some(({ path }) => path === "src/components/landing/header.tsx"));
+  assert.ok(result.editableCandidates.some(({ path }) => path === "src/app/globals.css"));
+  assert.ok(result.editableCandidates.some(({ path }) => path === "src/app/page.tsx"));
+  assert.equal(modelFreeExplorationIsSufficient(result), true);
+});
+
+test("model-free exploration remains conservative for ordinary behavior work", () => {
+  assert.equal(modelFreeExplorationIsSufficient(exploration()), false);
+});
+
+test("application-wide visual wording uses proved framework scope without model exploration", async (t) => {
+  const f = await fixture(t);
+  await mkdir(join(f.root, "src/app"), { recursive: true });
+  await writeFile(join(f.root, "src/app/layout.tsx"),
+    "import './globals.css'; export default function Layout({children}:any){return children}\n");
+  await writeFile(join(f.root, "src/app/page.tsx"),
+    "export default function Home(){return <main>Home</main>}\n");
+  await writeFile(join(f.root, "src/app/globals.css"), "body { background: white; }\n");
+  await writeFile(join(f.root, "package.json"), JSON.stringify({ dependencies: { next: "16.0.0" } }));
+  const profile = await profileRepo(f.root);
+
+  for (const task of [
+    "Make all pages on the entire website black.",
+    "Gør alle sider på hele hjemmesiden sort.",
+  ]) {
+    const result = withInferredFrameworkCreationTargets(task, profile,
+      await deterministicRepositoryExploration(f.root, task, profile));
+    assert.deepEqual(result.editableCandidates.map(({ path }) => path).sort(),
+      ["src/app/globals.css", "src/app/page.tsx"]);
+    assert.equal(modelFreeExplorationIsSufficient(result, task), true);
+    const strategy = strategyWithExploration(task, chooseExecutionStrategy(task, profile), {
+      ...result, confidence: "high", unresolvedQuestions: [],
+    });
+    assert.equal(strategy.execution_strategy, "direct");
+    assert.equal(strategy.execution_effort, "normal");
+  }
+});
+
+test("page-wide professional redesign includes both rendered page and global cascade owner", async (t) => {
+  const f = await fixture(t);
+  await mkdir(join(f.root, "src/app"), { recursive: true });
+  await writeFile(join(f.root, "src/app/layout.tsx"),
+    "import './globals.css'; export default function Layout({children}:any){return children}\n");
+  await writeFile(join(f.root, "src/app/page.tsx"),
+    "export default function Home(){return <main className='hero'>Home</main>}\n");
+  await writeFile(join(f.root, "src/app/globals.css"),
+    "body * { color: black !important; background: white !important; }\n");
+  await writeFile(join(f.root, "package.json"), JSON.stringify({ dependencies: { next: "16.0.0" } }));
+  const profile = await profileRepo(f.root);
+  const task = "Gør hele forsiden top level, meget flot og professionel med en moderne Stripe-lignende stil.";
+  const result = withInferredFrameworkCreationTargets(task, profile,
+    await deterministicRepositoryExploration(f.root, task, profile));
+  assert.deepEqual(result.editableCandidates.map(({ path }) => path).sort(),
+    ["src/app/globals.css", "src/app/page.tsx"]);
+  assert.equal(modelFreeExplorationIsSufficient(result, task), true);
+});
+
+test("single destination-page copy edit accepts deterministic local evidence without OpenHands", async (t) => {
+  const f = await fixture(t);
+  await mkdir(join(f.root, "src/app/how-it-works"), { recursive: true });
+  await writeFile(join(f.root, "src/app/how-it-works/page.tsx"),
+    "export default function Page(){return <p>jeg elsker betalinger</p>}\n");
+  await writeFile(join(f.root, "src/other.ts"), "export const unrelated = true\n");
+  const profile = await profileRepo(f.root);
+  const task = "ændrer teksten inde på den side man kommer til fra how it works til 'hej jeg hedder y'";
+  const local = await deterministicRepositoryExploration(f.root, task, profile);
+  assert.deepEqual(local.editableCandidates.map(({ path }) => path),
+    ["src/app/how-it-works/page.tsx"]);
+  assert.equal(modelFreeExplorationIsSufficient(local, task), true);
+  const strategy = strategyWithExploration(task, chooseExecutionStrategy(task, profile), {
+    ...local, confidence: "high",
+  });
+  assert.equal(strategy.execution_effort, "tiny");
+});
+
+test("OpenHands line-number locations authorize only the underlying repository path", async (t) => {
+  const f = await fixture(t);
+  const result = await new OpenHandsExplorer(f.gateway, { runner: async () => report(exploration({
+    editableCandidates: [{ path: "src/budget.ts:1", reason: "definition at line 1" }],
+    readonlyFiles: [], relatedTests: [], dependencies: [],
+    evidence: [{ path: "src/budget.ts:1:8", detail: "exact symbol location" }],
+  })) }).explore({ repoPath: f.root, task: "Update budget", profile: f.profile });
+  assert.deepEqual(result.editableCandidates.map(({ path }) => path), ["src/budget.ts"]);
+  assert.deepEqual(result.evidence.map(({ path }) => path), ["src/budget.ts"]);
 });
 
 test("no-path behavior task uses OpenHands and forwards implementation evidence to Aider", async (t) => {
@@ -319,4 +667,89 @@ test("read-only guard restores the repository if a runner attempts mutation", as
     /read-only violation/i,
   );
   assert.equal(await readFile(join(f.root, "src/budget.ts"), "utf8"), original);
+});
+
+for (const task of [
+  "On the homepage change the primary button text to 'Start now'. Preserve its link and design.",
+  "På forsiden: ændr teksten på den primære knap til 'Kom i gang'. Bevar link og design.",
+]) test(`bounded UI text localization avoids model discovery: ${task}`, async (t) => {
+  const f = await fixture(t);
+  await mkdir(join(f.root, "src/app"), { recursive: true });
+  await writeFile(join(f.root, "src/app/page.tsx"),
+    "import {CTA} from '../cta';export default function Home(){return <CTA href='/start'>Begin</CTA>}");
+  await writeFile(join(f.root, "src/cta.tsx"), "export const CTA=()=>null;");
+  for (let i = 0; i < 70; i++) await writeFile(join(f.root, `src/route${i}.tsx`), "export const link='Start now';");
+  const profile = await profileRepo(f.root);
+  const evidence = await boundedTextEditExploration(f.root, task, profile);
+  assert.equal(evidence?.confidence, "high");
+  assert.deepEqual(evidence?.editableCandidates.map(({path})=>path), ["src/app/page.tsx"]);
+  assert.deepEqual(evidence?.readonlyFiles.map(({path})=>path), ["src/cta.tsx"]);
+  assert.match(evidence!.evidence[0]!.detail, /inspected locally/);
+  const strategy = strategyWithExploration(task, chooseExecutionStrategy(task, profile), evidence!);
+  assert.equal(strategy.execution_strategy, "direct");
+  assert.equal(strategy.execution_effort, "tiny");
+  assert.equal(strategy.preciseTarget, "src/app/page.tsx");
+});
+
+test("bounded text localization declines ambiguity, explicit restrictions, large files and behavior work", async (t) => {
+  const f = await fixture(t);
+  await mkdir(join(f.root, "src/app"), {recursive:true});
+  await mkdir(join(f.root, "pages"));
+  await writeFile(join(f.root, "src/app/page.tsx"), "export default()=> <button>Old</button>");
+  const task = "Change the homepage button text to 'New'";
+  let profile = await profileRepo(f.root);
+  assert.ok(await boundedTextEditExploration(f.root, task, profile));
+  assert.equal(await boundedTextEditExploration(f.root, task + ". Modify only src/other.ts", profile), undefined);
+  assert.equal(await boundedTextEditExploration(f.root, task + ". Modify only files within src/app", profile), undefined);
+  assert.equal(await boundedTextEditExploration(f.root, task + " and implement authentication", profile), undefined);
+  await writeFile(join(f.root, "pages/index.tsx"), "export default()=> <button>Old</button>");
+  profile = await profileRepo(f.root);
+  assert.equal(await boundedTextEditExploration(f.root, task, profile), undefined);
+  await rm(join(f.root, "pages/index.tsx"));
+  await writeFile(join(f.root, "src/app/page.tsx"), "x".repeat(33_000));
+  profile = await profileRepo(f.root);
+  assert.equal(await boundedTextEditExploration(f.root, task, profile), undefined);
+});
+
+test("explicit existing scope skips semantic discovery even for complex independent batch logic", async t => {
+  const f=await fixture(t);
+  const task="Modify src/budget.ts and add regression tests in tests/budget.test.ts. Implement three algorithms behind a batch API; each invocation must be independent. Preserve every requirement.";
+  const route={...chooseExecutionStrategy(task,f.profile),execution_strategy:"stable" as const};
+  const result=fastPathExploration(task,f.profile,route);
+  assert.deepEqual(result?.editableCandidates.map(x=>x.path).sort(),["src/budget.ts","tests/budget.test.ts"]);
+  assert.equal(fastPathExploration("Refactor throughout the entire repository including src/budget.ts",f.profile,route),undefined);
+  const readonly=fastPathExploration("Modify src/budget.ts. Read tests/budget.test.ts as context; preserve existing tests.",f.profile,route);
+  assert.ok(!readonly?.editableCandidates.some(x=>x.path==="tests/budget.test.ts"));
+});
+
+test('header copy localization follows UI imports instead of identical favicon literals in a large repo', async t => {
+  const f = await fixture(t);
+  await mkdir(join(f.root, 'src/components'), { recursive: true });
+  await mkdir(join(f.root, 'src/app'), { recursive: true });
+  await writeFile(join(f.root, 'src/components/site-header.tsx'), "import { Logo } from '@site/brand-logo';export function Header(){return <header><Logo/></header>}");
+  await writeFile(join(f.root, 'tsconfig.json'), JSON.stringify({compilerOptions:{paths:{'@site/*':['./src/components/*']}}}));
+  await writeFile(join(f.root, 'src/components/brand-logo.tsx'), "export function Logo(){return <span>sample.</span>}");
+  await writeFile(join(f.root, 'src/app/icon.tsx'), "export default function Icon(){return <span>sample.</span>}");
+  await writeFile(join(f.root, 'src/app/apple-icon.tsx'), "export default function Icon(){return <span>sample.</span>}");
+  for (let i = 0; i < 20; i++) await writeFile(join(f.root, `src/other-${i}.tsx`), 'export default()=> <div/>');
+  const profile = await profileRepo(f.root);
+  const evidence = await boundedTextEditExploration(f.root, 'Ændrer navnet på headeren fra sample. til newname', profile);
+  assert.deepEqual(evidence?.editableCandidates.map(file => file.path), ['src/components/brand-logo.tsx']);
+  assert.ok(evidence?.readonlyFiles.some(file => file.path === 'src/components/site-header.tsx'));
+  await writeFile(join(f.root, 'src/components/brand-logo.tsx'), 'export function Logo(){return <span>other</span>}');
+  assert.equal(await boundedTextEditExploration(f.root, 'Change header text from sample. to newname', profile), undefined,
+    'favicon-only evidence must not authorize a header edit');
+});
+
+test('fallback preserves all explicit multi-file edits including entrypoint and tests, excluding preserved files',async t=>{
+ const f=await fixture(t);await mkdir(join(f.root,'src/operations'));
+ const paths=['src/index.cjs','src/operations/a.cjs','src/operations/b.cjs','src/operations/c.cjs','tests/api.test.cjs'];
+ for(const p of paths)await writeFile(join(f.root,p),'module.exports=()=>null;');
+ const profile=await profileRepo(f.root);
+ const task='Modify src/index.cjs and src/operations/a.cjs, src/operations/b.cjs, src/operations/c.cjs. Add regression tests in tests/api.test.cjs. Preserve package.json and README.md.';
+ const result=await deterministicRepositoryExploration(f.root,task,profile);
+ for(const path of paths)assert.ok(result.editableCandidates.some(p=>p.path===path),path);
+ assert.ok(!result.editableCandidates.some(p=>p.path==='package.json'));
+ const restricted=await deterministicRepositoryExploration(f.root,'Modify only src/index.cjs. Do not modify src/operations/a.cjs.',profile);
+ assert.deepEqual(restricted.editableCandidates.map(p=>p.path),['src/index.cjs']);
 });

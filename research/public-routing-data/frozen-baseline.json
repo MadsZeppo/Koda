@@ -1,0 +1,17 @@
+{
+  "research/cold-start-v6-pareto/artifacts/coverage.json": "924f1c8586d8f1bb01f591c0375dc75336bb83db26478e0d22a530328686cb5e",
+  "research/cold-start-v6-pareto/artifacts/decisions.json": "44a912c3eb4f16f12cd166f571a0e065c848bbbbc93f27fa8458b65084b84f6b",
+  "research/cold-start-v6-pareto/artifacts/evaluation-features.json": "a009e7f5923a98a561990f0cd1ede2b148cd2d922246d5d00995a9d209a3c8b9",
+  "research/cold-start-v6-pareto/artifacts/evaluation-inputs.json": "142f97bc8df75b1bfb5ba084747bdf4fc4a776ead4644aab36ca65c3bcc6c73a",
+  "research/cold-start-v6-pareto/artifacts/frozen.json": "4e083a7a761f8a40630f4d20aa6a9832224c92585ea36347583c15a47e5dc8e5",
+  "research/cold-start-v6-pareto/artifacts/paired.json": "d2a0838180c16134d536bcd07bbb143e4dcd4e0efc384056788b974d37ea3cfc",
+  "research/cold-start-v6-pareto/artifacts/predictor.json": "4df34f3de4785991d72c8a4dd00018642d7e2daaccc6ebf3371344ad7a0add3d",
+  "research/cold-start-v6-pareto/artifacts/protocol.json": "863483d7acb0caef6a686f593acaadff176468941d8cf08d92466f42763e4202",
+  "research/cold-start-v6-pareto/artifacts/results.json": "2f734aecf824dc8f3e3b018a0bd480477fbb93f441f4070ab6f69603c667862f",
+  "research/cold-start-v6-pareto/artifacts/routing-inputs.json": "0b48beb5c90d120ec7312c44537650ccb7af3d2339b4d5a005f0661188df8587",
+  "research/cold-start-v6-pareto/artifacts/train-features.json": "9bb842517618edcb11d47a828a8e294d84fa0d810071c96d1f0de2cf40e16390",
+  "research/cold-start-v6-pareto/artifacts/train-inputs.json": "4dcaab025ac5018c7d722a799647b724a9d2cab9a302947eab583fd9a6c0e835",
+  "src/router/capabilityRoutingV6.ts": "4349ff30c82415ca5a266a525d0ed6f2a767aa5a424ed418f87ad96759a6d9bc",
+  "src/router/startRouterV6.ts": "16533c133ffa3bf35fc9e650c7737ef169ac67c791cfe12693a10e793b6124b2",
+  "src/router/stepRouterV6.ts": "d622b8ff2590ec96442c4cbb1f881ec4ff629a9c88d81c4d862903b228bf212e"
+}

@@ -5,11 +5,47 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   verify,
+  retryOperationalVerification,
+  runtimeInfrastructureFailure,
   verificationAgainstBaseline,
   verificationRegressions,
   verificationResult,
 } from "../src/verifier/verifier.js";
 import { pythonSandboxEnvironment } from "../src/repo/commands.js";
+
+test("an internal build-tool fault is retried once without retrying source regressions", async () => {
+  const internal = {
+    command: "npm run build", exitCode: 1, stdout: "",
+    stderr: "next/font/google queries have exactly one entry\nError while looking up import map",
+    wallClockMs: 1, timedOut: false,
+  };
+  const pass = { ...internal, exitCode: 0, stderr: "", stdout: "build passed" };
+  const options = { strictPythonEnvironment: false, pythonCommand: false, remainingMs: 20_000 };
+  assert.equal(runtimeInfrastructureFailure(internal), "verification_tool_internal_error");
+  let calls = 0;
+  const recovered = await retryOperationalVerification(internal, async () => {
+    calls++;
+    return { ...pass };
+  }, options);
+  assert.equal(calls, 1);
+  assert.equal(recovered.exitCode, 0);
+  assert.equal(recovered.infrastructureRecoveryAttempts, 1);
+
+  const persistent = await retryOperationalVerification(internal, async () => {
+    calls++;
+    return { ...internal };
+  }, options);
+  assert.equal(calls, 2);
+  assert.equal(runtimeInfrastructureFailure(persistent), "verification_tool_internal_error");
+
+  const compilerRegression = { ...internal, stderr: "Type error: missing required property" };
+  assert.equal(runtimeInfrastructureFailure(compilerRegression), undefined);
+  assert.equal(await retryOperationalVerification(compilerRegression, async () => {
+    calls++;
+    return { ...pass };
+  }, options), compilerRegression);
+  assert.equal(calls, 2);
+});
 
 async function concreteSystemPython(root: string) {
   const resolved = await pythonSandboxEnvironment(root, {

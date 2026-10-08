@@ -13,6 +13,28 @@ export type Difficulty = "low" | "medium" | "high";
 export type TaskFamily = "localized_bugfix" | "debugging" | "test_change" | "refactor" |
   "frontend_ui" | "backend_api" | "database" | "architecture" | "devops" |
   "documentation" | "multi_component";
+
+/**
+ * Language-level visual intent shared by routing and deterministic UI scope
+ * inference. Repository evidence still decides which paths may be edited.
+ */
+export function visualDesignTask(task: string): boolean {
+  const explicitVisual =
+    /\b(?:visual|design|redesign|screenshot|image|pixel|layout|spacing|styles?|styling|responsive|appearance|colou?r|theme|dark|black|background)\b|\b(?:visuel|design|redesign|skærmbillede|billede|layout|afstand|stil|styling|udseende|farve|tema|mørk|sort|baggrund)\b/i.test(task);
+  const uiQualityRequest =
+    /\b(?:ui|ux|interface|frontend|pages?|screens?|home ?page|landing page|front ?page|website|site|app|forside[nr]?|hjemmeside[nr]?|landingsside[nr]?|side[nr]?|skærm(?:en)?)\b/i.test(task) &&
+    /\b(?:polish(?:ed)?|professional|beautiful|modern|premium|top[- ]?level|stripe[- ]?level|flot|professionel(?:t)?|moderne|eksklusiv(?:t)?)\b/i.test(task);
+  return explicitVisual || uiQualityRequest;
+}
+
+export function broadVisualDesignTask(task: string): boolean {
+  const broadSurface =
+    /\b(?:whole|entire|all)\s+(?:app|application|site|website|ui|pages?|home ?page|landing page|front ?page)\b|\b(?:site|app)[- ]wide\b|\bglobal(?:ly)?\b[^.\n]{0,40}\b(?:ui|style|theme|color|background)\b|\b(?:hele\s+(?:appen|appens|sitet|websitet|hjemmesiden|sidens|ui|forsiden|landingssiden)|alle\s+sider|på\s+tværs\s+af\s+(?:appen|sitet|hjemmesiden)|overalt)\b/i.test(task);
+  const sharedThemeControl =
+    /\b(?:dark mode|light mode|theme (?:switch|toggle)|color scheme)\b|\b(?:mørk tilstand|lys tilstand|tema(?:skift|knap)|farvetema)\b/i.test(task) &&
+    /\b(?:app|application|site|website|pages?|navigation)\b|\b(?:hjemmeside[nr]?|appen|sider|navigation)\b/i.test(task);
+  return (broadSurface || sharedThemeControl) && visualDesignTask(task);
+}
 export interface TaskDifficulty {
   technicalComplexity: Difficulty;
   visualComplexity: Difficulty;
@@ -256,7 +278,8 @@ export function taskFingerprint(
   const frontend = /\b(?:ui|ux|frontend|react|vue|svelte|css|styling|layout|responsive|browser)\b/.test(text);
   const backend = /\b(?:backend|api|server|endpoint|service|controller)\b/.test(text);
   add("architecture", /\b(?:architect|migration|schema redesign|system design)\b/.test(text));
-  add("sql_database", /\b(?:sql|database|postgres|sqlite|query|migration)\b/.test(text));
+  add("sql_database", /\b(?:sql|database|postgres|sqlite|migration)\b/.test(text) ||
+    (/\bquery\b/.test(text) && !/\bquery[- ]?parameters?\b/.test(text)));
   add("devops", /\b(?:deploy|docker|kubernetes|ci|pipeline|terraform|infra)\b/.test(text));
   add("fullstack", frontend && backend);
   add("frontend_ui", frontend && !backend);
@@ -281,11 +304,11 @@ export function taskFingerprint(
     : features.implementationFiles === 1 && subtask.likelyWritePaths.length > 1 && subtask.likelyWritePaths.length <= 3 ? "localized"
     : subtask.likelyWritePaths.length > 1 ? "multi-file"
     : subtask.likelyWritePaths.length === 1 ? "single" : "localized";
-  const visualRelevant = /\b(?:visual|design|screenshot|image|pixel|layout|spacing|styling|responsive|appearance|color)\b/.test(text);
+  const visualRelevant = visualDesignTask(text);
   const visionRequired = /\b(?:inspect|compare|read|analy[sz]e)\b.{0,40}\b(?:screenshot|image|picture)\b/.test(text);
   const checks = verification?.checks ?? [];
   // Generic build/typecheck is not evidence that subjective UI or prose meets the task.
-  const subjective = (visualRelevant && /\b(?:polish|redesign|design|look|feel|layout|spacing|color|visual|style|appearance|interface)\b/.test(text)) || kinds.includes("documentation");
+  const subjective = (visualRelevant && /\b(?:polish|redesign|design|look|feel|layout|spacing|colou?r|visual|style|appearance|interface|professional|beautiful|premium|top[- ]?level|stripe[- ]?level|flot|professionel(?:t)?|moderne|udseende)\b/.test(text)) || kinds.includes("documentation");
   const focusedCheck = [...subtask.verificationCommands, ...checks.filter((check) =>
     check.outcome === "CHECK_PASS" || check.outcome === "CHECK_FAIL",
   ).map((check) => check.command)].some((command) =>
@@ -397,7 +420,7 @@ export function taskFingerprint(
     subtask.likelyWritePaths[0] === ".";
   const difficulty: TaskDifficulty = {
     technicalComplexity: technical,
-    visualComplexity: visualRelevant ? high(/\b(?:redesign|design.system|complex.layout|pixel.perfect)\b/) ? "high" : "medium" : "low",
+    visualComplexity: visualRelevant ? high(/\b(?:redesign|design.system|complex.layout|pixel.perfect|top[- ]?level|stripe[- ]?level|professionel(?:t)?)\b/) ? "high" : "medium" : "low",
     architecturalComplexity: architecture ? "high" : architecturalCoupling,
     interactionComplexity: interactions && architecture ? "high" : interactions || concurrency ? "medium" : "low",
     repoReasoningComplexity: scope === "cross-component" ? "high" : toolExplorationNeed,

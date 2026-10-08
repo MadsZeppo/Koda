@@ -63,3 +63,25 @@ test("tool results enforce a byte cap and history trimming preserves paired tool
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("discovery excludes backups, caches and nested worktrees without hiding mutation evidence", async () => {
+  const { mkdir } = await import("node:fs/promises");
+  const { profileRepo } = await import("../src/repo/profiler.js");
+  const { snapshotTree } = await import("../src/workspace/files.js");
+  const root = await mkdtemp(join(tmpdir(), "koda-discovery-noise-"));
+  try {
+    for (const file of ["src/answer.js", "src/answer.js.before-repair", "backups/answer.js", ".cache/answer.js", ".worktrees/old/src/answer.js"]) {
+      const { dirname } = await import("node:path");
+      await mkdir(dirname(join(root, file)), { recursive: true });
+      await writeFile(join(root, file), "export const requestedAnswer = 42;\n");
+    }
+    const logger = new Logger(join(root, ".koda"), "discovery-noise", true);
+    const tools = new AgentTools(root, true, 1000, logger, "worker");
+    assert.equal(String(await tools.execute("list_files", {})), "src/answer.js");
+    const hits = String(await tools.execute("search_code", { query: "requestedAnswer" }));
+    assert.match(hits, /src\/answer.js/);
+    assert.doesNotMatch(hits, /before-repair|backups|\.cache|\.worktrees/);
+    assert.deepEqual((await profileRepo(root)).files, ["src/answer.js"]);
+    assert.ok((await snapshotTree(root)).files["backups/answer.js"], "Safety snapshots must still detect edits to excluded discovery files");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

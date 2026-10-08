@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
-import { access, cp, lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { existsSync, constants } from "node:fs";
+import { access, cp, lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile, symlink } from "node:fs/promises";
 import { arch, homedir, platform } from "node:os";
 import { basename, delimiter, dirname, join, posix, relative, resolve } from "node:path";
 import { execa } from "execa";
@@ -13,6 +13,42 @@ export interface DependencyBridge {
 }
 
 const registered = new Map<string, DependencyBridge[]>();
+
+/** A real, isolated dependency directory for tools that reject external links.
+ * Clone files where supported; never hardlink writable candidate files to the host.
+ * Package/bin symlinks remain internal to the copied tree. */
+export async function materializeDependencyTree(source: string, target: string) {
+  const root = await realpath(source);
+  try {
+    await mkdir(dirname(target), { recursive: true });
+    // Native APFS cloning avoids thousands of sequential JS file-copy calls.
+    const cloned = process.platform === "darwin" &&
+      (await execa("/bin/cp", ["-cR", root, target], { reject: false })).exitCode === 0;
+    if (!cloned)
+      await cp(root, target, {
+        recursive: true, verbatimSymlinks: true, mode: constants.COPYFILE_FICLONE,
+      });
+    const relocate = async (directory: string) => {
+      for (const entry of await readdir(directory, { withFileTypes: true })) {
+        const destination = join(directory, entry.name);
+        if (entry.isDirectory()) await relocate(destination);
+        else if (entry.isSymbolicLink()) {
+          const original = join(root, relative(target, destination));
+          const resolved = await realpath(original);
+          const suffix = relative(root, resolved);
+          if (suffix === ".." || suffix.startsWith("../") || resolve(root, suffix) !== resolved)
+            throw Error("Dependency symlink escapes the registered dependency tree");
+          await rm(destination);
+          await symlink(relative(dirname(destination), join(target, suffix)), destination);
+        }
+      }
+    };
+    await relocate(target);
+  } catch (error) {
+    await rm(target, { recursive: true, force: true });
+    throw error;
+  }
+}
 const registeredPython = new Map<string, string>();
 export interface NodeRuntimeEnvironment {
   executable: string;

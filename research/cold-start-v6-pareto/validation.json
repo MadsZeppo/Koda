@@ -1,0 +1,52 @@
+{
+  "typecheck": "PASS",
+  "researchTypecheck": "PASS",
+  "focusedTS": {
+    "total": 28,
+    "passed": 28,
+    "failed": 0
+  },
+  "python": {
+    "total": 4,
+    "passed": 4,
+    "failed": 0
+  },
+  "full": {
+    "total": 1107,
+    "passed": 1106,
+    "skipped": 1,
+    "failed": 0
+  },
+  "evaluationTasks": 100,
+  "effectiveModels": 12,
+  "paidCalls": 0,
+  "productionAuthorityChanged": false,
+  "liveHarness": "deferred under failed-quality stop condition; no paid or dynamic dispatch executed",
+  "filesChanged": [
+    "research/cold-start-v6-pareto/.gitignore",
+    "research/cold-start-v6-pareto/README.md",
+    "research/cold-start-v6-pareto/artifacts/REPORT.md",
+    "research/cold-start-v6-pareto/artifacts/coverage.json",
+    "research/cold-start-v6-pareto/artifacts/decisions.json",
+    "research/cold-start-v6-pareto/artifacts/evaluation-features.json",
+    "research/cold-start-v6-pareto/artifacts/evaluation-inputs.json",
+    "research/cold-start-v6-pareto/artifacts/frozen.json",
+    "research/cold-start-v6-pareto/artifacts/paired.json",
+    "research/cold-start-v6-pareto/artifacts/predictor.json",
+    "research/cold-start-v6-pareto/artifacts/protocol.json",
+    "research/cold-start-v6-pareto/artifacts/results.json",
+    "research/cold-start-v6-pareto/artifacts/routing-inputs.json",
+    "research/cold-start-v6-pareto/artifacts/train-features.json",
+    "research/cold-start-v6-pareto/artifacts/train-inputs.json",
+    "research/cold-start-v6-pareto/licenses/pareto-router.txt",
+    "research/cold-start-v6-pareto/licenses/weave.txt",
+    "research/cold-start-v6-pareto/sources.json",
+    "research/cold-start-v6-pareto/src/audit.py",
+    "research/cold-start-v6-pareto/src/encode.ts",
+    "research/cold-start-v6-pareto/src/experiment.py",
+    "research/cold-start-v6-pareto/src/router.ts",
+    "research/cold-start-v6-pareto/src/select.ts",
+    "research/cold-start-v6-pareto/src/test_audit.py",
+    "tests/paretoResearchV62.test.ts"
+  ]
+}

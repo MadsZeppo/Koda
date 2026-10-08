@@ -33,9 +33,16 @@ export function extractFeatures(
   // implementation modules merely because tests live in a different directory.
   const implementationPaths = paths.filter((path) => !isTestPath(path));
   const modulePaths = implementationPaths.length ? implementationPaths : paths;
-  const requiresCrossModuleReasoning =
-    /\b(?:across\s+(?:modules?|components?|packages?|services?)|cross[ -]module)\b/.test(text) ||
-    new Set(modulePaths.map(dirname)).size > 1;
+  const explicitlyCrossModule =
+    /\b(?:across\s+(?:modules?|components?|packages?|services?)|cross[ -]module)\b/.test(text);
+  const concreteBoundedScope = paths.length > 0 && paths.length <= 4 &&
+    paths.every((path) => path !== "." && !/[?*{}[\]]/.test(path));
+  // Directory boundaries alone do not make a small, already-localized edit an
+  // architectural task. A component, its stylesheet and a route commonly live
+  // in different directories while still forming one bounded implementation.
+  // Keep genuinely broad or explicitly cross-module work on the stronger path.
+  const requiresCrossModuleReasoning = explicitlyCrossModule ||
+    (!concreteBoundedScope && new Set(modulePaths.map(dirname)).size > 1);
   const complexity =
     subtask.estimatedDifficulty === "high" || requiresArchitectureReasoning
       ? "large"
@@ -43,7 +50,7 @@ export function extractFeatures(
         ? "medium"
         : "small";
   const stack = compactEcosystem(profile.ecosystem, paths);
-  const boundedScope = paths.length > 0 && paths.length <= 3 && !requiresCrossModuleReasoning;
+  const boundedScope = concreteBoundedScope && !requiresCrossModuleReasoning;
   const knownTargets = paths.filter((path) => profile.files.includes(path));
   const readTargets = knownTargets.filter((path) => subtask.likelyReadPaths.includes(path));
   const localizationConfidence = !paths.length || !knownTargets.length ? "low" as const

@@ -240,6 +240,12 @@ for (const mode of [
         assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
         assert.ok(f.repairCalls >= 1);
         assert.ok(events.some((event) => event.type === "stable_final_repair_start"));
+        if (mode === "compiler")
+          assert.ok(events.some((event) =>
+            event.type === "verification_reused" &&
+            event.phase === "final" &&
+            event.commands.length > 0),
+          "a passing repair check for the same candidate should not run again during final verification");
         const lock = events.find((event) => event.type === "stable_discovery_scope_locked");
         assert.deepEqual(lock.repair_write_scope, lock.actual_changed_paths);
         assert.equal(await readFile(join(result.integration!.path, "tests/calc.test.cjs"), "utf8"), goodTest);

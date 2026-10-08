@@ -285,10 +285,38 @@ export async function applyChangeFiles(
   source: string,
   target: string,
   changes: FileChange[],
+  compareOriginal = false,
 ) {
+  validateChangePaths(changes);
+  // Check every destination before writing any path. A replaced parent must
+  // never redirect a permitted write through a symlink or hardlink.
+  const root = await realpath(target);
+  for (const change of changes) {
+    for (let path = join(root, change.path); path !== root; path = dirname(path)) {
+      try {
+        const stat = await lstat(path);
+        if (stat.isSymbolicLink() || (stat.isFile() && stat.nlink > 1))
+          throw Error(`Unsafe apply destination: ${change.path}`);
+      } catch (error: any) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+    }
+  }
   for (const change of changes) {
     const destination = join(target, change.path);
+    const assertOriginal = async () => {
+      if (!compareOriginal) return;
+      const stat = await lstat(destination).catch((error) => {
+        if (error.code !== 'ENOENT') throw error;
+        return undefined;
+      });
+      if (change.type === 'create' ? !!stat : !stat || !stat.isFile() ||
+          (stat.mode & 0o777) !== change.beforeMode ||
+          hash(await readFile(destination)) !== change.beforeHash)
+        throw Error(`APPLY_CONFLICT: Original file changed before write: ${change.path}`);
+    };
     if (change.type === "delete") {
+      await assertOriginal();
       await rm(destination, { force: true });
       continue;
     }
@@ -302,7 +330,13 @@ export async function applyChangeFiles(
       `.koda-${randomUUID()}.tmp`,
     );
     await copyFile(sourcePath, temporary);
+    if (change.afterHash && hash(await readFile(temporary)) !== change.afterHash) {
+      await rm(temporary, { force: true });
+      throw Error(`Verified source changed while applying: ${change.path}`);
+    }
     await chmod(temporary, change.afterMode ?? 0o644);
+    try { await assertOriginal(); }
+    catch (error) { await rm(temporary, { force: true }); throw error; }
     await rename(temporary, destination);
   }
 }

@@ -1,0 +1,17 @@
+{
+  "version": "6.2",
+  "qualityEstimator": "Pareto multi-output Ridge alpha=10 sparse_cg; task TF-IDF + existing Koda TaskCapabilityProfile features",
+  "fit": "frozen SWE TRAIN only",
+  "costEstimator": "per-model observed TRAIN mean receipt; no evaluation receipt in routing",
+  "gaps": [
+    0.01,
+    0.02,
+    0.03
+  ],
+  "normalCapability": "soft feature, no domain hard floor",
+  "hardRisk": "only explicit attested serious security/destructive schema/transaction concurrency/Koda invariant restrictions; lexical proxy alone cannot attest seriousness",
+  "reference": "highest TRAIN success rate then TRAIN mean cost then canonical identity",
+  "evaluation": "unchanged previously observed V3/V4/V6 FINAL100; retrospective",
+  "stop": "no quality/cost frontier improvement OR harmful downgrade > configured 3pp maximum OR retained solve <97%; no retuning",
+  "paidCalls": 0
+}

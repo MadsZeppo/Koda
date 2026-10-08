@@ -1,4 +1,9 @@
 import { posix } from "node:path";
+import { generatedPath } from "./ecosystem.js";
+
+/** Discovery noise stays out of prompts, but remains visible to mutation safety checks. */
+export const discoveryNoise = (path: string) => generatedPath(path) ||
+  /(?:^|\/)(?:\.cache|\.worktrees?|worktrees|backups?|\.codex|\.aider)(?:\/|$)|(?:\.before[-.]|\.(?:bak|orig|swp)$|~$)/i.test(path);
 
 const testPath = (path: string) => /(?:^|\/)(?:tests?|__tests__)(?:\/|$)|(?:^|\/)test_|[._](?:test|spec)\./i.test(path);
 const stem = (path: string) => posix.basename(path).replace(/\.[^.]+$/, "").replace(/^(?:test_|spec_)/i, "").replace(/[._-](?:test|spec)$/i, "").toLowerCase();

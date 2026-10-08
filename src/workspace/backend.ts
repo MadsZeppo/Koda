@@ -1,5 +1,6 @@
 import {
   copyFile,
+  lstat,
   mkdir,
   readFile,
   realpath,
@@ -12,6 +13,7 @@ import type { Logger } from "../telemetry/logger.js";
 import { git } from "../repo/commands.js";
 import { Worktrees } from "../worktrees/manager.js";
 import { Integrator } from "../integration/integrator.js";
+import { verifyAppliedRepository } from './verification.js';
 import {
   applyChangeFiles,
   changesBetween,
@@ -67,11 +69,12 @@ export interface WorkspaceBackend {
     output: string,
     integration: WorkspaceInstance,
     verified: boolean,
+    acceptedChanges?: FileChange[],
   ): Promise<ApplyResult>;
 }
 export interface ApplyResult {
   requested: boolean;
-  status: "preview" | "applied" | "conflict" | "not_verified";
+  status: "preview" | "applied" | "conflict" | "not_verified" | "verification_failed";
   conflicts: string[];
   changes: FileChange[];
 }
@@ -87,7 +90,9 @@ async function detectState(root: string) {
   const top = await realpath(result.stdout.trim());
   if (top !== root) return { state: "non_git" as const, isGit: false };
   const status = await git(root, "status", "--porcelain", "--untracked-files=all");
+  const revision = await execa("git", ["rev-parse", "--verify", "HEAD"], { cwd: root, reject: false });
   return {
+    hasHead: revision.exitCode === 0,
     state: status ? ("dirty_git" as const) : ("clean_git" as const),
     status,
     isGit: true,
@@ -131,8 +136,11 @@ abstract class BaseBackend implements WorkspaceBackend {
     output: string,
     integration: WorkspaceInstance,
     verified: boolean,
+    acceptedChanges?: FileChange[],
   ): Promise<ApplyResult> {
     const changes = await this.persistCandidate(output, integration);
+    if (verified && acceptedChanges && JSON.stringify(changes) !== JSON.stringify(acceptedChanges))
+      throw Error('Verified integration changed before apply');
     if (!verified) {
       await updateArtifact(output, { applyStatus: "not_verified" });
       return {
@@ -158,11 +166,18 @@ abstract class BaseBackend implements WorkspaceBackend {
           : !!now;
       })
       .map((change) => change.path);
+    for (const change of changes.filter((change) => change.type === 'create')) {
+      if (await lstat(join(this.originalRoot, change.path)).catch((error) => {
+        if (error.code !== 'ENOENT') throw error;
+        return undefined;
+      })) if (!conflicts.includes(change.path)) conflicts.push(change.path);
+    }
     if (conflicts.length) {
       await updateArtifact(output, { applied: false, applyStatus: "conflict", applyConflicts: conflicts });
       return { requested: true, status: "conflict", conflicts, changes };
     }
-    await applyChangeFiles(integration.path, this.originalRoot, changes);
+    await assertCandidateMatches(integration.path, changes);
+    await applyVerifiedChanges(output, integration.path, this.originalRoot, changes);
     const applied = await snapshotTree(this.originalRoot, undefined, this.explicitlyIncluded);
     const accepted = await this.changes(integration.path);
     if (JSON.stringify(accepted) !== JSON.stringify(changes) || changes.some((change) => {
@@ -365,7 +380,7 @@ export async function createWorkspaceBackend(
     baseCommit,
     explicitlyIncluded,
   ] as const;
-  return detected.isGit && detected.state === "clean_git"
+  return detected.isGit && detected.hasHead && detected.state === "clean_git"
     ? new GitBackend(...args)
     : new FilesystemBackend(...args);
 }
@@ -398,7 +413,7 @@ async function writeApplyArtifact(
   if (changes.length) {
     const baseline = await realpath(join(workspace, "before"));
     const candidate = await realpath(join(workspace, "after"));
-    const diff = await execa(
+    let diff = await execa(
       "git",
       [
         "diff",
@@ -412,14 +427,19 @@ async function writeApplyArtifact(
         candidate,
       ],
       { reject: false, maxBuffer: 16 * 1024 * 1024 },
-    );
-    if (diff.exitCode !== 0 && diff.exitCode !== 1)
+    ).catch((error) => {
+      if (error.code !== 'ENOENT') throw error;
+      return undefined;
+    });
+    if (diff?.code === 'ENOENT') diff = undefined;
+    if (diff && diff.exitCode !== 0 && diff.exitCode !== 1)
       throw Error(`Candidate patch generation failed: ${diff.stderr}`);
-    const normalized = diff.stdout
+    const normalized = diff ? diff.stdout
       .replaceAll(`a${baseline}/`, "a/")
       .replaceAll(`b${candidate}/`, "b/")
       .replaceAll(`a/${baseline.replace(/^\//, "")}/`, "a/")
-      .replaceAll(`b/${candidate.replace(/^\//, "")}/`, "b/");
+      .replaceAll(`b/${candidate.replace(/^\//, "")}/`, "b/")
+      : await filesystemCandidatePatch(baseline, candidate, changes);
     await writeFile(join(output, "candidate.patch"), normalized + (normalized.endsWith("\n") ? "" : "\n"));
   }
   await writeFile(
@@ -446,6 +466,27 @@ async function writeApplyArtifact(
       2,
     ),
   );
+}
+
+async function filesystemCandidatePatch(before: string, after: string, changes: FileChange[]) {
+  const patches: string[] = [];
+  for (const change of changes) {
+    const a = change.type === 'create' ? Buffer.alloc(0) : await readFile(join(before, change.path));
+    const b = change.type === 'delete' ? Buffer.alloc(0) : await readFile(join(after, change.path));
+    const header = `diff --git a/${change.path} b/${change.path}\n`;
+    if ([a, b].some((bytes) => bytes.includes(0) || !Buffer.from(bytes.toString('utf8')).equals(bytes))) {
+      patches.push(`${header}Binary files differ; exact before/after bytes are preserved in workspace/\n`);
+      continue;
+    }
+    const lines = (bytes: Buffer) => bytes.length ? bytes.toString('utf8').replace(/\n$/, '').split('\n') : [];
+    const old = lines(a), next = lines(b);
+    const body = (rows: string[], prefix: string, bytes: Buffer) => rows.map((row, index) =>
+      `${prefix}${row}\n${index === rows.length - 1 && !bytes.toString('utf8').endsWith('\n') ? '\\ No newline at end of file\n' : ''}`).join('');
+    patches.push(`${header}--- ${change.type === 'create' ? '/dev/null' : `a/${change.path}`}\n` +
+      `+++ ${change.type === 'delete' ? '/dev/null' : `b/${change.path}`}\n` +
+      `@@ -${old.length ? 1 : 0},${old.length} +${next.length ? 1 : 0},${next.length} @@\n` + body(old, '-', a) + body(next, '+', b));
+  }
+  return patches.join('');
 }
 async function updateArtifact(output: string, values: Record<string, unknown>) {
   const path = join(output, "workspace.json");
@@ -518,6 +559,12 @@ export async function applyWorkspaceRun(output: string) {
         : !!now;
     })
     .map((change) => change.path);
+  for (const change of changes.filter((change) => change.type === 'create')) {
+    if (await lstat(join(root, change.path)).catch((error) => {
+      if (error.code !== 'ENOENT') throw error;
+      return undefined;
+    })) if (!conflicts.includes(change.path)) conflicts.push(change.path);
+  }
   if (conflicts.length) {
     await updateArtifact(output, {
       applied: false,
@@ -528,7 +575,9 @@ export async function applyWorkspaceRun(output: string) {
     await updateSummaryApply(output, "conflict", conflicts);
     return { status: "APPLY_CONFLICT" as const, conflicts, changes };
   }
-  await applyChangeFiles(join(output, "workspace", "after"), root, changes);
+  await assertCandidateMatches(join(output, "workspace", "after"), changes);
+  await applyVerifiedChanges(output, join(output, "workspace", "after"), root, changes);
+  await assertCandidateMatches(root, changes);
   await updateArtifact(output, {
     applied: true,
     applyRequested: true,
@@ -536,7 +585,82 @@ export async function applyWorkspaceRun(output: string) {
     applyConflicts: [],
   });
   await updateSummaryApply(output, "applied", []);
+  if (summary.verification) {
+    let verification;
+    try {
+      verification = await verifyAppliedRepository(root, summary.verification, summary.applyVerificationTimeoutMs ?? 120_000, undefined, changes);
+      await assertCandidateMatches(root, changes);
+    } catch (error) {
+      await updateArtifact(output, { applyStatus: 'verification_failed', applyError: String(error) });
+      const rollback = await rollbackAppliedRun(output);
+      await writeFile(join(output, 'summary.json'), JSON.stringify({ ...summary,
+        status: 'NOT_FULLY_VERIFIED', applyRequested: true, applyResult: 'verification_failed',
+        applyRollback: rollback, revertStatus: rollback.status === 'REVERTED' ? 'reverted' : 'conflict',
+        revertConflicts: rollback.conflicts,
+        error: `Applied repository verification failed: ${String(error)}`,
+      }, null, 2));
+      return { status: 'APPLY_VERIFICATION_FAILED' as const, conflicts: [], changes };
+    }
+    const rollback = verification.status !== 'VERIFIED_SUCCESS' ? await rollbackAppliedRun(output) : undefined;
+    await writeFile(join(output, 'summary.json'), JSON.stringify({ ...summary,
+      status: verification.status, verification, applyRequested: true,
+      applyResult: verification.status === 'VERIFIED_SUCCESS' ? 'applied' : 'verification_failed',
+      applyConflicts: [], appliedVerification: verification,
+      ...(rollback ? { applyRollback: rollback, revertStatus: rollback.status === 'REVERTED' ? 'reverted' : 'conflict', revertConflicts: rollback.conflicts } : {}),
+    }, null, 2));
+    if (verification.status !== 'VERIFIED_SUCCESS') {
+      await updateArtifact(output, { applyStatus: 'verification_failed', appliedVerification: verification });
+      return { status: 'APPLY_VERIFICATION_FAILED' as const, conflicts: [], changes };
+    }
+    await updateArtifact(output, { appliedVerification: verification });
+  }
   return { status: "APPLIED" as const, conflicts: [], changes };
+}
+
+export async function rollbackAppliedRun(output: string) {
+  try { return await revertWorkspaceRun(output); }
+  catch (error) {
+    const artifact = JSON.parse(await readFile(join(output, 'workspace.json'), 'utf8'));
+    const conflicts = (artifact.changes as FileChange[]).map((change) => change.path);
+    await updateArtifact(output, { revertStatus: 'conflict', revertConflicts: conflicts, revertError: String(error) });
+    return { status: 'REVERT_CONFLICT' as const, conflicts, error: String(error) };
+  }
+}
+
+/** Roll back completed writes on a mid-apply error, without replacing new user edits. */
+export async function applyVerifiedChanges(output: string, source: string, target: string, changes: FileChange[]) {
+  const completed: FileChange[] = [];
+  try {
+    for (const change of changes) {
+      await applyChangeFiles(source, target, [change], true);
+      completed.push(change);
+    }
+  } catch (error) {
+    const conflicts: string[] = [];
+    for (const change of completed.reverse()) {
+      const inverse: FileChange = {
+        path: change.path,
+        type: change.type === 'create' ? 'delete' : change.type === 'delete' ? 'create' : 'modify',
+        beforeHash: change.afterHash, beforeMode: change.afterMode,
+        afterHash: change.beforeHash, afterMode: change.beforeMode,
+      };
+      try { await applyChangeFiles(join(output, 'workspace', 'before'), target, [inverse], true); }
+      catch { conflicts.push(change.path); }
+    }
+    await updateArtifact(output, { applied: conflicts.length > 0, applyStatus: 'not_verified',
+      partialApplyConflicts: conflicts, applyError: String(error) });
+    throw Error(`${String(error)}${conflicts.length ? `; rollback conflicts: ${conflicts.join(', ')}` : '; completed writes rolled back'}`);
+  }
+}
+
+export async function assertCandidateMatches(root: string, changes: FileChange[]) {
+  const snapshot = await snapshotTree(root, undefined, new Set(changes.map((change) => change.path)));
+  for (const change of changes) {
+    const actual = snapshot.files[change.path];
+    if (change.type === 'delete' ? !!actual :
+      !actual || actual.hash !== change.afterHash || actual.mode !== change.afterMode)
+      throw Error(`Verified candidate changed before/during apply: ${change.path}`);
+  }
 }
 
 async function updateSummaryApply(

@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import type { CodingWorkerContext } from "./codingWorker.js";
 import { AIDER_PROMPT_OVERHEAD_TOKENS } from "./attemptPolicy.js";
+import { broadVisualDesignTask, visualDesignTask } from "../router/taskFingerprint.js";
 
 export type CodingHandoffMode = "direct" | "aider" | "agentic";
 
@@ -19,6 +20,8 @@ export interface CodingHandoffPlan {
 
 export interface CodingHandoffInput {
   repoPath: string;
+  /** Only virtual Auto requires native execution to discover and pin its served model. */
+  routedModel?: string;
   task: string;
   writeScope: readonly string[];
   context?: CodingWorkerContext;
@@ -245,6 +248,14 @@ export async function planCodingHandoff(
     input.writeScope,
   );
 
+  if (input.routedModel === "openrouter/auto") {
+    return {
+      mode: "agentic",
+      estimatedPromptBytes: compactTokens * ATTEMPT_POLICY_BYTES_PER_TOKEN,
+      reason: "Virtual Auto requires native tools to discover and pin its concrete served model",
+    };
+  }
+
   if (
     !scope.length ||
     scope.includes(".")
@@ -310,6 +321,19 @@ export async function planCodingHandoff(
       reason: "localized execution-limit continuation uses bounded reads instead of resending the complete file packet" };
   }
 
+  // A broad visual change commonly needs coordinated edits in several files.
+  // Aider must emit that entire patch in one response, which can exhaust a
+  // small output cap before the first mutation. Progressive Agentic execution
+  // keeps the same concrete write scope and can return each mutation promptly.
+  if (scope.length > 1 && visualDesignTask(input.task) &&
+      (broadVisualDesignTask(input.task) || input.maxOutputTokens <= AIDER_OUTPUT_RESERVE_TOKENS)) {
+    return {
+      mode: "agentic",
+      estimatedPromptBytes: compactTokens * ATTEMPT_POLICY_BYTES_PER_TOKEN,
+      reason: "multi-file visual work exceeds a small single-response output cap; use progressive bounded mutations",
+    };
+  }
+
   const editable =
     inspected.map(
       ({ path }) => path,
@@ -320,6 +344,16 @@ export async function planCodingHandoff(
       ({ info }) =>
         !info.exists,
     );
+
+  if (missing.length && editable.length > 1) {
+    return {
+      mode: "agentic",
+      estimatedPromptBytes:
+        compactTokens * ATTEMPT_POLICY_BYTES_PER_TOKEN,
+      reason:
+        "localized multi-file creation uses bounded read/mutate turns instead of one large generated patch",
+    };
+  }
 
   const editableTokens =
     inspected.reduce(

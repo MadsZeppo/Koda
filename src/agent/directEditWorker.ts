@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { providerTransport } from '../provider/transport.js';
 import type {
   ChatCompletionMessageParam,
   ChatCompletionTool,
@@ -430,18 +431,14 @@ export class DirectEditWorker implements CodingWorker {
       return this.requester(input, messages, directEditTool, maxOutputTokens);
     }
 
-    const apiKey = (process.env.OPENROUTER_API_KEY ?? "").trim();
-
-    if (!apiKey) {
-      throw Error("INFRA_FAILURE: OPENROUTER_API_KEY is missing");
-    }
+    const { apiKey, baseUrl } = providerTransport(input.baseUrl);
 
     const timeoutMs = timeoutOverrideMs ?? directEditRequestTimeoutMs(input);
 
     const sdk = new OpenAI({
       apiKey,
 
-      baseURL: input.baseUrl,
+      baseURL: baseUrl,
 
       maxRetries: 0,
 
@@ -686,7 +683,7 @@ export class DirectEditWorker implements CodingWorker {
       }
     }
 
-    const maxOutputTokens = Math.max(
+    let maxOutputTokens = Math.max(
       512,
 
       Math.min(
@@ -809,6 +806,83 @@ export class DirectEditWorker implements CodingWorker {
           repair,
       },
     ];
+
+    /*
+     * Bound the ACTUAL serialized DirectEdit request.
+     *
+     * The full user task is intentionally preserved. If task + bounded target
+     * excerpts cannot fit this execution engine, switch engines rather than
+     * silently deleting task requirements.
+     */
+    const initialPromptTokens =
+      directEditPromptTokenCeiling(
+        messages,
+      );
+
+    const attemptOutputRoom =
+      input.maxTokens -
+      initialPromptTokens;
+
+    const providerOutputRoom =
+      (input.contextWindowTokens ?? Infinity) -
+      initialPromptTokens -
+      128;
+
+    maxOutputTokens =
+      Math.floor(
+        Math.min(
+          maxOutputTokens,
+          attemptOutputRoom,
+          providerOutputRoom,
+        ),
+      );
+
+    if (maxOutputTokens < 64) {
+      const providerLimited =
+        providerOutputRoom < 64;
+
+      return {
+        exitStatus: "infra_failure",
+
+        model: input.model,
+
+        engine: "direct-edit",
+
+        engineVersion:
+          DIRECT_EDIT_VERSION,
+
+        changedPaths: [],
+
+        wallClockMs:
+          Date.now() - started,
+
+        terminationReason:
+          providerLimited
+            ? "direct_edit_context_preflight"
+            : "direct_edit_token_preflight",
+
+        limitKind:
+          providerLimited
+            ? "context_limit"
+            : "token_preflight",
+
+        exactLimitFired:
+          providerLimited
+            ? "direct_edit_provider_context"
+            : "direct_edit_attempt_tokens",
+
+        progressPhase:
+          "DISCOVERY",
+
+        configuredTokenLimit:
+          input.maxTokens,
+
+        consumedTokens: 0,
+
+        remainingTokens:
+          input.maxTokens,
+      };
+    }
 
     const reservation = this.budget.reserve(input.budgetUsd, input.maxTokens);
 

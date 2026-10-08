@@ -1,0 +1,26 @@
+{
+  "paidCalls": 0,
+  "productionChanged": false,
+  "typecheck": "PASS",
+  "focusedTypeScript": {
+    "total": 13,
+    "passed": 13,
+    "failed": 0
+  },
+  "focusedPython": {
+    "total": 8,
+    "passed": 8,
+    "failed": 0
+  },
+  "fullSuite": {
+    "total": 1111,
+    "passed": 1109,
+    "failed": 1,
+    "skipped": 1,
+    "reproducedOnFullRerun": true,
+    "failure": "tests/planner.test.ts:1010 maxConcurrentCodingWorkers >= 2",
+    "isolatedRecheck": "PASS (1/1)",
+    "productionFixAttempted": false
+  },
+  "frozenBaselineHashesUnchanged": 15
+}

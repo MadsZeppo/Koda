@@ -1,8 +1,11 @@
+import {AUTO_MODEL,autoRequestPlugin,autoTaskTier} from "../router/openRouterAutoPolicy.js";
 import { admitProviderPayload, MAX_PROVIDER_OUTPUT_TOKENS } from "../context/packetPolicy.js";
 import { PoolRouter } from "../router/modelRouter.js";
 import type { ModelDiscoveryAdapter } from "../router/capabilityRegistry.js";
 import OpenAI from "openai";
+import { providerTransport, providerErrorOrigin } from '../provider/transport.js';
 import type {
+  ChatCompletionMessage,
   ChatCompletionMessageParam,
   ChatCompletionTool,
 } from "openai/resources/chat/completions";
@@ -38,6 +41,15 @@ export function isTransientProviderError(error: unknown) {
       /\b(?:ETIMEDOUT|ECONNRESET|fetch failed|timeout|timed out|aborted)\b/i.test(error.message))
   );
 }
+export function isReasoningDisableRejected(error: unknown) {
+  return (
+    error instanceof OpenAI.APIError &&
+    error.status === 400 &&
+    /reasoning[^\n]*(?:mandatory|required|cannot be disabled)|(?:mandatory|required)[^\n]*reasoning/i.test(
+      String(error),
+    )
+  );
+}
 export function isRouteEndpointIncompatibility(error: unknown) {
   return (
     error instanceof OpenAI.APIError && [400, 404].includes(error.status ?? 0)
@@ -62,6 +74,7 @@ export function implementationReasoningEffort(route: any, fingerprint: any):
 }
 export class Gateway {
   private sdk: OpenAI;
+  private readonly mandatoryReasoningModels = new Set<string>();
   private readonly phaseSpent = { discovery: 0, planning: 0 };
   private readonly phaseReserved = { discovery: 0, planning: 0 };
   private readonly phaseTokens = { discovery: 0, planning: 0 };
@@ -74,10 +87,10 @@ export class Gateway {
     adapter?: ModelDiscoveryAdapter,
   ) {
     if (config.modelPool) this.modelRouter = new PoolRouter(config, logger, adapter, () => budget.remainingUsd());
+    const transport = providerTransport(config.baseUrl, config.modelPool?.provider);
     this.sdk = new OpenAI({
-      apiKey: ((config.modelPool?.provider ?? "openrouter") === "openrouter"
-        ? process.env.OPENROUTER_API_KEY : process.env.KODA_MODEL_API_KEY) || "missing",
-      baseURL: config.baseUrl,
+      apiKey: transport.apiKey,
+      baseURL: transport.baseUrl,
       maxRetries: 0,
       timeout: Math.max(...Object.values(config.modelTimeoutMs)),
     });
@@ -94,8 +107,11 @@ export class Gateway {
       requireTool?: boolean;
       timeoutMs?: number;
       codingRoute?: CodingRoute;
+      disableReasoning?: boolean;
+      reasoningEffort?: "low" | "medium" | "high";
+      responseFormat?: OpenAI.Chat.Completions.ChatCompletionCreateParams["response_format"];
     },
-  ) {
+  ): Promise<ChatCompletionMessage> {
     const deadlineClass = modelDeadlineClass(stage);
     const configuredTimeout = this.config.modelTimeoutMs[deadlineClass];
     const maxOutputTokens = Math.min(
@@ -115,6 +131,9 @@ export class Gateway {
     const bytes = Buffer.byteLength(JSON.stringify({ messages, tools }));
     let tokenBound = admitProviderPayload({ model, messages, tools, max_tokens: maxOutputTokens }, maxOutputTokens).inputTokens;
     let reserveTokens = tokenBound + maxOutputTokens;
+    const auto = model === AUTO_MODEL;
+    const autoSettings = this.config.routing.openRouterAuto;
+    if(auto && (this.config.routing.authority !== "openrouter-auto" || !autoSettings)) throw Error("Auto requires explicit opt-in pool configuration");
     const pareto = model === PARETO_CODE_MODEL;
     if (
       pareto &&
@@ -126,17 +145,17 @@ export class Gateway {
         "Pareto coding route requires an unforced adaptive coding demand",
       );
     const metadata =
-      this.modelRouter && !pareto
+      this.modelRouter && !pareto && !auto
         ? (await this.modelRouter.catalog.get()).get(model)
         : undefined;
     // The virtual router's catalog row is $0. Reserve against the configured
     // price ceiling, then settle only from authoritative response usage.
     const inputPrice =
-      this.modelRouter && !pareto
+      this.modelRouter && !pareto && !auto
         ? metadata?.inputPrice
         : this.config.maxInputPrice;
     const outputPrice =
-      this.modelRouter && !pareto
+      this.modelRouter && !pareto && !auto
         ? metadata?.outputPrice
         : this.config.maxOutputPrice;
     if (inputPrice === undefined || outputPrice === undefined)
@@ -163,21 +182,32 @@ export class Gateway {
       max_price: { prompt: promptPrice, completion: completionPrice },
     };
     const openrouter = (this.config.modelPool?.provider ?? "openrouter") === "openrouter";
-    const reasoningEffort = metadata?.supportedParameters?.includes("reasoning") && stage === "implement"
-      ? implementationReasoningEffort(route, fingerprint)
+    const reasoningMandatory = metadata?.reasoning?.mandatory === true || this.mandatoryReasoningModels.has(model);
+    const requestedEffort = limits?.reasoningEffort ??
+      (stage === "completion-review" && reasoningMandatory ? "low" : undefined);
+    const supportedEfforts = metadata?.reasoning?.supported_efforts;
+    const allowedEffort = !supportedEfforts || (requestedEffort && supportedEfforts.includes(requestedEffort))
+      ? requestedEffort : undefined;
+    const reasoningEffort = metadata?.supportedParameters?.includes("reasoning")
+      ? allowedEffort ?? (stage === "implement" ? implementationReasoningEffort(route, fingerprint) : undefined)
       : undefined;
     const sessionId = `${this.logger.runId}/${subtaskId}`;
     this.logger.log("provider_policy", { subtaskId, stage, model,
       session_id: openrouter ? sessionId : null, provider: openrouter ? providerPolicy : null,
       reasoning_effort: reasoningEffort ?? null });
     const providerPayload = {
+          ...(auto ? {plugins:[autoRequestPlugin({models:autoSettings!.models ?? [...(this.config.modelPool?.models.map(m=>m.id) ?? [])],costTier:autoSettings!.costTier==="auto"?autoTaskTier(fingerprint as any ?? {}):autoSettings!.costTier})]} : {}),
           model,
           messages,
           tools,
           tool_choice: limits?.requireTool ? "required" as const : undefined,
           max_tokens: maxOutputTokens,
           stream: false as const,
+          ...(limits?.responseFormat && metadata?.supportedParameters?.includes("structured_outputs")
+            ? { response_format: limits.responseFormat } : {}),
           ...(reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
+          ...(limits?.disableReasoning && !reasoningMandatory && metadata?.supportedParameters?.includes("reasoning")
+            ? { reasoning: { enabled: false } } : {}),
           ...({
             ...(pareto
               ? {
@@ -255,6 +285,7 @@ export class Gateway {
     };
     const start = Date.now();
     let responseLogged = false;
+    let providerResponseReceived = false;
     try {
       const response = await this.sdk.chat.completions.create(
         providerPayload,
@@ -263,6 +294,7 @@ export class Gateway {
           signal: AbortSignal.timeout(timeoutMs),
         },
       );
+      providerResponseReceived = true;
       const providerUsage = parseUsage(response.usage);
       const estimatedUsageCost = providerUsage.costUsd === null
         ? estimateUsageCost(providerUsage, promptPrice, completionPrice)
@@ -307,6 +339,7 @@ export class Gateway {
         timestampStart: new Date(start).toISOString(),
         timestampEnd: new Date().toISOString(),
         wallClockMs: Date.now() - start,
+        timeoutMs,
         ...usage,
         providerReportedCostUsd: providerUsage.costUsd,
         costSource,
@@ -317,6 +350,7 @@ export class Gateway {
       responseLogged = true;
       operation("response", response.model ?? null, (response as any).provider,
         Date.now() - start, usage.costUsd, costSource);
+      if(auto && (!response.model || !(autoSettings!.models ?? this.config.modelPool?.models.map(m=>m.id) ?? []).includes(response.model))) throw Error("provider_protocol_error: Auto returned no authorized concrete model");
       if (pareto && (!response.model || response.model === PARETO_CODE_MODEL))
         throw Error("Pareto response omitted concrete served model");
       const message = response.choices[0]?.message;
@@ -388,6 +422,7 @@ export class Gateway {
           timestampStart: new Date(start).toISOString(),
           timestampEnd: new Date().toISOString(),
           wallClockMs: Date.now() - start,
+          timeoutMs,
           ...parseUsage(rejectedBeforeExecution ? { cost: 0 } : undefined),
           attempt,
           outcome: "error",
@@ -400,6 +435,8 @@ export class Gateway {
           ? "tool_protocol_incompatible"
           : /timeout|timed out|ETIMEDOUT|AbortError/i.test(String(e)) ? "timeout" : "provider");
       this.logger.log("model_error", {
+        errorOrigin: providerErrorOrigin(e),
+        failureOrigin: providerResponseReceived ? "response_validation" : "provider",
         subtaskId,
         stage,
         role:
@@ -414,6 +451,28 @@ export class Gateway {
         error: String(e),
         classification: "OPERATIONAL_FAILURE",
       });
+      // A catalog advertising `reasoning` support does not prove that the
+      // endpoint permits `{ enabled: false }`. Some endpoints require
+      // reasoning. A rejected request has no provider usage, so retry the same
+      // bounded request once without disabling reasoning. Completion review
+      // must not inherit an expensive provider default after this rejection.
+      if (limits?.disableReasoning && isReasoningDisableRejected(e)) {
+        // Keep observed capability evidence for later review batches in this
+        // run, including catalogs cached before reasoning metadata existed.
+        this.mandatoryReasoningModels.add(model);
+        this.logger.log("provider_parameter_retry", {
+          subtaskId,
+          stage,
+          model,
+          parameter: "reasoning.enabled",
+          classification: "OPERATIONAL_FAILURE",
+        });
+        return this.call(model, messages, subtaskId, stage, attempt, tools, {
+          ...limits,
+          disableReasoning: false,
+          reasoningEffort: limits?.reasoningEffort ?? (stage === "completion-review" ? "low" : undefined),
+        });
+      }
       throw e;
     }
   }

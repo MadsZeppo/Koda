@@ -1,0 +1,15 @@
+import { mkdir, writeFile, chmod } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+import electron from 'electron';
+if (process.platform !== 'darwin') throw Error('Denne lokale launcher er til macOS; brug pnpm desktop på andre platforme.');
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const bundle = join(homedir(), 'Applications', 'Koda Local.app');
+await mkdir(join(bundle, 'Contents', 'MacOS'), { recursive: true });
+const quote = text => "'" + text.replaceAll("'", "'\\''") + "'";
+const executable = join(bundle, 'Contents', 'MacOS', 'Koda');
+await writeFile(executable, `#!/bin/zsh\nexport PATH=${quote(dirname(process.execPath) + ":" + (process.env.PATH || "/usr/bin:/bin"))}:"$PATH"\nexport KODA_NODE_RUNTIME=${quote(process.execPath)}\nunset ELECTRON_RUN_AS_NODE\nexec ${quote(electron)} ${quote(join(root, 'desktop', 'main.mjs'))}\n`);
+await chmod(executable, 0o755);
+await writeFile(join(bundle, 'Contents', 'Info.plist'), `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleExecutable</key><string>Koda</string><key>CFBundleIdentifier</key><string>local.koda.desktop</string><key>CFBundleName</key><string>Koda Local</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>1</string></dict></plist>`);
+console.log(bundle);

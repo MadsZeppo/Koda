@@ -1,0 +1,69 @@
+{
+  "version": "cold-start-v3-swe-first-1",
+  "seed": 20261007,
+  "split": [
+    0.6,
+    0.2,
+    0.2
+  ],
+  "Cs": [
+    0.1,
+    1.0,
+    10.0
+  ],
+  "methods": [
+    "structured",
+    "text",
+    "combined",
+    "pairwise",
+    "nonlinear"
+  ],
+  "selection": "SWE validation cross-fitted-calibrated solve first (pairwise: discordance ranking); then SWE OOF Brier, overall solve, regularization/config fingerprint; repo identity excluded",
+  "bootstrapReplicates": 2000,
+  "calibration": "5-fold validation OOF; method selection on SWE Brier if present, otherwise source-only; none/sigmoid; isotonic only >=200 primary-gate samples and >=30 each class",
+  "lowEvidence": "validation similarity 10th percentile; unseen language/ecosystem or any residual bucket <20 samples",
+  "coveragePoints": [
+    1.0,
+    0.9,
+    0.75,
+    0.5
+  ],
+  "costGaps": [
+    0.0,
+    0.01,
+    0.025,
+    0.05
+  ],
+  "criteria": {
+    "strongDeltaV2": 0.05,
+    "strongPairedLowerV2": 0.0,
+    "strongPairedLowerStatic": -0.03,
+    "strongDeltaStatic": 0.0,
+    "strongCatReduction": 0.03,
+    "strongEceReduction": 0.02,
+    "strongMinimumRoutedCoverage": 0.5,
+    "strongConditionalSolveTolerance": 0.02,
+    "strongQualityAlternativeToCost": 0.03,
+    "promisingDeltaV2": 0.05,
+    "promisingPairedLowerV2": -0.02,
+    "minimumRepoDeltaV2": 0.02,
+    "strongMinimumRepoDeltaStatic": -0.03,
+    "staticReference": "best observed single SWE model posthoc; TRAIN-selected dataset-aware also reported"
+  },
+  "v2Replay": "frozen V2 hyperparameters, re-fit with V3 TRAIN only; residuals fit V3 VALIDATION only; literal old trained artifact is contaminated by overlapping V3 holdout and not used",
+  "optionalOmitted": [
+    "embeddings",
+    "CodeRouterBench priors",
+    "repo cloning"
+  ],
+  "productionIntegration": false,
+  "paidCalls": 0,
+  "nonlinear": {
+    "kind": "HistGradientBoostingClassifier",
+    "maxIter": 100,
+    "maxDepth": 3,
+    "minSamplesLeaf": 20,
+    "l2": "1/C"
+  },
+  "repoStress": "Fixed ordinary TRAIN/VALIDATION partitions with entire test repos excluded, LCB retained as in ordinary fitting; each repo predicted once, no stress tuning"
+}

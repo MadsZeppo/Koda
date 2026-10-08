@@ -1,6 +1,7 @@
 import { readFile, mkdir, writeFile, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { providerTransport, openRouterCompatibleBackend } from '../provider/transport.js';
 import {
   metadataSchema,
   type Metadata,
@@ -63,7 +64,7 @@ export class Catalog {
       }
     } catch {}
     const officialOpenRouter = (() => {
-      try { return /(?:^|\.)openrouter\.ai$/i.test(new URL(this.baseUrl).hostname); }
+      try { return /(?:^|\.)openrouter\.ai$/i.test(new URL(this.baseUrl).hostname) || openRouterCompatibleBackend(this.baseUrl); }
       catch { return false; }
     })();
     if (
@@ -76,7 +77,8 @@ export class Catalog {
     )
       return new Map(cached.entries);
     try {
-      const res = await fetch(this.baseUrl.replace(/\/$/, "") + "/models", {
+      const transport = providerTransport(this.baseUrl);
+      const res = await fetch(transport.baseUrl.replace(/\/$/, "") + "/models", {
         signal: AbortSignal.timeout(8000),
       });
       if (!res.ok) throw Error(`Catalog HTTP ${res.status}`);
@@ -92,12 +94,12 @@ export class Catalog {
       };
       const endpointSets = new Map<string, string[][]>();
       if (officialOpenRouter) {
-        const key = process.env.OPENROUTER_API_KEY;
+        const key = transport.apiKey;
         const headers = key ? { Authorization: `Bearer ${key}` } : undefined;
         await Promise.all(this.models.filter((model) => model.enabled &&
           model.strengths.includes("tool_use")).map(async (model) => {
           try {
-            const response = await fetch(this.baseUrl.replace(/\/$/, "") +
+            const response = await fetch(transport.baseUrl.replace(/\/$/, "") +
               `/models/${model.id}/endpoints`, {
                 headers, signal: AbortSignal.timeout(3000),
               });
@@ -146,6 +148,7 @@ export class Catalog {
             maxOutputTokens: raw.top_provider?.max_completion_tokens,
             available: true,
             supportedParameters: raw.supported_parameters,
+            reasoning: raw.reasoning,
             routableParameterSets: embeddedSets(raw) ?? endpointSets.get(model.id),
             retrievedAt,
           },

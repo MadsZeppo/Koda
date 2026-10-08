@@ -10,7 +10,15 @@ import {
   focusedVerificationCheck,
   impactAwareVerificationSelection,
   verificationImpactRelationships,
+  discoveredTestGlobs,
 } from "../src/verifier/selection.js";
+
+test("discovered test glob handles a bounded native TypeScript runner", () => {
+  assert.deepEqual(discoveredTestGlobs(
+    "node --experimental-strip-types --test tests/*.test.ts"),
+  ["tests/*.test.ts"]);
+  assert.deepEqual(discoveredTestGlobs("node --import arbitrary --test tests/*.test.ts"), []);
+});
 
 
 const aggregateTest: VerificationCandidate = {
@@ -684,9 +692,72 @@ test("executor enables root handoff and verifies actual changed paths without re
     const checks = logger.events.filter((event) => event.type === "verification");
     assert.ok(checks.length > 0);
     assert.ok(checks.every((check) => check.command !== "npm test" && check.command !== "pnpm test"));
-    assert.equal(checks.filter((check) => check.command === "node --test 'tests/value.test.cjs'").length, 2,
-      "one candidate test and one matching baseline test");
+    assert.equal(checks.filter((check) => check.command === "node --test 'tests/value.test.cjs'").length, 1,
+      "a passing authoritative candidate check does not need a redundant baseline rerun");
     assert.ok(result.verification.checks.some((check) => check.kind === "typecheck"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(logs, { recursive: true, force: true });
+  }
+});
+
+test("a provider failure after mutation hands the candidate to deterministic verification", async () => {
+  const { mkdtemp, mkdir, writeFile, rm } = await import("node:fs/promises");
+  const { join } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const { implement } = await import("../src/agent/codingExecutor.js");
+  const { profileRepo } = await import("../src/repo/profiler.js");
+  const { config } = await import("../src/config.js");
+  const { Logger } = await import("../src/telemetry/logger.js");
+  const { Budget } = await import("../src/openrouter/usage.js");
+  const { git } = await import("../src/repo/commands.js");
+  const root = await mkdtemp(join(tmpdir(), "koda-provider-after-mutation-"));
+  const logs = await mkdtemp(join(tmpdir(), "koda-provider-after-mutation-logs-"));
+  try {
+    await mkdir(join(root, "src"));
+    await mkdir(join(root, "tests"));
+    await writeFile(join(root, "package.json"), JSON.stringify({ scripts: {
+      test: "node --test tests/*.test.cjs", typecheck: "node --check src/value.cjs",
+    } }));
+    await writeFile(join(root, "src/value.cjs"), "module.exports = 1;\n");
+    await writeFile(join(root, "tests/value.test.cjs"),
+      "const {test}=require('node:test');const assert=require('node:assert/strict');const value=require('../src/value.cjs');test('value',()=>assert.equal(value,2));\n");
+    await git(root, "init", "-q");
+    await git(root, "config", "user.name", "Test");
+    await git(root, "config", "user.email", "test@example.test");
+    await git(root, "add", ".");
+    await git(root, "commit", "-qm", "baseline");
+    const repo = await profileRepo(root);
+    const logger = new Logger(logs, "provider-after-mutation", true);
+    const result = await implement(
+      { config: await config(undefined, { maxIterations: 1 }), logger,
+        budget: new Budget(1, 100000, 60000) } as any,
+      root,
+      "Change the internal value to 2",
+      { ...makeSubtask(["src/value.cjs"]), id: "direct", title: "Change value",
+        objective: "Change src/value.cjs to export 2", estimatedDifficulty: "low" },
+      { acceptanceCriteria: ["src/value.cjs exports 2"] },
+      repo,
+      {
+        codingWorker: { engine: "agentic", async run(input) {
+          await writeFile(join(root, "src/value.cjs"), "module.exports = 2;\n");
+          return { exitStatus: "infra_failure", model: input.model, engine: "agentic",
+            engineVersion: "test", changedPaths: ["src/value.cjs"], wallClockMs: 1,
+            terminationReason: "agentic_provider_error", progressPhase: "MUTATION_OBSERVED",
+            fatalError: "HTTP 402 after mutation" };
+        } },
+        completionReviewer: async (input) => ({
+          passed: true,
+          requirements: input.requirements.map(({ id }) =>
+            ({ id, satisfied: true, evidence: "export is 2" })),
+          summary: "All requirements are present",
+        }),
+      },
+    );
+    assert.equal(result.verification.status, "VERIFIED_SUCCESS");
+    assert.equal(await import("node:fs/promises").then(({ readFile }) =>
+      readFile(join(root, "src/value.cjs"), "utf8")), "module.exports = 2;\n");
+    assert.ok(logger.events.some((event) => event.type === "candidate_verification_handoff"));
   } finally {
     await rm(root, { recursive: true, force: true });
     await rm(logs, { recursive: true, force: true });

@@ -1,6 +1,7 @@
 import { readFile, writeFile, mkdir, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { providerTransport, providerMode, localOpenRouterKey, openRouterCompatibleBackend } from '../provider/transport.js';
 import type { Config } from "../config.js";
 import type { Catalog } from "../openrouter/catalog.js";
 import { supportsParameters, type Metadata, type PoolModel } from "./pool.js";
@@ -85,7 +86,7 @@ export class CapabilityRegistry {
     const officialOpenRouter = (() => {
       try {
         return (this.config.modelPool?.provider ?? "openrouter") === "openrouter" &&
-          /(?:^|\.)openrouter\.ai$/i.test(new URL(this.config.baseUrl).hostname);
+          (/(?:^|\.)openrouter\.ai$/i.test(new URL(this.config.baseUrl).hostname) || (providerMode() === "backend" && this.config.routing.authority !== "legacy"));
       } catch { return false; }
     })();
     let snapshot = cached;
@@ -128,10 +129,11 @@ export class CapabilityRegistry {
     } catch {}
     if (!force && cached && Date.now() - cached.retrievedAt < this.config.routing.cacheTtlMs) return cached;
     const openrouter = (this.config.modelPool?.provider ?? "openrouter") === "openrouter";
-    const key = openrouter ? process.env.OPENROUTER_API_KEY : process.env.KODA_MODEL_API_KEY;
+    const transport = providerTransport(this.config.baseUrl, this.config.modelPool?.provider);
+    const key = transport.apiKey;
     const headers = key ? { Authorization: `Bearer ${key}` } : undefined;
     const get = async (suffix: string) => {
-      const response = await fetch(this.config.baseUrl.replace(/\/$/, "") + suffix, { headers, signal: AbortSignal.timeout(3000) });
+      const response = await fetch(transport.baseUrl.replace(/\/$/, "") + suffix, { headers, signal: AbortSignal.timeout(3000) });
       if (!response.ok) throw Error(`metadata HTTP ${response.status}`);
       return response.json() as Promise<any>;
     };
@@ -141,7 +143,7 @@ export class CapabilityRegistry {
     const configuredIds = new Set(this.config.modelPool?.models.map((model) => model.id) ?? []);
     const hasNewModels = listed.some((model) => typeof model?.id === "string" && !configuredIds.has(model.id));
     const officialOpenRouter = (() => {
-      try { return /(?:^|\.)openrouter\.ai$/i.test(new URL(this.config.baseUrl).hostname); }
+      try { return /(?:^|\.)openrouter\.ai$/i.test(new URL(this.config.baseUrl).hostname) || openRouterCompatibleBackend(this.config.baseUrl); }
       catch { return false; }
     })();
     const supplement = openrouter && (officialOpenRouter || hasNewModels)
@@ -224,7 +226,7 @@ export class CapabilityRegistry {
       // Routing never waits for catalog research. Use the last-known-good
       // snapshot immediately and refresh it opportunistically for later tasks.
       this.pending = this.cachedSnapshot().then((snapshot) => this.build(snapshot));
-      if (!this.runSnapshotFrozen && !this.adapter && process.env.OPENROUTER_API_KEY && !this.refreshStarted) {
+      if (!this.runSnapshotFrozen && !this.adapter && (providerMode() === 'backend' || localOpenRouterKey()) && !this.refreshStarted) {
         this.refreshStarted = true;
         void this.refresh().catch(() => undefined);
       }

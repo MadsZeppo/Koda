@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { Budget } from "../src/openrouter/usage.js";
 import {
   AgenticCodingWorker,
+  agenticPromptBytes,
   type AgenticCodingResponse,
 } from "../src/agent/agenticCodingWorker.js";
 import { AgentTools } from "../src/agent/tools.js";
@@ -203,6 +204,159 @@ test("agentic mode supplies bounded excerpts and enforces implementation after t
   assert.match(await readFile(join(root, "a.ts"), "utf8"), /return 2/);
   assert.ok(events.some((event) => event.type === "agentic_implementation_transition"));
   assert.equal(events.filter((event) => event.type === "agentic_discovery_call_deferred").length, 4);
+});
+
+test("localized multi-file work reads every existing target and returns after the complete mutation batch", async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-agentic-multifile-"));
+  await writeFile(join(root, "a.ts"), "export const a = 1;\n");
+  await writeFile(join(root, "b.ts"), "export const b = 1;\n");
+  let call = 0;
+  const worker = new AgenticCodingWorker(new Budget(1, 20_000, 60_000),
+    { events: [], log() {} } as any, async (_input, _messages, tools) => {
+      call++;
+      const names = tools.flatMap((tool) => "function" in tool ? [tool.function.name] : []);
+      const invoke = (id: string, name: string, args: object) => ({ id, type: "function", function: {
+        name, arguments: JSON.stringify(args),
+      } });
+      if (call === 1) {
+        assert.equal(names.includes("edit_file"), false);
+        return { model: "mock", usage: { prompt_tokens: 100, completion_tokens: 20 }, message: {
+          tool_calls: [invoke("read-a", "read_file", { path: "a.ts" })],
+        } } as AgenticCodingResponse;
+      }
+      if (call === 2) {
+        assert.equal(names.includes("edit_file"), false, "one target read must not authorize guessing edits to another target");
+        return { model: "mock", usage: { prompt_tokens: 100, completion_tokens: 20 }, message: {
+          tool_calls: [invoke("read-b", "read_file", { path: "b.ts" })],
+        } } as AgenticCodingResponse;
+      }
+      assert.ok(names.includes("apply_patch"));
+      return { model: "mock", usage: { prompt_tokens: 120, completion_tokens: 40 }, message: {
+        tool_calls: [invoke("mutate", "apply_patch", { edits: [
+          { path: "a.ts", oldText: "a = 1", newText: "a = 2" },
+          { path: "b.ts", oldText: "b = 1", newText: "b = 2" },
+          { path: "new.ts", createContent: "export const ready = true;\n" },
+        ] })],
+      } } as AgenticCodingResponse;
+    });
+  const result = await worker.run({ repoPath: root, attemptId: "multi", task: "Update a and b and create new", model: "mock",
+    budgetUsd: .1, maxTokens: 10_000, maxSteps: 8, timeoutMs: 30_000, requestTimeoutMs: 5_000,
+    commandTimeoutMs: 5_000, maxOutputTokens: 1_000, baseUrl: "unused",
+    writeScope: ["a.ts", "b.ts", "new.ts"], context: { implementationRecovery: { reason: "bounded multi-file packet" } } });
+  assert.equal(result.exitStatus, "completed");
+  assert.deepEqual(result.changedPaths.sort(), ["a.ts", "b.ts", "new.ts"]);
+  assert.equal(call, 3, "the worker must not spend another model turn after the complete mutation batch");
+});
+
+test("large write scope starts a grounded edit without reading every authorized file", async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-agentic-large-scope-"));
+  for (let index = 0; index < 6; index++)
+    await writeFile(join(root, `file-${index}.ts`), `export const value${index} = 1;\n`);
+  const events: any[] = [];
+  const logger = { events, log: (type: string, payload: any) => events.push({ type, ...payload }) } as any;
+  const call = (id: string, name: string, args: object) => ({ id, type: "function", function: {
+    name, arguments: JSON.stringify(args),
+  } });
+  let turns = 0;
+  const worker = new AgenticCodingWorker(new Budget(1, 20_000, 60_000), logger,
+    async (_input, _messages, tools) => {
+      turns++;
+      const names = tools.flatMap((tool) => "function" in tool ? [tool.function.name] : []);
+      const usage = { prompt_tokens: 700, completion_tokens: 100, cost: 0.0001 };
+      if (turns === 1) return { model: "mock", usage, message: { tool_calls: [
+        call("read-0", "read_file", { path: "file-0.ts" }),
+        call("read-1", "read_file", { path: "file-1.ts" }),
+      ] } } as AgenticCodingResponse;
+      if (turns === 2) {
+        assert.deepEqual(names.sort(), ["apply_patch", "edit_file", "write_file"]);
+        return { model: "mock", usage, message: { tool_calls: [
+          call("edit-0", "edit_file", { path: "file-0.ts", oldText: "value0 = 1", newText: "value0 = 2" }),
+          call("unread-2", "edit_file", { path: "file-2.ts", oldText: "value2 = 1", newText: "value2 = 2" }),
+        ] } } as AgenticCodingResponse;
+      }
+      if (turns === 3) {
+        assert.ok(names.includes("read_file"), "discovery reopens after a real mutation");
+        assert.match(await readFile(join(root, "file-2.ts"), "utf8"), /value2 = 1/,
+          "a file may not be edited before it is read");
+        return { model: "mock", usage, message: { tool_calls: [
+          call("read-2", "read_file", { path: "file-2.ts" }),
+        ] } } as AgenticCodingResponse;
+      }
+      if (turns === 4) return { model: "mock", usage, message: { tool_calls: [
+        call("edit-2", "edit_file", { path: "file-2.ts", oldText: "value2 = 1", newText: "value2 = 2" }),
+      ] } } as AgenticCodingResponse;
+      return { model: "mock", usage, message: { content: "done", tool_calls: [] } } as AgenticCodingResponse;
+    });
+  const result = await worker.run({ repoPath: root, attemptId: "large-scope", task: "Improve several components",
+    model: "mock", budgetUsd: 0.1, maxTokens: 12_000, maxSteps: 6, timeoutMs: 30_000,
+    requestTimeoutMs: 5_000, commandTimeoutMs: 5_000, maxOutputTokens: 1_000, baseUrl: "unused",
+    writeScope: Array.from({ length: 6 }, (_, index) => `file-${index}.ts`),
+    context: { implementationRecovery: { reason: "bounded coding packet" } } });
+  assert.equal(result.exitStatus, "completed");
+  assert.deepEqual(result.changedPaths.sort(), ["file-0.ts", "file-2.ts"]);
+  assert.ok(events.some((event) => event.type === "agentic_implementation_transition"));
+});
+
+test("malformed tool arguments retry once with retained reads and a bounded edit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-agentic-protocol-"));
+  await writeFile(join(root, "page.tsx"), "export const title = 'old';\n");
+  const events: any[] = [];
+  const logger = { events, log: (type: string, payload: any) => events.push({ type, ...payload }) } as any;
+  let turns = 0;
+  const worker = new AgenticCodingWorker(new Budget(1, 20_000, 60_000), logger,
+    async (_input, messages, tools) => {
+      turns++;
+      if (turns === 1) return { model: "mock", usage: { prompt_tokens: 100, completion_tokens: 20 }, message: {
+        tool_calls: [{ id: "read", type: "function", function: { name: "read_file",
+          arguments: JSON.stringify({ path: "page.tsx" }) } }],
+      } } as AgenticCodingResponse;
+      if (turns === 2) throw Error("502 OpenRouter returned a malformed response (invalid_tool_arguments)");
+      assert.ok(messages.some((message) => message.role === "user" &&
+        String(message.content).includes("invalid JSON")));
+      assert.ok(tools.some((tool) => "function" in tool && tool.function.name === "edit_file"));
+      return { model: "mock", usage: { prompt_tokens: 120, completion_tokens: 30 }, message: {
+        tool_calls: [{ id: "edit", type: "function", function: { name: "edit_file",
+          arguments: JSON.stringify({ path: "page.tsx", oldText: "title = 'old'", newText: "title = 'new'" }) } }],
+      } } as AgenticCodingResponse;
+    });
+  const result = await worker.run({ repoPath: root, attemptId: "protocol-retry", task: "Change the title",
+    model: "mock", budgetUsd: 0.1, maxTokens: 5_000, maxSteps: 4, timeoutMs: 30_000,
+    requestTimeoutMs: 5_000, commandTimeoutMs: 5_000, maxOutputTokens: 1_000, baseUrl: "unused",
+    writeScope: ["page.tsx"], returnOnMutation: true });
+  assert.equal(result.exitStatus, "completed");
+  assert.equal(turns, 3);
+  assert.match(await readFile(join(root, "page.tsx"), "utf8"), /title = 'new'/);
+  assert.equal(events.filter((event) => event.type === "agentic_tool_protocol_retry").length, 1);
+});
+
+test("a rejected tool envelope does not consume the only verification repair step", async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-agentic-repair-protocol-"));
+  await writeFile(join(root, "page.tsx"), "export const title = 'old';\n");
+  const events: any[] = [];
+  let requests = 0;
+  const worker = new AgenticCodingWorker(new Budget(1, 20_000, 60_000), {
+    events, log: (type: string, payload: any) => events.push({ type, ...payload }),
+  } as any, async () => {
+    requests++;
+    if (requests === 1)
+      throw Error("502 OpenRouter returned a malformed response (invalid_tool_arguments)");
+    return { model: "mock", usage: { prompt_tokens: 120, completion_tokens: 30 }, message: {
+      tool_calls: [{ id: "edit", type: "function", function: { name: "edit_file",
+        arguments: JSON.stringify({ path: "page.tsx", oldText: "title = 'old'", newText: "title = 'new'" }) } }],
+    } } as AgenticCodingResponse;
+  });
+  const result = await worker.run({ repoPath: root, attemptId: "one-step-repair",
+    task: "Fix the candidate lint error", model: "mock", budgetUsd: 0.1,
+    maxTokens: 5_000, maxSteps: 1, timeoutMs: 30_000, requestTimeoutMs: 5_000,
+    commandTimeoutMs: 5_000, maxOutputTokens: 1_000, baseUrl: "unused",
+    writeScope: ["page.tsx"], context: { completionRepair: {
+      unresolvedRequirementIds: ["VERIFICATION_REGRESSION"], mutationRequiredBeforeDiscovery: true,
+    } } });
+  assert.equal(requests, 2);
+  assert.equal(result.exitStatus, "completed");
+  assert.deepEqual(result.changedPaths, ["page.tsx"]);
+  assert.match(await readFile(join(root, "page.tsx"), "utf8"), /title = 'new'/);
+  assert.equal(events.filter((event) => event.type === "agentic_tool_protocol_retry").length, 1);
 });
 
 test("repository reads deduplicate exact path and line ranges and expose a cheap outline", async () => {
@@ -781,4 +935,186 @@ test("localized output-limit continuation reads known contracts and mutates with
   assert.equal(events.filter((event) => event.type === "agentic_discovery_call_deferred").length, 0);
   assert.ok(events.some((event) => event.type === "agentic_implementation_transition" &&
     event.useful_discovery_steps === 1), "retained localization needs one real read, not another discovery cycle");
+});
+
+test("unknown location follows imports, makes multiple mutations and completes with the complete long task", async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-progressive-general-"));
+  await mkdir(join(root, "src"));
+  await writeFile(join(root, "src/main.cjs"), "const {value}=require('./math.cjs');exports.assemble=()=>value;\n");
+  await writeFile(join(root, "src/math.cjs"), "exports.value=1;\n");
+  const task = ["Fix assemble behavior; preserve all existing exports.",
+    ...Array.from({ length: 120 }, (_, i) => `Constraint ${i}: preserve compatibility for caller ${i}.`),
+    "Finally create a focused regression test asserting assemble returns exactly 3."].join("\n");
+  let turn = 0;
+  const logger = { events: [] as any[], log(type: string, payload: any) { this.events.push({type, ...payload}); } } as any;
+  const worker = new AgenticCodingWorker(new Budget(1, 80_000, 60_000), logger,
+    async (_input, messages) => {
+      turn++;
+      assert.ok(messages.some((message) => typeof message.content === "string" && message.content.includes(task)),
+        "Every provider request must preserve requirements at both ends of the task");
+      if (turn === 4) assert.ok(messages.some((message) => message.role === "tool" && String(message.content).includes("exports.value=1")),
+        "The imported implementation must actually be read before editing");
+      const calls = [
+        ["search_code", { query: "assemble" }],
+        ["read_file", { path: "src/main.cjs" }],
+        ["read_file", { path: "src/math.cjs" }],
+        ["edit_file", { path: "src/math.cjs", oldText: "value=1", newText: "value=3" }],
+        ["file_outline", { path: "src/main.cjs" }],
+        ["write_file", { path: "tests/assemble.test.cjs", content: "const {test}=require('node:test');const a=require('node:assert/strict');test('assemble',()=>a.equal(require('../src/main.cjs').assemble(),3));\n" }],
+      ] as const;
+      const next = calls[turn - 1];
+      return { model: "mock", usage: { prompt_tokens: 100, completion_tokens: 20 }, message: next
+        ? { tool_calls: [{ id: `turn-${turn}`, type: "function", function: { name: next[0], arguments: JSON.stringify(next[1]) } }] }
+        : { content: "Completed implementation and regression test" } } as AgenticCodingResponse;
+    });
+  const result = await worker.run({ repoPath: root, attemptId: "progressive", task, model: "mock",
+    budgetUsd: .5, maxTokens: 40_000, maxSteps: 8, timeoutMs: 30_000, requestTimeoutMs: 5_000,
+    commandTimeoutMs: 5_000, maxOutputTokens: 1_000, baseUrl: "unused", writeScope: ["."] });
+  assert.equal(result.exitStatus, "completed");
+  assert.equal(turn, 7);
+  assert.deepEqual(result.changedPaths.sort(), ["src/math.cjs", "tests/assemble.test.cjs"]);
+  const { execa } = await import("execa");
+  await execa(process.execPath, ["--test", "tests/assemble.test.cjs"], { cwd: root });
+  await execa(process.execPath, ["--check", "src/math.cjs"], { cwd: root });
+});
+
+test("agentic creates multiple concrete files in an empty repository before completing", async () => {
+  const root = await mkdtemp(join(tmpdir(), "koda-empty-multi-"));
+  let turn = 0;
+  const worker = new AgenticCodingWorker(new Budget(1, 30_000, 60_000), { log() {}, events: [] } as any,
+    async (_input, _messages, tools) => {
+      turn++;
+      assert.ok(tools.some((tool) => tool.type === "function" && tool.function.name === "write_file"), "Missing localized targets must remain creatable");
+      return { model: "mock", usage: { prompt_tokens: 100, completion_tokens: 20 }, message: turn <= 2
+        ? { tool_calls: [{ id: `new-${turn}`, type: "function", function: { name: "write_file", arguments: JSON.stringify({
+          path: turn === 1 ? "src/answer.cjs" : "tests/answer.test.cjs",
+          content: turn === 1 ? "exports.answer=42;\n" : "const {test}=require('node:test');const a=require('node:assert/strict');test('answer',()=>a.equal(require('../src/answer.cjs').answer,42));\n",
+        }) } }] } : { content: "done" } } as AgenticCodingResponse;
+    });
+  const result = await worker.run({ repoPath: root, attemptId: "empty-multi", task: "Create src/answer.cjs exporting answer=42 and tests/answer.test.cjs verifying it.",
+    model: "mock", budgetUsd: .5, maxTokens: 20_000, maxSteps: 4, timeoutMs: 30_000, requestTimeoutMs: 5_000,
+    commandTimeoutMs: 5_000, maxOutputTokens: 1_000, baseUrl: "unused", writeScope: ["src/answer.cjs", "tests/answer.test.cjs"],
+    context: { implementationRecovery: { reason: "complete_packet_preflight" }, relevantFiles: ["src/answer.cjs", "tests/answer.test.cjs"] } });
+  assert.equal(result.exitStatus, "completed", JSON.stringify(result));
+  assert.equal(turn, 2, "complete bounded scope returns immediately after its final mutation");
+  assert.equal(result.changedPaths.length, 2);
+  const { execa } = await import("execa");
+  await execa(process.execPath, ["--test", "tests/answer.test.cjs"], { cwd: root });
+});
+
+test('partial multifile mutation compacts history and finishes remaining edits within the same attempt',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'koda-mutation-compact-'));
+ await writeFile(join(root,'first.ts'),'export const first = 1;');
+ await writeFile(join(root,'second.ts'),'export const second = 1;');
+ let calls=0;
+ const events:string[]=[];
+ const worker=new AgenticCodingWorker(new Budget(1,20000,60000),{log(type:string){events.push(type);}} as any,async (_input,messages)=>{
+  calls++;
+  if(calls===1)return response(toolCall('read_file',{path:'first.ts'}),toolCall('read_file',{path:'second.ts'}));
+  if(calls===2)return {...response(toolCall('edit_file',{path:'first.ts',oldText:'= 1',newText:'= 2'})),message:{content:'old verbose reasoning '.repeat(3000),tool_calls:[toolCall('edit_file',{path:'first.ts',oldText:'= 1',newText:'= 2'})]}};
+  assert.ok(!JSON.stringify(messages).includes('old verbose reasoning'));
+  assert.match(JSON.stringify(messages),/CURRENT FILE first.ts/);
+  assert.match(JSON.stringify(messages),/first = 2/);
+  assert.match(JSON.stringify(messages),/Preserve this exact requirement/);
+  return response(toolCall('edit_file',{path:'second.ts',oldText:'= 1',newText:'= 2'}));
+ });
+ const r=await worker.run({...workerInput(root),task:'Update both values. Preserve this exact requirement.',writeScope:['first.ts','second.ts'],returnOnMutation:false,maxTokens:9000});
+ assert.equal(calls,3);
+ assert.ok(events.includes('agentic_mutation_history_compact_retry'));
+ assert.deepEqual(r.changedPaths.sort(),['first.ts','second.ts']);
+ assert.match(await readFile(join(root,'second.ts'),'utf8'),/second = 2/);
+});
+
+test('explicit affordable provider output limit retries the same request once without rediscovery',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'koda-credit-retry-'));
+ let calls=0;
+ let rejectedMessages='';
+ const worker=new AgenticCodingWorker(new Budget(1,20000,60000),{log(){}} as any,async(input,messages,_tools,output)=>{
+  calls++;
+  assert.equal(input.model,'mock');
+  if(calls===1){assert.equal(output,1000);rejectedMessages=JSON.stringify(messages);throw Error('402 This request requires more credits. You requested up to 1000 tokens, but can only afford 500.');}
+  assert.equal(output,500);
+  assert.equal(JSON.stringify(messages),rejectedMessages);
+  return response(toolCall('write_file',{path:'value.ts',content:'export const value=1;'}));
+ });
+ const r=await worker.run({...workerInput(root),maxSteps:1});
+ assert.equal(calls,2);assert.equal(r.exitStatus,'completed');assert.deepEqual(r.changedPaths,['value.ts']);
+});
+
+test('exhausted credits without an affordable output bound stop without repeated dispatch',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'koda-credit-empty-'));
+ let calls=0;
+ const worker=new AgenticCodingWorker(new Budget(1,20000,60000),{log(){}} as any,async()=>{calls++;throw Error('402 available credits exceeded by in-flight requests');});
+ const r=await worker.run(workerInput(root));
+ assert.equal(calls,1);assert.equal(r.exitStatus,'infra_failure');assert.equal(r.costUsd,undefined);
+ assert.equal(r.inputTokens,undefined);assert.equal(r.outputTokens,undefined);
+});
+
+test('provider failure preserves known usage and candidate for recovery without fabricated total cost',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'koda-known-receipts-'));
+ let calls=0;
+ const worker=new AgenticCodingWorker(new Budget(1,20000,60000),{log(){}} as any,async()=>{
+  if(++calls===1)return response(toolCall('write_file',{path:'first.ts',content:'export const first=1;'}));
+  throw Error('Request was aborted.');
+ });
+ const r=await worker.run({...workerInput(root),returnOnMutation:false,writeScope:['first.ts','second.ts']});
+ assert.equal(r.exitStatus,'infra_failure');assert.deepEqual(r.changedPaths,['first.ts']);
+ assert.equal(r.inputTokens,100);assert.equal(r.outputTokens,20);assert.equal(r.consumedTokens,120);assert.equal(r.costUsd,undefined);
+});
+
+test('native forecast uses bounded repair evidence independently of raw verifier output size',()=>{
+ const task='Preserve the complete task literal EXACT_REQUIRED_VALUE';
+ const context={implementationRecovery:{reason:'bounded_coding_packet'},diagnostics:'FAIL exact assertion\n'+'trace '.repeat(100000),previousFailedDiff:'diff '.repeat(100000),relevantFiles:['src/value.ts'],sourceFiles:[{path:'src/value.ts',snippet:'source '.repeat(100000)}]};
+ const a=agenticPromptBytes({task,writeScope:['src/value.ts'],context});
+ const b=agenticPromptBytes({task,writeScope:['src/value.ts'],context:{...context,diagnostics:context.diagnostics.slice(0,3000),previousFailedDiff:context.previousFailedDiff.slice(0,3000),sourceFiles:[]}});
+ assert.equal(a,b);assert.ok(a<32000);assert.ok(agenticPromptBytes({task:task.repeat(2),writeScope:['src/value.ts'],context})>a,'task is preserved rather than silently truncated');
+});
+
+test('requested tests continue in the same worker session after premature completion', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'koda-test-continuation-'));
+  await mkdir(join(root, 'tests'));
+  await writeFile(join(root, 'value.ts'), 'export const value = 1;\n');
+  await writeFile(join(root, 'package.json'), JSON.stringify({scripts:{test:'tsx --test tests/*.test.ts'}}));
+  let calls=0;
+  const events:any[]=[];
+  const worker = new AgenticCodingWorker(new Budget(1, 30_000, 60_000), {log(type:string,data:any){events.push({type,...data});}} as any,
+    async (_input,messages)=>{
+      calls++;
+      if(calls===1)return response(toolCall('read_file',{path:'value.ts'}));
+      if(calls===2)return response(toolCall('edit_file',{path:'value.ts',oldText:'= 1',newText:'= 2'}));
+      if(calls===3)return {...response(),message:{content:'Done'}};
+      if(calls===4){assert.match(JSON.stringify(messages),/requested test mutation is missing/);return response(toolCall('write_file',{path:'tests/value.test.ts',content:'import {value} from "../value.js";\n'}));}
+      return {...response(),message:{content:'Done'}};
+    });
+  const result=await worker.run({...workerInput(root),task:'Change value to 2 and add regression tests',returnOnMutation:false});
+  assert.equal(result.exitStatus,'completed');
+  assert.deepEqual(result.changedPaths.sort(),['tests/value.test.ts','value.ts']);
+  assert.equal(calls,5);
+  assert.equal(events.filter(e=>e.type==='agentic_missing_tests_continuation').length,1);
+});
+
+test('aborted dispatched Agentic turn remains an unknown-cost receipt', async () => {
+ const root=await mkdtemp(join(tmpdir(),'koda-aborted-receipt-'));
+ const events:any[]=[];
+ const worker=new AgenticCodingWorker(new Budget(1,20000,60000),{events,log(type:string,payload:any){events.push({type,...payload});}} as any,async()=>{throw Error('Request was aborted.');});
+ const result=await worker.run({...workerInput(root)});
+ assert.equal(result.exitStatus,'infra_failure');
+ const calls=events.filter(e=>e.type==='model_call');
+ assert.equal(calls.length,1);
+ assert.equal(calls[0].costUsd,null);
+ assert.equal(calls[0].costSource,'missing');
+ assert.equal(calls[0].outcome,'OPERATIONAL_FAILURE');
+});
+
+test('tiny worker compacts directly after its first relevant read',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'koda-first-read-'));
+ await writeFile(join(root,'value.ts'),'export const value = 1;\n');
+ const events:any[]=[];let turn=0;
+ const worker=new AgenticCodingWorker(new Budget(1,20000,60000),{events,log(type:string,payload:any){events.push({type,...payload});}} as any,async()=>{
+  if(++turn===1)return response(toolCall('read_file',{path:'value.ts'}));
+  assert.equal(events.filter(e=>e.type==='agentic_implementation_transition').length,1);
+  return response(toolCall('edit_file',{path:'value.ts',oldText:'value = 1',newText:'value = 2'}));
+ });
+ const result=await worker.run({...workerInput(root),writeScope:['value.ts']});
+ assert.deepEqual(result.changedPaths,['value.ts']);assert.equal(turn,2);
 });

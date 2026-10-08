@@ -1,0 +1,7 @@
+task_id,source_split,dimension,model,resolved,in_tok,out_tok,cost_usd,cost_source
+ood-0,fixture-ood,arithmetic,model-a,1,10,5,0.01,synthetic_fixture
+ood-0,fixture-ood,arithmetic,model-b,0,10,5,0.02,synthetic_fixture
+ood-0,fixture-ood,arithmetic,model-c,0,10,5,0.04,synthetic_fixture
+ood-1,fixture-ood,text_processing,model-a,0,10,5,0.01,synthetic_fixture
+ood-1,fixture-ood,text_processing,model-b,1,10,5,0.02,synthetic_fixture
+ood-1,fixture-ood,text_processing,model-c,0,10,5,0.04,synthetic_fixture

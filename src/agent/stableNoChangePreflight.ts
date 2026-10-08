@@ -7,6 +7,9 @@ import { verificationPlan } from "../verifier/plan.js";
 import { optionalUnavailableCheck } from "../verifier/recovery.js";
 import { verify, verificationResult } from "../verifier/verifier.js";
 import { isExplicitTestOnlyTask, testRequirementAlreadyCovered } from "./mutationInvariant.js";
+import type { ExecutionStrategy } from "../router/executionStrategy.js";
+import { applicationWideVisualTask, type RepositoryExploration } from "./openHandsExplorer.js";
+import { isOnlyLocalizedCopyTask } from "./literalEdit.js";
 
 const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
 
@@ -39,6 +42,36 @@ export interface StableNoChangePreflight {
   satisfied: boolean;
   verification: VerificationResult;
   evidencePaths: string[];
+}
+
+/**
+ * A clean structural baseline is useful routing evidence, but it need not sit
+ * on the critical path once local repository evidence has already bounded a
+ * mutation. Candidate verification still runs normally, and any candidate
+ * failure triggers the existing on-demand baseline comparison before Koda can
+ * classify it as a regression.
+ */
+export function canDeferRoutingBaseline(
+  task: string,
+  profile: RepoProfile,
+  exploration: RepositoryExploration,
+  strategy: ExecutionStrategy,
+  boundedImplementation = false,
+): boolean {
+  const paths = exploration.editableCandidates.map(({ path }) => path);
+  const mechanicallyReviewable = (boundedImplementation && paths.every(path => /\.(?:[cm]?[jt]sx?|py|go|rs|java|vue|svelte|html?|css)$/i.test(path))) || applicationWideVisualTask(task) ||
+    (paths.length === 1 &&
+      /\.(?:[cm]?[jt]sx?|vue|svelte|html?|css)$/i.test(paths[0] ?? "") &&
+      isOnlyLocalizedCopyTask(task));
+  return strategy.execution_strategy === "direct" &&
+    strategy.execution_effort !== "complex" &&
+    exploration.confidence === "high" &&
+    exploration.unresolvedQuestions.length === 0 &&
+    exploration.relatedTests.length === 0 &&
+    paths.length > 0 && paths.length <= 4 &&
+    paths.every((path) => path !== "." && !path.includes("..") && (boundedImplementation || profile.files.includes(path))) &&
+    mechanicallyReviewable &&
+    !isExplicitTestOnlyTask(task);
 }
 
 /**

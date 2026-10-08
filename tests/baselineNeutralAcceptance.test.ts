@@ -5,6 +5,7 @@ import {
   verificationAgainstBaseline,
   verificationRegressions,
   verificationResult,
+  runtimeInfrastructureFailure,
 } from "../src/verifier/verifier.js";
 import {
   completionReviewGate,
@@ -27,6 +28,24 @@ const pass = (
   stderr: "",
   wallClockMs: 1,
   timedOut: false,
+});
+
+test("external dependency mount failure is infrastructure and cannot independently verify success", () => {
+  const check = { command: "npm run build", exitCode: 1, stdout: "",
+    stderr: "TurbopackInternalError: Symlink [project]/node_modules is invalid, it points out of the filesystem root",
+    wallClockMs: 1, timedOut: false };
+  assert.equal(runtimeInfrastructureFailure(check), "verification_dependency_mount_environment");
+  assert.equal(verificationResult([{ ...check, outcome: "INFRA_FAILURE" }]).status, "NOT_FULLY_VERIFIED");
+  assert.equal(runtimeInfrastructureFailure({ ...check, stderr: "Type error: property missing" }), undefined);
+});
+
+test("build resource download failures are infrastructure, never a passing build or assertion failure", () => {
+  const check = { command: "npm run build", exitCode: 1, stdout: "",
+    stderr: "Error while requesting resource\nThere was an issue establishing a connection while requesting https://example.test/resource.css",
+    wallClockMs: 1, timedOut: false };
+  assert.equal(runtimeInfrastructureFailure(check), "verification_network_environment");
+  assert.equal(verificationResult([{ ...check, outcome: "INFRA_FAILURE" }]).status, "NOT_FULLY_VERIFIED");
+  assert.equal(runtimeInfrastructureFailure({ ...check, stderr: `AssertionError: ${check.stderr}` }), undefined);
 });
 
 const existingPlannerFailure = (duration: string): CommandResult => ({

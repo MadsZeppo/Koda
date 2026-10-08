@@ -3,12 +3,21 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "bin": {
+    "koda": "bin/koda.mjs"
+  },
   "engines": {
     "node": ">=22"
   },
   "packageManager": "pnpm@11.7.0",
   "scripts": {
+    "cold-start:test": "tsc --noEmit -p research/cold-start/tsconfig.json && tsx --test research/cold-start/tests/*.test.ts",
+    "cold-start:data": "tsx research/cold-start/src/cli.ts data",
+    "cold-start:eval": "tsx research/cold-start/src/cli.ts eval",
+    "benchmark:compare": "tsx src/dev/benchmarkCompare.ts",
     "agent": "tsx src/cli.ts",
+    "backend": "tsx src/backend/server.ts",
+    "smoke:fake": "tsx src/dev/fakeSmoke.ts",
     "calibrate:model": "tsx src/cli.ts calibrate-model",
     "routing:sync-evidence": "tsx src/cli.ts routing-sync-evidence",
     "routing:prepare-coderouterbench": "tsx src/cli.ts routing-prepare-coderouterbench",
@@ -22,7 +31,37 @@
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",
     "format": "prettier --write src tests/*.ts *.json README.md benchmarks",
-    "format:check": "prettier --check src tests/*.ts *.json README.md benchmarks"
+    "format:check": "prettier --check src tests/*.ts *.json README.md benchmarks",
+    "smoke:suite:fake": "tsx src/dev/fakeSuite.ts",
+    "smoke:suite:live": "tsx src/dev/liveSuite.ts",
+    "desktop": "electron desktop/main.mjs",
+    "desktop:install": "node desktop/install.mjs",
+    "eval:task-assessment": "tsx src/dev/taskAssessmentEval.ts",
+    "eval:verification-contract": "tsx src/dev/verificationContractEval.ts",
+    "eval:failure-attribution": "tsx src/dev/failureAttributionEval.ts",
+    "eval:routing-v1": "tsx src/dev/routingV1Eval.ts",
+    "routing:build-public": "tsx src/dev/publicRoutingEvidence.ts",
+    "routing:calibrate": "tsx src/dev/nativeCalibration.ts",
+    "routing:eval-contextual": "tsx src/dev/contextualMilestoneEval.ts",
+    "routing:verifier:preflight": "tsx src/dev/verifierPilot.ts --preflight",
+    "routing:verifier:pilot": "tsx src/dev/verifierPilot.ts",
+    "cold-start-v2:data": "python3 research/cold-start-v2/src/cli.py data",
+    "cold-start-v2:validate": "python3 research/cold-start-v2/src/cli.py validate",
+    "cold-start-v2:test": "python3 research/cold-start-v2/src/cli.py test",
+    "cold-start-v2:cross-eval": "python3 research/cold-start-v2/src/cli.py cross-eval",
+    "cold-start-v2:export": "python3 research/cold-start-v2/src/cli.py export",
+    "cold-start-v2:smoke": "python3 research/cold-start-v2/src/cli.py smoke",
+    "cold-start-v2:unit": "python3 -m unittest discover -s research/cold-start-v2/tests -v",
+    "cold-start-v3:data": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 research/cold-start-v3/.venv/bin/python research/cold-start-v3/src/cli.py data",
+    "cold-start-v3:validate": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 research/cold-start-v3/.venv/bin/python research/cold-start-v3/src/cli.py validate",
+    "cold-start-v3:freeze": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 research/cold-start-v3/.venv/bin/python research/cold-start-v3/src/cli.py freeze",
+    "cold-start-v3:test": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 research/cold-start-v3/.venv/bin/python research/cold-start-v3/src/cli.py test",
+    "cold-start-v3:stress": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 research/cold-start-v3/.venv/bin/python research/cold-start-v3/src/cli.py stress",
+    "cold-start-v3:export": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 research/cold-start-v3/.venv/bin/python research/cold-start-v3/src/cli.py export",
+    "cold-start-v3:smoke": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 research/cold-start-v3/.venv/bin/python research/cold-start-v3/src/cli.py smoke",
+    "cold-start-v3:unit": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 research/cold-start-v3/.venv/bin/python -m unittest discover -s research/cold-start-v3/tests -v",
+    "benchmark:auto-frontier": "tsx src/dev/autoFrontierPilot.ts",
+    "benchmark:claude-suite": "tsx src/dev/claudeTierSuite.ts"
   },
   "dependencies": {
     "commander": "^14.0.0",
@@ -33,6 +72,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "electron": "^44.5.1",
     "prettier": "^3.9.6",
     "tsx": "^4.20.0",
     "typescript": "^5.8.0"

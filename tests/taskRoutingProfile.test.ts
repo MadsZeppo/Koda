@@ -59,6 +59,55 @@ test("test intent is determined from objective and accepts deterministic unit-te
   assert.equal(taskFingerprint(feature, featureRepo, featureFacts, "normal").primary, "implementation");
 });
 
+test("a URL query-parameter constraint is frontend work, not SQL database work", () => {
+  const paths = ["src/app/globals.css", "src/components/header.tsx", "src/app/how-it-works/page.tsx"];
+  const task = work("Create the /how-it-works UI route. Do not use a query parameter.", paths);
+  const repo = profile(paths);
+  const features = extractFeatures(task, repo, 1200, undefined, "direct");
+  const fingerprint = taskFingerprint(task, repo, features, "normal");
+  assert.equal(fingerprint.primary, "implementation");
+  assert.ok(fingerprint.secondary.includes("frontend_ui"));
+  assert.equal(fingerprint.secondary.includes("sql_database"), false);
+});
+
+test("a concrete route, component and stylesheet remain a bounded multi-file UI task", () => {
+  const paths = [
+    "src/components/landing/landing-header.tsx",
+    "src/app/globals.css",
+    "src/app/how-it-works/page.tsx",
+  ];
+  const task = work(
+    "Gør hele appens UI sort, opret /how-it-works, og opdatér navigationens link",
+    paths,
+  );
+  // The route is new; the other two targets have already been localized and read.
+  const repo = profile(paths.slice(0, 2));
+  const features = extractFeatures(task, repo, 2200, undefined, "direct");
+  const fingerprint = taskFingerprint(task, repo, features, "normal");
+  assert.equal(features.requiresCrossModuleReasoning, false);
+  assert.equal(features.localizationConfidence, "high");
+  assert.equal(fingerprint.scope, "multi-file");
+  assert.equal(fingerprint.crossComponent, false);
+  assert.equal(fingerprint.architecturalCoupling, "low");
+  assert.equal(fingerprint.difficulty.architecturalComplexity, "low");
+  assert.equal(fingerprint.visualRelevant, true);
+});
+
+test("quality language for a whole UI is recognized as subjective visual work", () => {
+  const paths = ["src/app/globals.css", "src/app/page.tsx"];
+  const task = work(
+    "Gør hele UI top level, meget flot og professionelt ligesom Stripe",
+    paths,
+  );
+  const repo = profile(paths);
+  const features = extractFeatures(task, repo, 1200, undefined, "direct");
+  const fingerprint = taskFingerprint(task, repo, features, "normal");
+  assert.equal(fingerprint.visualRelevant, true);
+  assert.equal(fingerprint.difficulty.visualComplexity, "high");
+  assert.equal(fingerprint.verificationStrength, "weak");
+  assert.equal(fingerprint.verifierFalseAcceptRisk, "high");
+});
+
 test("explicit local test target does not absorb unrelated textual matches into routing risk", () => {
   const files = [
     "tests/controlPolicy.test.ts",

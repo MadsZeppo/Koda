@@ -6,6 +6,7 @@ export const metadataSchema = z.object({
   maxOutputTokens: z.number().positive().optional(),
   available: z.boolean().optional(),
   supportedParameters: z.array(z.string()).optional(),
+  reasoning: z.object({ mandatory: z.boolean().optional(), supported_efforts: z.array(z.string()).nullable().optional() }).passthrough().optional(),
   /** Parameters supported together by each concrete provider endpoint. */
   routableParameterSets: z.array(z.array(z.string())).optional(),
   retrievedAt: z.string().optional(),
@@ -35,6 +36,22 @@ export const poolSchema = z
   );
 export const routingSchema = z
   .object({
+    authority: z.enum(["legacy", "cold-start", "openrouter-auto"]).default("legacy"),
+    openRouterAuto: z.object({
+      models: z.array(z.string().min(1)).min(1).optional(),
+      referenceModel: z.string().min(1),
+      costTier: z.enum(["auto", "low", "medium", "high", "xhigh", "max"]).default("auto"),
+      priceRatio: z.object({low:z.number().positive().default(0.05),medium:z.number().positive().default(0.25),high:z.number().positive().default(1),xhigh:z.number().positive().default(2),max:z.number().positive().default(4)}).default({}),
+      completionReserveFraction: z.number().min(0.05).max(0.5).default(0.1),
+    }).refine(p => (!p.models || (new Set(p.models).size === p.models.length && p.models.includes(p.referenceModel) && !p.models.some(id => id.startsWith("openrouter/auto") || /[*?]/.test(id)))),
+      "Auto requires exact unique concrete model IDs including its reference").optional(),
+    coldStart: z.object({
+      referenceModel: z.string().min(1),
+      models: z.array(z.string().min(1)).min(1).max(6),
+      evidenceFile: z.string().min(1).optional(),
+      completionReserveFraction: z.number().min(0.05).max(0.5).default(0.1),
+    }).refine((p) => new Set(p.models).size === p.models.length && p.models.includes(p.referenceModel),
+      "Cold-start pool must be unique and include its explicit reference").optional(),
     minimumQuality: z.number().min(0).max(1).default(0.9),
     maxQualityRegret: z.number().min(0).max(0.2).default(0.02),
     costWeight: z.number().nonnegative().default(0.55),
@@ -50,6 +67,11 @@ export const routingSchema = z
     researchTimeoutMs: z.number().int().positive().max(20000).default(12000),
     conditionalRecoveryMinSamples: z.number().int().min(2).max(50).default(3),
   })
+  .refine(r => r.authority !== "openrouter-auto" || !!r.openRouterAuto, "Auto authority requires an explicit pool and reference")
+  .refine(
+    (r) => r.authority !== "cold-start" || !!r.coldStart,
+    "Cold-start authority requires a pool and reference model",
+  )
   .refine(
     (r) => r.costWeight + r.latencyWeight > 0,
     "Routing weights must have positive total",

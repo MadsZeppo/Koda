@@ -317,7 +317,7 @@ class RepositoryExecutor(ToolExecutor):
                         continue
                     path = self.root / relative
                     if relative not in self.state["files_inspected"] and (
-                        len(self.state["files_inspected"]) + len(set(inspected))
+                        len(self.state["files_inspected"] | set(inspected))
                         >= self.state["max_files_read"]
                     ):
                         break
@@ -327,9 +327,12 @@ class RepositoryExecutor(ToolExecutor):
                         text = path.read_text("utf-8", errors="replace")
                     except OSError:
                         continue
-                    inspected.append(relative)
                     for number, line in enumerate(text.splitlines(), 1):
                         if pattern.search(line):
+                            if relative not in inspected:
+                                # Scanned files without hits provide no model
+                                # evidence and must not consume its read budget.
+                                inspected.append(relative)
                             matches.append(f"{relative}:{number}:{line[:300]}")
                             if len(matches) >= action.limit:
                                 break
@@ -468,6 +471,8 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
         model=request["llm_model"],
         api_key=os.environ.get("KODA_EXPLORER_API_KEY", "missing"),
         base_url=request.get("base_url"),
+        litellm_extra_body={"model": request["routed_model"]}
+        if request.get("provider_mode") == "backend" else {},
         num_retries=0,
         timeout=max(1, int(request["request_timeout_ms"] / 1000)),
         max_input_tokens=request["max_input_tokens"],

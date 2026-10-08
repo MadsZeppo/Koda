@@ -1,6 +1,6 @@
 # Koda: parallel coding-agent experiment
 
-A local TypeScript CLI for measuring whether explicit model routing and isolated parallel execution can reduce coding-agent cost and latency while preserving executable task success. No server, dashboard, accounts, database, or billing system.
+A local TypeScript CLI for measuring whether explicit model routing and isolated parallel execution can reduce coding-agent cost and latency while preserving executable task success. A small provider backend keeps OpenRouter credentials server-side; there are no accounts, dashboard, database, or billing system.
 
 Production coding attempts use Aider through `AiderExecutor`. Koda owns routing,
 model selection, per-call budgets, isolated write scopes, verification, and apply
@@ -10,11 +10,19 @@ fallback, and telemetry.
 
 ## Run
 
-Requires Node.js 22+, pnpm, ripgrep, and **macOS `sandbox-exec` or Linux `bubblewrap` (`bwrap`)**. Git is required by Aider; non-Git and dirty-workspace inputs remain supported through disposable Git snapshots. The macOS execution path is tested; Linux support requires a host that permits unprivileged namespaces.
+Requires Node.js 22+, pnpm, ripgrep, and **macOS `sandbox-exec` or Linux `bubblewrap` (`bwrap`)**. Git is optional: clean repositories can use worktrees, while ordinary folders use filesystem snapshots. Aider requires the Git executable; when it is unavailable, its execution handoff uses bounded native Agentic tools on the same model. No GitHub account or login is needed. The macOS execution path is tested; Linux support requires a host that permits unprivileged namespaces.
+
+Start the [Koda backend](docs/backend.md) first. Normal CLI runs use that backend
+and do not need an OpenRouter key locally. Only the server stores the upstream
+key; direct local provider calls require explicit `KODA_PROVIDER_MODE=direct-openrouter`.
+
+macOS sandbox commands use [restricted build networking](docs/sandbox-network.md)
+for resources such as Google Fonts. Baseline, candidate and post-apply checks
+share that policy; direct external sockets remain blocked.
 
 ```sh
 pnpm install
-export OPENROUTER_API_KEY='your-key'
+export KODA_API_URL='http://127.0.0.1:8787'
 pnpm agent run \
   --repo /absolute/path/to/repository \
   --task "Implement X and fix Y" \
@@ -25,6 +33,42 @@ pnpm agent run \
 Koda chooses a workspace backend before profiling. A clean Git repository uses the existing isolated Git worktree and integration branch. A dirty Git checkout or ordinary non-Git directory uses bounded filesystem snapshots; tracked edits and untracked files are part of the immutable baseline. Both modes leave the original directory untouched while agents run.
 
 The default is preview mode. Review `summary.json`, `workspace.json`, and the printed integration directory. Apply that exact verified preview with `pnpm agent apply --run /absolute/path/to/run-output`, or pass `--apply` to a run to apply immediately after verification. Apply compares every affected original file with the baseline first and refuses the whole operation on a conflict. A failed or incomplete verification is never applied. To undo an applied run, use `pnpm agent revert --run /absolute/path/to/run-output`; revert also refuses to overwrite files edited since apply.
+
+### Link the local development CLI once
+
+From the Koda checkout, with Node.js 22+ active:
+
+```sh
+cd /Users/madsflyvholm/Desktop/Koda.ai
+pnpm install
+npm link --ignore-scripts --no-package-lock
+```
+
+This registers the standard package `bin` command, `koda`, in npm's global bin
+directory (which must be on your `PATH`). It runs the current local TypeScript
+source, so development changes need no rebuild. Keep Koda's checkout and its
+installed dependencies in place. `npm unlink --global koda-agent` removes the link.
+The target project does not need Koda dependencies or source files.
+
+From another project, preview first or opt into real apply:
+
+```sh
+cd ~/Desktop/some-other-project
+export KODA_API_URL='http://127.0.0.1:8787'
+koda agent run --repo . --task "Fix the failing tests"
+koda agent run --repo . --task "Fix the failing tests" --apply
+```
+
+`koda run` also works; both forms use the same CLI. Apply copies only the
+verified modified, created and deleted paths, leaving unrelated user files and
+the Git index alone. A changed destination produces explicit `applyConflicts`;
+no files are written when the initial conflict check fails. The accepted checks
+run again against the original repository's current contents under verification
+isolation. If they fail, the run cannot report `VERIFIED_SUCCESS`: it records
+`verification_failed` and attempts to roll back its own changes. Rollback refuses
+to overwrite newer user edits and reports any conflicts. The candidate remains
+inspectable in the report. Preview apply also validates the stored candidate hashes before
+writing and repeats the recorded checks for normal pipeline reports.
 
 Install the target repository's dependencies **before** running Koda. Existing `node_modules` is copied into each worktree (copy-on-write where supported), never shared as a writable directory. Global toolchains under standard system paths are readable. Home-directory toolchains, virtual environments, workspace symlinks escaping the worktree, network-dependent tests, and services requiring network access need adaptation to the sandbox. V0 does not autonomously install packages or provision external services. Dependencies added by a task may therefore require another run after installation.
 
@@ -162,11 +206,11 @@ pnpm agent run --config ./koda.free.json --repo /tmp/koda-routing-fixtures/direc
 pnpm agent run --config ./koda.free.json --repo /tmp/koda-routing-fixtures/parallel --task "Fix the broken math helper, slug helper, and display-name formatter so all tests pass. These are independent bugs." --max-parallel 3
 ```
 
-Set `OPENROUTER_API_KEY` first. Fixture generation makes no model calls. Rerunning generation resets only marked fixture repositories; remove their retained linked worktrees before resetting. Unmarked directories are refused. `koda.free.json` is unchanged. No live OpenRouter benchmark was run for this implementation.
+Set `KODA_API_URL` to a running backend first. Fixture generation makes no model calls. Rerunning generation resets only marked fixture repositories; remove their retained linked worktrees before resetting. Unmarked directories are refused. `koda.free.json` is unchanged. No live OpenRouter benchmark was run for this implementation.
 
 ## Manual model-router evaluation
 
-With `OPENROUTER_API_KEY` set, run from the Koda repository. These commands use paid pool candidates with a $0.10 per-run maximum, not the legacy free config. Worktrees preserve the fixtures' original broken checkout, so the same task can be repeated without resetting between runs.
+With `KODA_API_URL` pointing to a backend with its server-side key configured, run from the Koda repository. These commands use paid pool candidates with a $0.10 per-run maximum, not the legacy free config. Worktrees preserve the fixtures' original broken checkout, so the same task can be repeated without resetting between runs.
 
 ```sh
 node scripts/create-routing-fixtures.mjs /tmp/koda-model-router-v1
@@ -181,3 +225,42 @@ pnpm agent run --models-file ./koda.models.json --force-model openai/gpt-5.6-sol
 ```
 
 Look for `execution_strategy`, `model_router`, `selected_model`, `routing_reason`, `estimated_quality`, model cost, wall clock, and verification. `summary.json` includes routing decisions/candidates, attempts, fallbacks, planner models/calls, actual per-call tokens/cost/time, concurrency, and final verification. A $0.10 budget can stop a larger/parallel run before completion; it is a cap, not a completion guarantee. No comparison with Codex or other agents has been established.
+# Expert coding smoke suite
+
+For a ten-task Codex comparison, run Koda on the IDs printed by
+`pnpm exec tsx src/dev/codexComparison.ts --list`, with parallel=1 and output
+`<comparison-directory>/koda`, then run
+`pnpm exec tsx src/dev/codexComparison.ts --model gpt-6.1-sol --output <comparison-directory>/codex`.
+The runner retains Codex JSONL usage and writes `comparison.json` beside the two
+suite reports. Codex costs are Standard API-equivalent estimates using a dated
+official pricing snapshot (short-context estimate plus long-context upper estimate),
+not ChatGPT subscription charges. Cached input/cache writes are accounted separately;
+reasoning is not added a second time to output. All failed-task spend is included.
+Incomplete or missing usage yields unknown totals, never a zero-price claim.
+Rates exclude paid tools, regional and service-tier premiums; the requested model
+is pinned with `--model`. Models without a verified rate are rejected before execution.
+
+The `stress` suite contains 30 longer integration tasks. Each task combines three
+expert algorithms behind a batch API (90 required algorithm implementations in
+total), with mixed/repeated calls, nonmutation, empty batches and unknown-operation
+checks. All tasks modify existing source files and request source + test changes.
+It reuses expert algorithm contracts in new combinations; it does not simulate
+large application repositories or browser/UI work. Independent acceptance stays
+outside the candidate repos.
+
+```sh
+pnpm smoke:suite:fake --suite stress --parallel 4 --output "/tmp/koda-stress-fake-$(date +%s)"
+KODA_PROVIDER_MODE=backend KODA_API_URL=http://127.0.0.1:8787 pnpm smoke:suite:live --suite stress --parallel 4 --budget-usd 3 --output "/tmp/koda-stress-live-$(date +%s)"
+```
+
+Run 30 harder, isolated coding tasks (graph traversal, dynamic programming,
+tree operations, money allocation, cache/rate-limit simulation and parsing).
+Every task requests regression tests; ten create new source files and ten use
+progressive discovery. The harness checks actual apply and independent behavior
+outside the candidate repo. These are small CommonJS projects, not UI or
+production-scale integration benchmarks.
+
+```sh
+pnpm smoke:suite:fake --suite expert --parallel 4 --output "/tmp/koda-expert-fake-$(date +%s)"
+KODA_PROVIDER_MODE=backend KODA_API_URL=http://127.0.0.1:8787 pnpm smoke:suite:live --suite expert --parallel 4 --budget-usd 3 --output "/tmp/koda-expert-live-$(date +%s)"
+```

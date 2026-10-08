@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { providerTransport } from '../provider/transport.js';
 
 import type { Gateway } from "../openrouter/client.js";
 import type { RepoProfile, Usage, VerificationResult } from "../types.js";
@@ -8,6 +9,13 @@ import type {
 } from "./taskProfiler.js";
 
 export const semanticTaskAssessmentSchema = z.object({
+  securityAssessment: z
+    .object({
+      resolution: z.enum(["security", "non_security", "unresolved"]),
+      confidence: z.number().finite().min(0).max(1),
+      evidence: z.string().trim().min(1).max(500),
+    })
+    .optional(),
   semanticDifficulty: z.enum(["easy", "normal", "hard", "frontier"]),
   repoReasoning: z.enum(["low", "medium", "high"]),
   localizationDifficulty: z.enum(["low", "medium", "high"]),
@@ -88,6 +96,7 @@ const noul = (payload: DecisionPayload, key: string): number => {
 export function assessmentFromDecisionPayload(
   payload: DecisionPayload,
   frontierThreshold = 0.9,
+  includeSecurityAssessment = false,
 ): SemanticTaskAssessment {
   const semanticDifficulty = choice(
     payload,
@@ -142,10 +151,23 @@ export function assessmentFromDecisionPayload(
     requestedStartingTier.confidence,
     Math.abs(frontierProbability - 0.5) * 2,
   ];
+  const security =
+    includeSecurityAssessment && payload.answers?.securityBoundary
+      ? choice(payload, "securityBoundary", ["security", "non_security", "unresolved"] as const)
+      : undefined;
   const confidence =
     confidences.reduce((sum, value) => sum + value, 0) / confidences.length;
 
   return semanticTaskAssessmentSchema.parse({
+    ...(security
+      ? {
+          securityAssessment: {
+            resolution: security.value,
+            confidence: security.confidence,
+            evidence: "Structured semantic interpretation of implementation action and security boundary using task and localization evidence.",
+          },
+        }
+      : {}),
     semanticDifficulty: semanticDifficulty.value,
     repoReasoning: repoReasoning.value,
     localizationDifficulty: localizationDifficulty.value,
@@ -260,6 +282,7 @@ export async function interpretTask(
   repo: RepoProfile,
   profile: DeterministicTaskProfile,
   verification: VerificationResult,
+  assessmentContext?: { taskSpec: unknown; localizationEvidence: string[]; deterministicRiskEvidence: string[] },
 ): Promise<SemanticTaskAssessment | undefined> {
   const config = gateway.config.semanticRouter;
   if (!config.enabled || gateway.config.forceModel) return undefined;
@@ -274,6 +297,7 @@ export async function interpretTask(
     }));
 
   const state = {
+    ...(assessmentContext ? { assessmentContext } : {}),
     task,
     repository: {
       fileCount: repo.files.length,
@@ -295,7 +319,7 @@ export async function interpretTask(
     baseline: observedChecks,
   };
 
-  const apiKey = process.env.OPENROUTER_API_KEY;
+  const { apiKey, baseUrl } = providerTransport(gateway.config.baseUrl, gateway.config.modelPool?.provider);
   if (!apiKey) {
     gateway.logger.log("semantic_router_fallback", {
       subtaskId: "semantic-router",
@@ -308,7 +332,20 @@ export async function interpretTask(
   const body = {
     model: config.model,
     state,
-    questions: QUESTIONS,
+    questions: assessmentContext
+      ? {
+          ...QUESTIONS,
+          securityBoundary: {
+            type: "choice",
+            instructions: "Does the requested IMPLEMENTATION modify authentication, authorization, permissions, credential/secret handling, signature/authenticity/integrity verification or session/password validation? UI copy, documentation and symbol renames are not security behavior. Use localized boundaries as corroboration, never path or vocabulary alone. Return unresolved when evidence is insufficient.",
+            criteria: {
+              security: "Concrete security-critical implementation behavior",
+              non_security: "Presentation/documentation/rename or ordinary behavior",
+              unresolved: "Possible boundary with insufficient evidence",
+            },
+          },
+        }
+      : QUESTIONS,
   };
   const encoded = JSON.stringify(body);
   const tokenReservation = Buffer.byteLength(encoded) + 256;
@@ -333,7 +370,7 @@ export async function interpretTask(
   const start = Date.now();
 
   try {
-    const base = new URL(gateway.config.baseUrl);
+    const base = new URL(baseUrl);
     const endpoint = `${base.origin}/api/alpha/decisions`;
     const response = await fetch(endpoint, {
       method: "POST",
@@ -419,6 +456,7 @@ export async function interpretTask(
     const assessment = assessmentFromDecisionPayload(
       payload,
       config.frontierThreshold,
+      !!assessmentContext,
     );
 
     gateway.logger.log("semantic_task_assessment", {

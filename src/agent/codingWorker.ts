@@ -14,7 +14,7 @@ export interface CodingWorkerContext {
   /** A rejected completion review must be repaired before any new discovery. */
   completionRepair?: {
     unresolvedRequirementIds: string[];
-    mutationRequiredBeforeDiscovery: true;
+    mutationRequiredBeforeDiscovery: boolean;
   };
 }
 
@@ -53,6 +53,7 @@ export interface CodingWorkerInput {
     editable: string[];
     readOnly: string[];
   };
+  autoRouter?: import("../router/openRouterAutoPolicy.js").AutoRequestSettings;
   modelMetadata?: import("../router/pool.js").Metadata;
 }
 

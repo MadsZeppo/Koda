@@ -1,0 +1,16 @@
+{
+  "models": [
+    {
+      "model": "model-a",
+      "provider": "synthetic-fixture"
+    },
+    {
+      "model": "model-b",
+      "provider": "synthetic-fixture"
+    },
+    {
+      "model": "model-c",
+      "provider": "synthetic-fixture"
+    }
+  ]
+}

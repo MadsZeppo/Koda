@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { posix } from "node:path";
+import { posix, relative, join, isAbsolute } from "node:path";
 import { lstat, readFile, realpath } from "node:fs/promises";
 
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
@@ -63,6 +63,14 @@ export type StableImplementationHandoff = z.infer<typeof declarationSchema>;
 class StableDeclarationError extends Error {}
 class StableScopeTimeoutError extends Error {}
 
+/** Exclude only this inspector's telemetry; repository writes still invalidate inspection. */
+const inspectionDiff = (root: string, gateway: Gateway) => {
+  const log = gateway.logger.directory
+    ? relative(root, join(gateway.logger.directory, "events.jsonl")).split("\\").join("/")
+    : "";
+  return currentDiff(root, log && !isAbsolute(log) && !log.startsWith("../") ? [log] : []);
+};
+
 /** Resolve only a unique implementation anchor backed by an existing focused test. */
 async function localStableScope(
   gateway: Gateway, root: string, task: string, subtask: Subtask,
@@ -77,7 +85,7 @@ async function localStableScope(
     .filter((file) => known.has(file) && isSourcePath(file) && !isTestPath(file));
   const action = task.split(/\b(?:while|preserv\w*|without)\b/i)[0]!
     .replace(/\b[\w./-]+\.test\.[cm]?[jt]sx?\b/gi, " ").toLowerCase();
-  const explicit = sources.filter((file) => task.includes(file));
+  const explicit = sources.filter((file) => action.includes(file.toLowerCase()));
   const named = sources.filter((file) => {
     const stem = posix.basename(file).replace(/\.[^.]+$/, "").toLowerCase();
     const names = [stem, ...(stem.endsWith("s") ? [stem.slice(0, -1)] : [])];
@@ -122,9 +130,11 @@ async function localStableScope(
       posix.basename(file).toLowerCase().startsWith(
         posix.basename(source).replace(/\.[^.]+$/, "").toLowerCase() + ".");
   });
-  if (!focused.length || !profile.verificationCommands.length) return undefined;
+  const hasVerification = profile.verificationCommands.length > 0 ||
+    profile.ecosystem?.projectUnits.some((unit) => unit.verification.some((check) => check.available && check.kind === "test"));
+  if (!focused.length || !hasVerification) return undefined;
   const writePaths = [source];
-  const before = await currentDiff(root);
+  const before = await inspectionDiff(root, gateway);
   const evidence = evidenceSchema.parse({
     relevantFiles: [source, ...focused.map(({ file }) => file)], symbols: [],
     reproduction: `Existing focused test imports or matches ${source}`,
@@ -139,7 +149,7 @@ async function localStableScope(
     requiredChange: `Implement the requested repair in ${source}; preserve existing behavior.`,
     regressionTest: `Run the existing focused test for ${source} and required repository checks.`,
   });
-  if (await currentDiff(root) !== before) throw Error("Stable local scope resolution mutated workspace");
+  if (await inspectionDiff(root, gateway) !== before) throw Error("Stable local scope resolution mutated workspace");
   const scope = new WriteScope(writePaths, gateway.logger, subtask.id);
   gateway.logger.log("stable_scope_locked", {
     subtaskId: subtask.id, allowed_write_paths: scope.paths, deterministic: true,
@@ -320,7 +330,7 @@ export async function prepareStableWorker(
     gateway.config.context.toolResultBytes,
   );
 
-  const before = await currentDiff(path);
+  const before = await inspectionDiff(path, gateway);
   const inspectedText = new Map<string, string>();
 
   /**
@@ -734,7 +744,7 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
       if (!allowed)
         throw new StableDeclarationError(`Write path lacks trusted task-specific evidence: ${file}`);
     }
-    if ((await currentDiff(path)) !== before)
+    if ((await inspectionDiff(path, gateway)) !== before)
       throw Error("Stable read-only inspection mutated the workspace");
     const scope = new WriteScope(proposal.paths, gateway.logger, subtask.id);
     const evidence = evidenceSchema.parse({
@@ -1025,7 +1035,7 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
         const parsed = z.object({ reason: z.string().trim().min(8).max(500) })
           .safeParse((() => { try { return JSON.parse(toolCall.function.arguments); } catch { return null; } })());
         if (parsed.success) {
-          if ((await currentDiff(path)) !== before)
+          if ((await inspectionDiff(path, gateway)) !== before)
             throw Error("Stable read-only inspection mutated the workspace");
           if (allowRepositoryTools) {
             const fallback = await acquireActionableScope(parsed.data.reason);
@@ -1145,7 +1155,7 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
     /**
      * Re-check the workspace after every inspection tool batch.
      */
-    if ((await currentDiff(path)) !== before) {
+    if ((await inspectionDiff(path, gateway)) !== before) {
       throw Error("Stable read-only inspection mutated the workspace");
     }
 
@@ -1331,7 +1341,7 @@ If there is genuinely not enough evidence for a real issue, call report_no_scope
      *
      * Fail closed. We never invent a scope on the model's behalf.
      */
-    if ((await currentDiff(path)) !== before) {
+    if ((await inspectionDiff(path, gateway)) !== before) {
       throw Error("Stable read-only inspection mutated the workspace");
     }
 

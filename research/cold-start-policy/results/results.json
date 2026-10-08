@@ -1,0 +1,52 @@
+{
+  "models": [
+    "claude-sonnet-4",
+    "gemini-2.5-flash",
+    "gpt-5",
+    "qwen3-235b-a22b-2507",
+    "deepseek-v3.1-terminus",
+    "glm-4.6"
+  ],
+  "reference": "claude-sonnet-4",
+  "tasks": 100,
+  "artifactDigest": null,
+  "cheapSelections": 0,
+  "routingMs": 19.834542,
+  "meanRoutingMs": 0.19834542,
+  "paidCalls": 0,
+  "policies": {
+    "Frontier/reference": {
+      "solved": 33,
+      "tasks": 100,
+      "totalHistoricalCostUsd": 8.217696000000002,
+      "costPerHistoricalSolveUsd": 0.24902109090909097,
+      "harmfulDowngrades": 0,
+      "liveVerifiedSuccess": null
+    },
+    "Cold-start fallback": {
+      "solved": 33,
+      "tasks": 100,
+      "totalHistoricalCostUsd": 8.217696000000002,
+      "costPerHistoricalSolveUsd": 0.24902109090909097,
+      "harmfulDowngrades": 0,
+      "liveVerifiedSuccess": null
+    },
+    "Oracle six-model pool": {
+      "solved": 45,
+      "tasks": 100,
+      "totalHistoricalCostUsd": 0.74001009,
+      "costPerHistoricalSolveUsd": 0.016444668666666665,
+      "harmfulDowngrades": 0,
+      "liveVerifiedSuccess": null
+    },
+    "Oracle previous twelve-model pool": {
+      "solved": 63,
+      "tasks": 100,
+      "totalHistoricalCostUsd": 1.4419807700000007,
+      "costPerHistoricalSolveUsd": 0.022888583650793663,
+      "harmfulDowngrades": 0,
+      "liveVerifiedSuccess": null
+    }
+  },
+  "limitation": "Historical single-patch replay only. No live Koda verification or recovery measured. No credible Koda-domain support for this pool: actual cold-start authority falls back to reference. Public task/model capability metadata was not fabricated."
+}

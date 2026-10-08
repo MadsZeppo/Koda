@@ -1,0 +1,61 @@
+{
+  "included": [
+    {
+      "source": "nvidia/Open-SWE-Traces",
+      "revision": "f8fb5b3d2c787f85f8a00f5fe04fe3f1a11088ef",
+      "license": "CC-BY-4.0",
+      "subset": "v1.0/openhands/minimax_m25/swe-rebench-v2",
+      "file": "data/openhands/minimax_m25/swe-rebench-v2/train-00000-of-00018.parquet",
+      "url": "https://huggingface.co/datasets/nvidia/Open-SWE-Traces/resolve/f8fb5b3d2c787f85f8a00f5fe04fe3f1a11088ef/data/openhands/minimax_m25/swe-rebench-v2/train-00000-of-00018.parquet",
+      "localFile": ".cache/source-0.parquet",
+      "sha256": "4d917ba86b030b1f5e227222b0bfe5c1e74c696cbde3a05e7085f30601bb7435",
+      "bytes": 206085165
+    },
+    {
+      "source": "nvidia/Open-SWE-Traces",
+      "revision": "f8fb5b3d2c787f85f8a00f5fe04fe3f1a11088ef",
+      "license": "CC-BY-4.0",
+      "subset": "v1.0/openhands/qwen35_122b/swe-rebench-v2",
+      "file": "data/openhands/qwen35_122b/swe-rebench-v2/train-00000-of-00017.parquet",
+      "url": "https://huggingface.co/datasets/nvidia/Open-SWE-Traces/resolve/f8fb5b3d2c787f85f8a00f5fe04fe3f1a11088ef/data/openhands/qwen35_122b/swe-rebench-v2/train-00000-of-00017.parquet",
+      "localFile": ".cache/source-1.parquet",
+      "sha256": "2f984536bbaa1e2755d31031b069f93cab450a75aa26d71e2c4e76f2627c8e9a",
+      "bytes": 236380400
+    },
+    {
+      "source": "SWE-bench/SWE-smith-trajectories",
+      "revision": "08e109b4a59eaeebf80e4675cd125d42e7ac99a4",
+      "license": "MIT",
+      "codeRevision": "9b74ac08118a85c39c356802f7961893af73e07f",
+      "subset": "tool",
+      "file": "data/tool-00000-of-00008.parquet",
+      "url": "https://huggingface.co/datasets/SWE-bench/SWE-smith-trajectories/resolve/08e109b4a59eaeebf80e4675cd125d42e7ac99a4/data/tool-00000-of-00008.parquet",
+      "localFile": ".cache/source-2.parquet",
+      "sha256": "ac76e9efe75978f83d4daec98a55604587dd58b0f1509364893b8778cbf5b487",
+      "bytes": 248851790
+    }
+  ],
+  "excluded": [
+    {
+      "source": "SAILResearch/swe-agent-subset-selection",
+      "revision": "74bb414fbe7662a7cfdfd2e78b22fdecc53d0389",
+      "reason": "LICENSE placeholder; provenance lookup only; bundled data never ingested"
+    },
+    {
+      "source": "SWE-bench/experiments",
+      "revision": "40f164d5b8f1d249bf95a6df8b74b577fd8e519d",
+      "reason": "original SAIL multi-model source; no explicit repository/data license found; S3 data license not established"
+    },
+    {
+      "source": "NPULH/LLMRouterBench",
+      "revision": "0e5af1b84bf73437a01a1849c0f1d2468baa93fc",
+      "reason": "HF dataset has no license card/README; MIT router CODE does not license benchmark DATA"
+    },
+    {
+      "source": "CodeRouterBench",
+      "reason": "existing cached evidence is not accompanied by verified exact dataset license; exclude from new training pending verification"
+    }
+  ],
+  "paidCalls": 0,
+  "sampling": "predeclared first shard for each of two OpenHands teachers plus SWE-smith tool; no outcome-dependent sampling"
+}

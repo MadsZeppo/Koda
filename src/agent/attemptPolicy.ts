@@ -29,6 +29,8 @@ export interface AttemptLimitPolicyInput {
   fingerprint: TaskFingerprint;
   effort: string;
   promptBytes: number;
+  /** Native worker enforces each call and compacts/retrieves context progressively. */
+  progressiveCompaction?: boolean;
   maxIterations: number;
   maxOutputTokens: number;
   learnedP90Tokens?: number;
@@ -362,9 +364,10 @@ export function attemptLimitPolicy(
       ? trajectoryOutputTokens
       : perTurnOutput;
 
-  const minimumViableTokens =
-    peakProviderPromptTokens +
-    peakProviderOutputTokens;
+  // Admission only requires a bounded next request. The trajectory and peak
+  // forecasts still size the attempt; runtime compaction/context checks own
+  // later requests rather than rejecting them speculatively before dispatch.
+  const minimumViableTokens = (input.progressiveCompaction ? promptTokens : peakProviderPromptTokens) + peakProviderOutputTokens;
 
   const desiredTrajectoryTokens =
     trajectoryPromptTokens +
@@ -403,10 +406,11 @@ export function attemptLimitPolicy(
     input.completionPricePerMillion === undefined
       ? undefined
       : (
-          trajectoryPromptTokens *
-            input.promptPricePerMillion +
-          trajectoryOutputTokens *
-            input.completionPricePerMillion
+          // Progressive execution may compact history and return between
+          // calls. A forecast for all viableCalls is not a dispatch minimum.
+          // The worker independently bounds each request and cumulative cost.
+          (input.progressiveCompaction ? promptTokens : trajectoryPromptTokens) * input.promptPricePerMillion +
+          (input.progressiveCompaction ? peakProviderOutputTokens : trajectoryOutputTokens) * input.completionPricePerMillion
         ) /
         1e6;
 
@@ -459,7 +463,9 @@ export function attemptLimitPolicy(
     Math.min(
       input.configuredTimeoutMs,
       input.remainingMs,
-      45_000,
+      // A progressive multi-file session is not a one-request editor.
+      // Retain the configured/run deadline; per-request timeouts stay separate.
+      complex && !input.boundedDiscovery && !directEdit ? Infinity : 45_000,
       predictedDirectDeadline,
     );
 

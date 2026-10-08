@@ -1,23 +1,53 @@
 export const ROUTING_KNOWLEDGE_VERSION = 2 as const;
 
-export type ExternalEvidenceType = "paired_task_model" | "agentic_economics" |
-  "benchmark_prior" | "task_distribution" | "trajectory_process" |
-  "catalog_metadata" | "market_adoption_signal";
+export type ExternalEvidenceType =
+  | "paired_task_model"
+  | "agentic_economics"
+  | "benchmark_prior"
+  | "task_distribution"
+  | "trajectory_process"
+  | "catalog_metadata"
+  | "market_adoption_signal";
 export type ModelIdentityLevel = "EXACT" | "FAMILY_TRANSFER" | "UNKNOWN";
-export type RoutingEvidenceCategory = "agentic_swe" | "terminal_tool" |
-  "coding_reasoning" | "efficiency" | "provider_capability" |
-  "task_distribution" | "market_signal";
-export type RoutingMetric = "result_at_1" | "pass_at_5" | "success_rate" |
-  "cost_per_task_usd" | "historical_cost_usd" | "current_repriced_cost_usd" |
-  "input_tokens" | "output_tokens" | "total_tokens" | "total_tokens_p75" |
-  "total_tokens_p90" | "total_tokens_p99" | "turns" | "cached_token_ratio" |
-  "completion_latency_p50_ms" | "completion_latency_p90_ms" |
-  "completion_latency_p99_ms" |
-  "task_count" | "market_share";
+export type RoutingEvidenceCategory =
+  | "agentic_swe"
+  | "terminal_tool"
+  | "coding_reasoning"
+  | "efficiency"
+  | "provider_capability"
+  | "task_distribution"
+  | "market_signal";
+export type RoutingMetric =
+  | "result_at_1"
+  | "pass_at_5"
+  | "success_rate"
+  | "cost_per_task_usd"
+  | "historical_cost_usd"
+  | "current_repriced_cost_usd"
+  | "input_tokens"
+  | "output_tokens"
+  | "total_tokens"
+  | "total_tokens_p75"
+  | "total_tokens_p90"
+  | "total_tokens_p99"
+  | "turns"
+  | "cached_token_ratio"
+  | "completion_latency_p50_ms"
+  | "completion_latency_p90_ms"
+  | "completion_latency_p99_ms"
+  | "task_count"
+  | "market_share";
 export type RoutingExecutionEngine = "aider" | "direct-edit" | "unknown";
-export type ProviderCapabilityMetric = "tools_supported" | "tool_choice_supported" |
-  "structured_output_supported" | "context_tokens" | "input_price_per_million" |
-  "output_price_per_million" | "availability" | "text_modality" | "vision_modality";
+export type ProviderCapabilityMetric =
+  | "tools_supported"
+  | "tool_choice_supported"
+  | "structured_output_supported"
+  | "context_tokens"
+  | "input_price_per_million"
+  | "output_price_per_million"
+  | "availability"
+  | "text_modality"
+  | "vision_modality";
 
 export interface RoutingKnowledgeObservation {
   id: string;
@@ -74,8 +104,11 @@ export interface RoutingTaskCase {
   engine?: RoutingExecutionEngine;
   evidenceQuality?: number;
   contaminationConfidence?: number;
-  outcomes: Array<{ modelId: string; success: boolean;
-    identityLevel: "EXACT" | "FAMILY_TRANSFER" }>;
+  outcomes: Array<{
+    modelId: string;
+    success: boolean;
+    identityLevel: "EXACT" | "FAMILY_TRANSFER";
+  }>;
 }
 export interface RoutingKnowledgeSource {
   id: string;
@@ -109,6 +142,8 @@ export interface RoutingKnowledgeSnapshot {
   taskCases?: RoutingTaskCase[];
   validation?: RoutingPolicyValidation;
   sources?: RoutingKnowledgeSource[];
+  /** Lossless, policy-gated supervision for the contextual shadow router. */
+  qualityEvidence?: import("./canonical.js").CanonicalQualityObservation[];
 }
 export interface ModelRoutingKnowledge {
   snapshotId: string;

@@ -1,7 +1,8 @@
 import { posix } from "node:path";
 
 import type { RepoProfile } from "../types.js";
-import { isSourcePath, isTestPath, taskTerms } from "../context/compiler.js";
+import { isRunnableTestPath, isSourcePath, isTestPath, taskTerms } from "../context/compiler.js";
+import { discoveredTestGlobs, matchesDiscoveredTestGlob } from "../verifier/selection.js";
 
 export interface ExecutionStrategy {
   execution_strategy: "direct" | "stable" | "planned";
@@ -51,6 +52,14 @@ export function explicitTaskPaths(task: string, profile: RepoProfile): string[] 
   const pattern = /(?:^|[^A-Za-z0-9_./-])((?:\.\/)?(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+|[A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+)(?=$|[^A-Za-z0-9_/-])/g;
   for (const match of task.matchAll(pattern)) {
     const value = match[1]!.replace(/^\.\//, "").replace(/[.,;:!?]+$/, "");
+    const start = task.indexOf(match[1]!, match.index);
+    const fileIntent = /(?:create|add|modify|edit|update|delete|remove|file(?:\s+named)?|path)\s+(?:(?:a|the)\s+)?$/i
+      .test(task.slice(Math.max(0, start - 80), start));
+    // Dotted prose abbreviations are not new file targets. Existing paths and
+    // explicitly named/quoted new files still take precedence over this shape.
+    if (/^(?:[A-Za-z]\.){2,}$/.test(match[1]!) &&
+        !profile.files.includes(value) && !fileIntent &&
+        !/[`'"]/.test(task[start - 1] ?? "")) continue;
     const parts = value.split("/");
     const basename = parts.at(-1) ?? "";
     if (
@@ -369,7 +378,22 @@ export function chooseExecutionStrategy(
 export function requestsTestMutation(task: string): boolean {
   return /\b(?:add|write|create|update|change|modify|fix|repair|remove|delete)\s+(?:(?:a|an|one|the|new|existing|focused|regression|deterministic|missing|unit|integration|failing|broken)\s+){0,8}tests?\b/i.test(task) ||
     /\b(?:add|implement|create)\b[^\n]{0,160}\bwith\s+(?:focused|regression)\s+tests?\b/i.test(task) ||
-    /\btests?\b[^.;\n]{0,80}\b(?:is|are)\s+(?:wrong|broken|incorrect)\b/i.test(task);
+    /\btests?\b[^.;\n]{0,80}\b(?:is|are)\s+(?:wrong|broken|incorrect)\b/i.test(task) ||
+    /\b(?:tilføj|opret|skriv|lav|implement[eé]r|opdat[eé]r|ret)\s+(?:(?:relevante|fokuserede|målrettede|nye|eksisterende|regressions|unit|integration)\s+){0,5}tests?\b/i.test(task);
+}
+
+const restrictedWriteTask = (task: string) =>
+  /\b(?:only|exclusively)\s+(?:modify|edit|change|write|touch)\b|\b(?:modify|edit|change|write|touch)\s+only\b|\b(?:do not|don.t|never)\s+(?:modify|edit|change|write|touch)\s+(?:(?:the|any|existing|current|new)\s+)?(?:tests?|specs?)\b|\bkun\s+(?:ændr|rediger|skriv|rør)\b|\b(?:ændr|rediger|skriv|rør)\s+kun\b|\b(?:ændr|rediger|skriv|rør)\s+ikke\s+(?:de\s+|eksisterende\s+)?tests?\b/i.test(task);
+
+function newTestTarget(source: string, glob: string) {
+  const suffix = glob.match(/(\.(?:test|spec)\.[cm]?[jt]sx?)$/i)?.[1];
+  if (!suffix) return undefined;
+  const stem = source.replace(/\.[^.]+$/, "").replace(/^(?:src|app|lib)\//, "")
+    .replaceAll("/", "-");
+  const globDir = posix.dirname(glob);
+  if (!stem || globDir.includes("*")) return undefined;
+  const target = posix.join(globDir, `${stem}${suffix}`);
+  return matchesDiscoveredTestGlob(target, [glob]) ? target : undefined;
 }
 
 export function directWritePaths(
@@ -380,6 +404,7 @@ export function directWritePaths(
   // A matching regression test is verification context, not write permission.
   // Explicit requests to change tests retain a coupled implementation scope.
   const changeTests = requestsTestMutation(task);
+  const inferTests = changeTests && !restrictedWriteTask(task);
   const implementation = files.filter((file) => !isTestPath(file));
   const stems = implementation.map((f) =>
     posix
@@ -388,13 +413,33 @@ export function directWritePaths(
       .toLowerCase(),
   );
 
+  const existingTestTargets = profile.files.filter((f) =>
+    inferTests && isRunnableTestPath(f) &&
+    stems.some((stem) => posix.basename(f).toLowerCase().split(/[._-]/).includes(stem)));
+  const explicitTestTargets = files.filter(isRunnableTestPath);
+  const testGlobs = discoveredTestGlobs(profile.scripts?.test ?? "");
+  // A newly requested endpoint/file is normally the implementation target;
+  // surrounding existing files are localization context, not the test name.
+  const source = implementation.find((path) => isSourcePath(path) && !profile.files.includes(path)) ??
+    implementation.find(isSourcePath);
+  const inferredTest = inferTests && source &&
+    !existingTestTargets.length && !explicitTestTargets.length && testGlobs.length === 1
+    ? newTestTarget(source, testGlobs[0]!) : undefined;
+  const newRunnerNeeded = inferTests && source &&
+    !existingTestTargets.length && !explicitTestTargets.length && !testGlobs.length &&
+    !profile.files.some(isRunnableTestPath) && !profile.scripts?.test &&
+    !profile.ecosystem?.monorepo && profile.files.includes("package.json");
+  const standaloneTest = newRunnerNeeded
+    ? newTestTarget(source!, `tests/*.test.${source!.endsWith(".ts") || source!.endsWith(".tsx") ? "ts" : "js"}`)
+    : undefined;
+
   return [
     ...new Set([
       ...implementation,
       ...profile.files.filter(
         (f) =>
-          changeTests &&
-          isTestPath(f) &&
+          inferTests &&
+          isRunnableTestPath(f) &&
           (/(?:^|[._-])(?:test|spec)(?:[._-]|$)/i.test(posix.basename(f)) ||
             /(?:^|\/)test_[^/]+\.py$/i.test(f) ||
             /_test\.go$/i.test(f)) &&
@@ -402,7 +447,9 @@ export function directWritePaths(
             posix.basename(f).toLowerCase().split(/[._-]/).includes(stem),
           ),
       ),
-      ...(changeTests ? files.filter(isTestPath) : []),
+      ...(changeTests ? files.filter(isRunnableTestPath) : []),
+      ...(inferredTest ? [inferredTest] : []),
+      ...(standaloneTest ? ["package.json", standaloneTest] : []),
     ]),
   ];
 }

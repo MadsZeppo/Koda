@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { poolSchema, routingSchema } from "./router/pool.js";
 import { z } from "zod";
 import { registry } from "./router/modelRegistry.js";
+import { providerTransport } from './provider/transport.js';
 const schema = z.object({
   maxParallel: z.number().int().min(1).max(8).default(3),
   budgetUsd: z.number().positive().default(5),
@@ -145,6 +146,7 @@ export async function config(
       Object.entries(overrides).filter(([, v]) => v !== undefined),
     ),
   });
+  c.baseUrl = providerTransport(c.baseUrl, c.modelPool?.provider).baseUrl;
   if (c.forceModel && !c.modelPool?.models.some((m) => m.id === c.forceModel))
     throw Error("forceModel must name a configured pool candidate");
   return { ...c, registry: registry(c.models) };

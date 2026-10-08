@@ -1,0 +1,785 @@
+{
+  "start_public_heldout": {
+    "claude-3-5-sonnet-20241022": {
+      "split": {
+        "test": {
+          "n": 55,
+          "brier": 0.20063481371239314,
+          "auroc": 0.7375730994152047,
+          "balanced_accuracy": 0.4707602339181286
+        },
+        "constant_train_prior": {
+          "n": 55,
+          "brier": 0.2304773513683549,
+          "auroc": 0.5,
+          "balanced_accuracy": 0.5
+        },
+        "train": 340,
+        "validation": 103,
+        "calibrated_on_validation": true
+      },
+      "repo_split": {
+        "test": {
+          "n": 34,
+          "brier": 0.17802248967452636,
+          "auroc": 0.8605769230769231,
+          "balanced_accuracy": 0.5
+        },
+        "constant_train_prior": {
+          "n": 34,
+          "brier": 0.18723430988628986,
+          "auroc": 0.5,
+          "balanced_accuracy": 0.5
+        },
+        "train": 424,
+        "validation": 40,
+        "calibrated_on_validation": true
+      }
+    },
+    "claude-3-7-sonnet-20250219": {
+      "split": {
+        "test": {
+          "n": 231,
+          "brier": 0.21255930876247026,
+          "auroc": 0.7183525136281042,
+          "balanced_accuracy": 0.6624772864930345
+        },
+        "constant_train_prior": {
+          "n": 231,
+          "brier": 0.24781657378538288,
+          "auroc": 0.5,
+          "balanced_accuracy": 0.5
+        },
+        "train": 1656,
+        "validation": 461,
+        "calibrated_on_validation": true
+      },
+      "repo_split": {
+        "test": {
+          "n": 256,
+          "brier": 0.23336000060920722,
+          "auroc": 0.6508228936379268,
+          "balanced_accuracy": 0.6041513141734218
+        },
+        "constant_train_prior": {
+          "n": 256,
+          "brier": 0.2548358065170362,
+          "auroc": 0.5,
+          "balanced_accuracy": 0.5
+        },
+        "train": 1720,
+        "validation": 372,
+        "calibrated_on_validation": true
+      }
+    },
+    "minimax-m2.5": {
+      "split": {
+        "test": {
+          "n": 185,
+          "brier": 0.25242410153342604,
+          "auroc": 0.5335051546391754,
+          "balanced_accuracy": 0.4933809746954077
+        },
+        "constant_train_prior": {
+          "n": 185,
+          "brier": 0.2509256576221171,
+          "auroc": 0.5,
+          "balanced_accuracy": 0.5
+        },
+        "train": 1367,
+        "validation": 403,
+        "calibrated_on_validation": true
+      },
+      "repo_split": {
+        "test": {
+          "n": 157,
+          "brier": 0.2550825514384519,
+          "auroc": 0.38905228758169935,
+          "balanced_accuracy": 0.5
+        },
+        "constant_train_prior": {
+          "n": 157,
+          "brier": 0.2486731688926212,
+          "auroc": 0.5,
+          "balanced_accuracy": 0.5
+        },
+        "train": 1408,
+        "validation": 390,
+        "calibrated_on_validation": true
+      }
+    },
+    "qwen3.5-122b-a10b": {
+      "split": {
+        "test": {
+          "n": 181,
+          "brier": 0.21129870313227658,
+          "auroc": 0.6209700028034763,
+          "balanced_accuracy": 0.491869918699187
+        },
+        "constant_train_prior": {
+          "n": 181,
+          "brier": 0.2177656853980425,
+          "auroc": 0.5,
+          "balanced_accuracy": 0.5
+        },
+        "train": 1334,
+        "validation": 394,
+        "calibrated_on_validation": true
+      },
+      "repo_split": {
+        "test": {
+          "n": 153,
+          "brier": 0.17234669075113979,
+          "auroc": 0.6990553306342779,
+          "balanced_accuracy": 0.5
+        },
+        "constant_train_prior": {
+          "n": 153,
+          "brier": 0.1960401290525377,
+          "auroc": 0.5,
+          "balanced_accuracy": 0.5
+        },
+        "train": 1363,
+        "validation": 393,
+        "calibrated_on_validation": true
+      }
+    }
+  },
+  "paired_heldout_ranking": {
+    "discordant_pairs": 7,
+    "accuracy": 0.8571428571428571
+  },
+  "paired_tasks": 247,
+  "agent_public_heldout": {
+    "next_progress": {
+      "split": {
+        "test": {
+          "n": 539,
+          "brier": 0.1838083194416029,
+          "auroc": 0.6449280575539569,
+          "balanced_accuracy": 0.5035971223021583
+        },
+        "constant_train_prior": {
+          "n": 539,
+          "brier": 0.19141963630003042,
+          "auroc": 0.5,
+          "balanced_accuracy": 0.5
+        },
+        "train": 3903,
+        "validation": 1135,
+        "calibrated_on_validation": true
+      },
+      "repo_split": {
+        "test": {
+          "n": 493,
+          "brier": 0.18508209335023765,
+          "auroc": 0.6020521898767375,
+          "balanced_accuracy": 0.5013222309642451
+        },
+        "constant_train_prior": {
+          "n": 493,
+          "brier": 0.1884073418674752,
+          "auroc": 0.5,
+          "balanced_accuracy": 0.5
+        },
+        "train": 4061,
+        "validation": 1023,
+        "calibrated_on_validation": true
+      }
+    },
+    "next_stuck": {
+      "split": {
+        "test": {
+          "n": 539,
+          "brier": 0.1097128887693057,
+          "auroc": 0.8651968826907301,
+          "balanced_accuracy": 0.6862899917965546
+        },
+        "constant_train_prior": {
+          "n": 539,
+          "brier": 0.16788690615709337,
+          "auroc": 0.5,
+          "balanced_accuracy": 0.5
+        },
+        "train": 3903,
+        "validation": 1135,
+        "calibrated_on_validation": true
+      },
+      "repo_split": {
+        "test": {
+          "n": 493,
+          "brier": 0.1350554687804582,
+          "auroc": 0.8358635007136369,
+          "balanced_accuracy": 0.6326067211625794
+        },
+        "constant_train_prior": {
+          "n": 493,
+          "brier": 0.19270533344097243,
+          "auroc": 0.5,
+          "balanced_accuracy": 0.5
+        },
+        "train": 4061,
+        "validation": 1023,
+        "calibrated_on_validation": true
+      }
+    }
+  },
+  "agent_prediction_target": "next tool-result observable progress/stuck proxy, one seeded prefix per deduplicated task; not success or intervention effect",
+  "agent_escalation_discrimination": null,
+  "agent_required_capability": null,
+  "frozen100": {
+    "abstain": 100,
+    "selected": 0,
+    "solve_rate": null,
+    "cost_per_solve": null,
+    "reason": "zero exact model overlap; cross-version transfer and prices unknown; no licensed paired training for V6.2 models"
+  },
+  "old_frozen_results": {
+    "policies": {
+      "Strongest static (TRAIN-selected)": {
+        "solveRate": 0.33,
+        "frontierRetained": 1.0,
+        "costPerSolved": 0.24902109090909091,
+        "saving": 0.0,
+        "harmfulDowngrade": 0.0,
+        "totalCost": 8.217696,
+        "distribution": {
+          "gpt-5": 0,
+          "gpt-5-chat": 0,
+          "claude-sonnet-4": 100,
+          "gemini-2.5-pro": 0,
+          "gemini-2.5-flash": 0,
+          "qwen3-235b-a22b-2507": 0,
+          "qwen3-235b-a22b-thinking-2507": 0,
+          "deepseek-v3.1-terminus": 0,
+          "deepseek-r1-0528": 0,
+          "deepseek-v3-0324": 0,
+          "kimi-k2-0905": 0,
+          "glm-4.6": 0
+        },
+        "cheapStartRate": 0.0,
+        "verifiedKodaSolveRate": null,
+        "routerAPIcost": 0,
+        "localRouterAndVerifierDollarCost": null
+      },
+      "V3": {
+        "solveRate": 0.24,
+        "frontierRetained": 0.7272727272727272,
+        "costPerSolved": 0.19761631833333335,
+        "saving": 0.20642738487770773,
+        "harmfulDowngrade": 0.09,
+        "totalCost": 4.74279164,
+        "distribution": {
+          "gpt-5": 3,
+          "gpt-5-chat": 0,
+          "claude-sonnet-4": 49,
+          "gemini-2.5-pro": 0,
+          "gemini-2.5-flash": 1,
+          "qwen3-235b-a22b-2507": 2,
+          "qwen3-235b-a22b-thinking-2507": 0,
+          "deepseek-v3.1-terminus": 19,
+          "deepseek-r1-0528": 0,
+          "deepseek-v3-0324": 0,
+          "kimi-k2-0905": 0,
+          "glm-4.6": 26
+        },
+        "cheapStartRate": 0.5,
+        "verifiedKodaSolveRate": null,
+        "routerAPIcost": 0,
+        "localRouterAndVerifierDollarCost": null
+      },
+      "Old V6": {
+        "solveRate": 0.33,
+        "frontierRetained": 1.0,
+        "costPerSolved": 0.24902109090909091,
+        "saving": 0.0,
+        "harmfulDowngrade": 0.0,
+        "totalCost": 8.217696,
+        "distribution": {
+          "gpt-5": 0,
+          "gpt-5-chat": 0,
+          "claude-sonnet-4": 100,
+          "gemini-2.5-pro": 0,
+          "gemini-2.5-flash": 0,
+          "qwen3-235b-a22b-2507": 0,
+          "qwen3-235b-a22b-thinking-2507": 0,
+          "deepseek-v3.1-terminus": 0,
+          "deepseek-r1-0528": 0,
+          "deepseek-v3-0324": 0,
+          "kimi-k2-0905": 0,
+          "glm-4.6": 0
+        },
+        "cheapStartRate": 0.0,
+        "verifiedKodaSolveRate": null,
+        "routerAPIcost": 0,
+        "localRouterAndVerifierDollarCost": null
+      },
+      "Pareto 1pp": {
+        "solveRate": 0.28,
+        "frontierRetained": 0.8484848484848485,
+        "costPerSolved": 0.3223261121428571,
+        "saving": -0.29437274154632687,
+        "harmfulDowngrade": 0.12,
+        "totalCost": 9.02513114,
+        "distribution": {
+          "gpt-5": 1,
+          "gpt-5-chat": 0,
+          "claude-sonnet-4": 45,
+          "gemini-2.5-pro": 29,
+          "gemini-2.5-flash": 0,
+          "qwen3-235b-a22b-2507": 0,
+          "qwen3-235b-a22b-thinking-2507": 0,
+          "deepseek-v3.1-terminus": 3,
+          "deepseek-r1-0528": 12,
+          "deepseek-v3-0324": 6,
+          "kimi-k2-0905": 4,
+          "glm-4.6": 0
+        },
+        "cheapStartRate": 0.3,
+        "verifiedKodaSolveRate": null,
+        "routerAPIcost": 0,
+        "localRouterAndVerifierDollarCost": null,
+        "forecastCheapStartRate": 0.26
+      },
+      "Pareto 2pp": {
+        "solveRate": 0.27,
+        "frontierRetained": 0.8181818181818182,
+        "costPerSolved": 0.31136144555555556,
+        "saving": -0.25034166551468107,
+        "harmfulDowngrade": 0.13,
+        "totalCost": 8.40675903,
+        "distribution": {
+          "gpt-5": 1,
+          "gpt-5-chat": 0,
+          "claude-sonnet-4": 50,
+          "gemini-2.5-pro": 22,
+          "gemini-2.5-flash": 0,
+          "qwen3-235b-a22b-2507": 0,
+          "qwen3-235b-a22b-thinking-2507": 0,
+          "deepseek-v3.1-terminus": 4,
+          "deepseek-r1-0528": 11,
+          "deepseek-v3-0324": 6,
+          "kimi-k2-0905": 6,
+          "glm-4.6": 0
+        },
+        "cheapStartRate": 0.32,
+        "verifiedKodaSolveRate": null,
+        "routerAPIcost": 0,
+        "localRouterAndVerifierDollarCost": null,
+        "forecastCheapStartRate": 0.28
+      },
+      "Pareto 3pp": {
+        "solveRate": 0.3,
+        "frontierRetained": 0.9090909090909091,
+        "costPerSolved": 0.2610435973333333,
+        "saving": -0.04827906897505074,
+        "harmfulDowngrade": 0.1,
+        "totalCost": 7.8313079199999995,
+        "distribution": {
+          "gpt-5": 1,
+          "gpt-5-chat": 0,
+          "claude-sonnet-4": 50,
+          "gemini-2.5-pro": 17,
+          "gemini-2.5-flash": 0,
+          "qwen3-235b-a22b-2507": 0,
+          "qwen3-235b-a22b-thinking-2507": 0,
+          "deepseek-v3.1-terminus": 4,
+          "deepseek-r1-0528": 13,
+          "deepseek-v3-0324": 8,
+          "kimi-k2-0905": 6,
+          "glm-4.6": 1
+        },
+        "cheapStartRate": 0.35,
+        "verifiedKodaSolveRate": null,
+        "routerAPIcost": 0,
+        "localRouterAndVerifierDollarCost": null,
+        "forecastCheapStartRate": 0.33
+      },
+      "Oracle new pool": {
+        "solveRate": 0.63,
+        "frontierRetained": 1.909090909090909,
+        "costPerSolved": 0.022888583650793652,
+        "saving": 0.9080857626667875,
+        "harmfulDowngrade": 0.0,
+        "totalCost": 1.44198077,
+        "distribution": {
+          "gpt-5": 2,
+          "gpt-5-chat": 0,
+          "claude-sonnet-4": 3,
+          "gemini-2.5-pro": 5,
+          "gemini-2.5-flash": 2,
+          "qwen3-235b-a22b-2507": 36,
+          "qwen3-235b-a22b-thinking-2507": 13,
+          "deepseek-v3.1-terminus": 15,
+          "deepseek-r1-0528": 6,
+          "deepseek-v3-0324": 11,
+          "kimi-k2-0905": 6,
+          "glm-4.6": 1
+        },
+        "cheapStartRate": 0.92,
+        "verifiedKodaSolveRate": null,
+        "routerAPIcost": 0,
+        "localRouterAndVerifierDollarCost": null
+      }
+    },
+    "effectivePool": [
+      "gpt-5",
+      "gpt-5-chat",
+      "claude-sonnet-4",
+      "gemini-2.5-pro",
+      "gemini-2.5-flash",
+      "qwen3-235b-a22b-2507",
+      "qwen3-235b-a22b-thinking-2507",
+      "deepseek-v3.1-terminus",
+      "deepseek-r1-0528",
+      "deepseek-v3-0324",
+      "kimi-k2-0905",
+      "glm-4.6"
+    ],
+    "excluded": {},
+    "reference": "claude-sonnet-4",
+    "strongestStaticExPost": "claude-sonnet-4",
+    "perModel": {
+      "gpt-5": {
+        "solveRate": 0.14,
+        "frontierRetained": 0.42424242424242425,
+        "costPerSolved": 0.36226125000000003,
+        "saving": -0.4547412376899804,
+        "harmfulDowngrade": 0.22,
+        "totalCost": 5.071657500000001,
+        "distribution": {
+          "gpt-5": 100,
+          "gpt-5-chat": 0,
+          "claude-sonnet-4": 0,
+          "gemini-2.5-pro": 0,
+          "gemini-2.5-flash": 0,
+          "qwen3-235b-a22b-2507": 0,
+          "qwen3-235b-a22b-thinking-2507": 0,
+          "deepseek-v3.1-terminus": 0,
+          "deepseek-r1-0528": 0,
+          "deepseek-v3-0324": 0,
+          "kimi-k2-0905": 0,
+          "glm-4.6": 0
+        },
+        "cheapStartRate": 0.79,
+        "verifiedKodaSolveRate": null,
+        "routerAPIcost": 0,
+        "localRouterAndVerifierDollarCost": null
+      },
+      "gpt-5-chat": {
+        "solveRate": 0.03,
+        "frontierRetained": 0.0909090909090909,
+        "costPerSolved": 0.8963312499999999,
+        "saving": -2.5994190159869626,
+        "harmfulDowngrade": 0.31,
+        "totalCost": 2.68899375,
+        "distribution": {
+          "gpt-5": 0,
+          "gpt-5-chat": 100,
+          "claude-sonnet-4": 0,
+          "gemini-2.5-pro": 0,
+          "gemini-2.5-flash": 0,
+          "qwen3-235b-a22b-2507": 0,
+          "qwen3-235b-a22b-thinking-2507": 0,
+          "deepseek-v3.1-terminus": 0,
+          "deepseek-r1-0528": 0,
+          "deepseek-v3-0324": 0,
+          "kimi-k2-0905": 0,
+          "glm-4.6": 0
+        },
+        "cheapStartRate": 1.0,
+        "verifiedKodaSolveRate": null,
+        "routerAPIcost": 0,
+        "localRouterAndVerifierDollarCost": null
+      },
+      "claude-sonnet-4": {
+        "solveRate": 0.33,
+        "frontierRetained": 1.0,
+        "costPerSolved": 0.24902109090909091,
+        "saving": 0.0,
+        "harmfulDowngrade": 0.0,
+        "totalCost": 8.217696,
+        "distribution": {
+          "gpt-5": 0,
+          "gpt-5-chat": 0,
+          "claude-sonnet-4": 100,
+          "gemini-2.5-pro": 0,
+          "gemini-2.5-flash": 0,
+          "qwen3-235b-a22b-2507": 0,
+          "qwen3-235b-a22b-thinking-2507": 0,
+          "deepseek-v3.1-terminus": 0,
+          "deepseek-r1-0528": 0,
+          "deepseek-v3-0324": 0,
+          "kimi-k2-0905": 0,
+          "glm-4.6": 0
+        },
+        "cheapStartRate": 0.0,
+        "verifiedKodaSolveRate": null,
+        "routerAPIcost": 0,
+        "localRouterAndVerifierDollarCost": null
+      },
+      "gemini-2.5-pro": {
+        "solveRate": 0.33,
+        "frontierRetained": 1.0,
+        "costPerSolved": 0.48513045454545456,
+        "saving": -0.9481500654197965,
+        "harmfulDowngrade": 0.09,
+        "totalCost": 16.009305,
+        "distribution": {
+          "gpt-5": 0,
+          "gpt-5-chat": 0,
+          "claude-sonnet-4": 0,
+          "gemini-2.5-pro": 100,
+          "gemini-2.5-flash": 0,
+          "qwen3-235b-a22b-2507": 0,
+          "qwen3-235b-a22b-thinking-2507": 0,
+          "deepseek-v3.1-terminus": 0,
+          "deepseek-r1-0528": 0,
+          "deepseek-v3-0324": 0,
+          "kimi-k2-0905": 0,
+          "glm-4.6": 0
+        },
+        "cheapStartRate": 0.1,
+        "verifiedKodaSolveRate": null,
+        "routerAPIcost": 0,
+        "localRouterAndVerifierDollarCost": null
+      },
+      "gemini-2.5-flash": {
+        "solveRate": 0.18,
+        "frontierRetained": 0.5454545454545454,
+        "costPerSolved": 0.04659619444444443,
+        "saving": 0.8128825382848591,
+        "harmfulDowngrade": 0.19,
+        "totalCost": 0.8387314999999999,
+        "distribution": {
+          "gpt-5": 0,
+          "gpt-5-chat": 0,
+          "claude-sonnet-4": 0,
+          "gemini-2.5-pro": 0,
+          "gemini-2.5-flash": 100,
+          "qwen3-235b-a22b-2507": 0,
+          "qwen3-235b-a22b-thinking-2507": 0,
+          "deepseek-v3.1-terminus": 0,
+          "deepseek-r1-0528": 0,
+          "deepseek-v3-0324": 0,
+          "kimi-k2-0905": 0,
+          "glm-4.6": 0
+        },
+        "cheapStartRate": 1.0,
+        "verifiedKodaSolveRate": null,
+        "routerAPIcost": 0,
+        "localRouterAndVerifierDollarCost": null
+      },
+      "qwen3-235b-a22b-2507": {
+        "solveRate": 0.11,
+        "frontierRetained": 0.3333333333333333,
+        "costPerSolved": 0.02872603727272727,
+        "saving": 0.8846441593848203,
+        "harmfulDowngrade": 0.25,
+        "totalCost": 0.31598641,
+        "distribution": {
+          "gpt-5": 0,
+          "gpt-5-chat": 0,
+          "claude-sonnet-4": 0,
+          "gemini-2.5-pro": 0,
+          "gemini-2.5-flash": 0,
+          "qwen3-235b-a22b-2507": 100,
+          "qwen3-235b-a22b-thinking-2507": 0,
+          "deepseek-v3.1-terminus": 0,
+          "deepseek-r1-0528": 0,
+          "deepseek-v3-0324": 0,
+          "kimi-k2-0905": 0,
+          "glm-4.6": 0
+        },
+        "cheapStartRate": 1.0,
+        "verifiedKodaSolveRate": null,
+        "routerAPIcost": 0,
+        "localRouterAndVerifierDollarCost": null
+      },
+      "qwen3-235b-a22b-thinking-2507": {
+        "solveRate": 0.17,
+        "frontierRetained": 0.5151515151515151,
+        "costPerSolved": 0.0979262176470588,
+        "saving": 0.6067553262674914,
+        "harmfulDowngrade": 0.19,
+        "totalCost": 1.6647456999999997,
+        "distribution": {
+          "gpt-5": 0,
+          "gpt-5-chat": 0,
+          "claude-sonnet-4": 0,
+          "gemini-2.5-pro": 0,
+          "gemini-2.5-flash": 0,
+          "qwen3-235b-a22b-2507": 0,
+          "qwen3-235b-a22b-thinking-2507": 100,
+          "deepseek-v3.1-terminus": 0,
+          "deepseek-r1-0528": 0,
+          "deepseek-v3-0324": 0,
+          "kimi-k2-0905": 0,
+          "glm-4.6": 0
+        },
+        "cheapStartRate": 0.93,
+        "verifiedKodaSolveRate": null,
+        "routerAPIcost": 0,
+        "localRouterAndVerifierDollarCost": null
+      },
+      "deepseek-v3.1-terminus": {
+        "solveRate": 0.22,
+        "frontierRetained": 0.6666666666666666,
+        "costPerSolved": 0.024247443636363643,
+        "saving": 0.9026289558533195,
+        "harmfulDowngrade": 0.18,
+        "totalCost": 0.5334437600000002,
+        "distribution": {
+          "gpt-5": 0,
+          "gpt-5-chat": 0,
+          "claude-sonnet-4": 0,
+          "gemini-2.5-pro": 0,
+          "gemini-2.5-flash": 0,
+          "qwen3-235b-a22b-2507": 0,
+          "qwen3-235b-a22b-thinking-2507": 0,
+          "deepseek-v3.1-terminus": 100,
+          "deepseek-r1-0528": 0,
+          "deepseek-v3-0324": 0,
+          "kimi-k2-0905": 0,
+          "glm-4.6": 0
+        },
+        "cheapStartRate": 1.0,
+        "verifiedKodaSolveRate": null,
+        "routerAPIcost": 0,
+        "localRouterAndVerifierDollarCost": null
+      },
+      "deepseek-r1-0528": {
+        "solveRate": 0.32,
+        "frontierRetained": 0.9696969696969697,
+        "costPerSolved": 0.06554587812499998,
+        "saving": 0.7367858365501718,
+        "harmfulDowngrade": 0.15,
+        "totalCost": 2.0974680999999995,
+        "distribution": {
+          "gpt-5": 0,
+          "gpt-5-chat": 0,
+          "claude-sonnet-4": 0,
+          "gemini-2.5-pro": 0,
+          "gemini-2.5-flash": 0,
+          "qwen3-235b-a22b-2507": 0,
+          "qwen3-235b-a22b-thinking-2507": 0,
+          "deepseek-v3.1-terminus": 0,
+          "deepseek-r1-0528": 100,
+          "deepseek-v3-0324": 0,
+          "kimi-k2-0905": 0,
+          "glm-4.6": 0
+        },
+        "cheapStartRate": 0.98,
+        "verifiedKodaSolveRate": null,
+        "routerAPIcost": 0,
+        "localRouterAndVerifierDollarCost": null
+      },
+      "deepseek-v3-0324": {
+        "solveRate": 0.22,
+        "frontierRetained": 0.6666666666666666,
+        "costPerSolved": 0.024234470454545454,
+        "saving": 0.9026810525723998,
+        "harmfulDowngrade": 0.17,
+        "totalCost": 0.53315835,
+        "distribution": {
+          "gpt-5": 0,
+          "gpt-5-chat": 0,
+          "claude-sonnet-4": 0,
+          "gemini-2.5-pro": 0,
+          "gemini-2.5-flash": 0,
+          "qwen3-235b-a22b-2507": 0,
+          "qwen3-235b-a22b-thinking-2507": 0,
+          "deepseek-v3.1-terminus": 0,
+          "deepseek-r1-0528": 0,
+          "deepseek-v3-0324": 100,
+          "kimi-k2-0905": 0,
+          "glm-4.6": 0
+        },
+        "cheapStartRate": 1.0,
+        "verifiedKodaSolveRate": null,
+        "routerAPIcost": 0,
+        "localRouterAndVerifierDollarCost": null
+      },
+      "kimi-k2-0905": {
+        "solveRate": 0.17,
+        "frontierRetained": 0.5151515151515151,
+        "costPerSolved": 0.06574302941176473,
+        "saving": 0.7359941313735339,
+        "harmfulDowngrade": 0.2,
+        "totalCost": 1.1176315000000003,
+        "distribution": {
+          "gpt-5": 0,
+          "gpt-5-chat": 0,
+          "claude-sonnet-4": 0,
+          "gemini-2.5-pro": 0,
+          "gemini-2.5-flash": 0,
+          "qwen3-235b-a22b-2507": 0,
+          "qwen3-235b-a22b-thinking-2507": 0,
+          "deepseek-v3.1-terminus": 0,
+          "deepseek-r1-0528": 0,
+          "deepseek-v3-0324": 0,
+          "kimi-k2-0905": 100,
+          "glm-4.6": 0
+        },
+        "cheapStartRate": 1.0,
+        "verifiedKodaSolveRate": null,
+        "routerAPIcost": 0,
+        "localRouterAndVerifierDollarCost": null
+      },
+      "glm-4.6": {
+        "solveRate": 0.21,
+        "frontierRetained": 0.6363636363636364,
+        "costPerSolved": 0.05657138571428571,
+        "saving": 0.7728249221471044,
+        "harmfulDowngrade": 0.16,
+        "totalCost": 1.1879990999999999,
+        "distribution": {
+          "gpt-5": 0,
+          "gpt-5-chat": 0,
+          "claude-sonnet-4": 0,
+          "gemini-2.5-pro": 0,
+          "gemini-2.5-flash": 0,
+          "qwen3-235b-a22b-2507": 0,
+          "qwen3-235b-a22b-thinking-2507": 0,
+          "deepseek-v3.1-terminus": 0,
+          "deepseek-r1-0528": 0,
+          "deepseek-v3-0324": 0,
+          "kimi-k2-0905": 0,
+          "glm-4.6": 100
+        },
+        "cheapStartRate": 1.0,
+        "verifiedKodaSolveRate": null,
+        "routerAPIcost": 0,
+        "localRouterAndVerifierDollarCost": null
+      }
+    },
+    "oldPoolOracleSolveRate": 0.45,
+    "broaderPoolHeadroomImproved": true,
+    "safeCheapRoutingDemonstrated": false,
+    "stop": true,
+    "reason": "STOP: no acceptable retained-quality cost saving; no production promotion",
+    "routingSelectionMeanMs": 0.010748759999999748,
+    "fitAndPredictMs": 30.07412515580654,
+    "distanceToOracle": {
+      "Pareto 1pp": {
+        "solveGap": 0.35,
+        "costPerSolveRatio": 14.08239658078103
+      },
+      "Pareto 2pp": {
+        "solveGap": 0.36,
+        "costPerSolveRatio": 13.603351360920021
+      },
+      "Pareto 3pp": {
+        "solveGap": 0.33,
+        "costPerSolveRatio": 11.404969451846434
+      }
+    },
+    "paidCalls": 0,
+    "dynamicPerformance": "NOT EVALUATED",
+    "trainingTasks": 300,
+    "evaluationTasks": 100,
+    "finalSetPreviouslyObserved": true
+  },
+  "paid_calls": 0,
+  "live_pilot_recommended": false
+}

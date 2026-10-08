@@ -1,14 +1,16 @@
 import { scopedCommand, type WriteScope } from "./writeScope.js";
 import { execa } from "execa";
-import { realpath, mkdtemp, rm, mkdir, lstat, symlink, readFile, readdir, access } from "node:fs/promises";
+import { realpath, mkdtemp, rm, mkdir, lstat, readFile, readdir, access } from "node:fs/promises";
 import { join, dirname, relative, isAbsolute, posix, resolve, delimiter } from "node:path";
 import { createConnection, createServer } from "node:net";
 import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { tmpdir } from "node:os";
+import { sandboxNetworkPolicy, startSandboxNetworkProxy } from "./network.js";
 import type { CommandResult } from "../types.js";
 import {
   dependenciesForWorkspace,
+  materializeDependencyTree,
   nodeEnvironmentForWorkspace,
   pythonEnvironmentForWorkspace,
   type DependencyBridge,
@@ -245,6 +247,7 @@ async function brokeredCommand(
           additionalReadRoots,
           additionalEnvironment: {
             OPENROUTER_API_KEY: additionalEnvironment.OPENROUTER_API_KEY,
+            KODA_PROVIDER_API_KEY: additionalEnvironment.KODA_PROVIDER_API_KEY,
           },
         }) + "\n",
       ),
@@ -270,6 +273,7 @@ async function sandboxBroker(
   roots: string[],
   allowedBridges: DependencyBridge[],
   deadline: number,
+  allowDependencyBootstrap = false,
 ) {
   const server = createServer((client) => {
     client.setEncoding("utf8");
@@ -284,6 +288,8 @@ async function sandboxBroker(
         const message = JSON.parse(request);
         if (message.token !== token)
           throw Error("Invalid sandbox broker token");
+        if (message.dependencyBootstrap && !allowDependencyBootstrap)
+          throw Error("Sandbox broker cannot expand the parent's network permissions");
         const cwd = await realpath(message.cwd);
         if (!roots.some((root) => within(root, cwd)))
           throw Error(
@@ -394,6 +400,8 @@ async function sandboxBroker(
         const additionalEnvironment: NodeJS.ProcessEnv =
           typeof message.additionalEnvironment?.OPENROUTER_API_KEY === "string"
             ? { OPENROUTER_API_KEY: message.additionalEnvironment.OPENROUTER_API_KEY } : {};
+        if (typeof message.additionalEnvironment?.KODA_PROVIDER_API_KEY === "string")
+          additionalEnvironment.KODA_PROVIDER_API_KEY = message.additionalEnvironment.KODA_PROVIDER_API_KEY;
         if (nodeEnvironment?.buildPython) {
           additionalEnvironment.PYTHON = nodeEnvironment.buildPython.executable;
           additionalEnvironment.npm_config_python = nodeEnvironment.buildPython.executable;
@@ -564,15 +572,20 @@ export async function command(
       }
       await mkdir(dirname(targetPath), { recursive: true });
       if (process.platform === "darwin")
-        await symlink(bridge.sourcePath, targetPath, "dir");
+        await materializeDependencyTree(bridge.sourcePath, targetPath);
       else await mkdir(targetPath, { recursive: true });
       mounted.push(targetPath);
       activeBridges.push({ ...bridge, targetPath });
     }
   } catch (error) {
+    for (const path of mounted.reverse())
+      await rm(path, { recursive: true, force: true });
     if (hostScratch) await rm(hostScratch, { recursive: true, force: true });
     throw error;
   }
+  const networkPolicyConfig = sandboxNetworkPolicy();
+  const networkProxy = process.platform === "darwin" && !dependencyBootstrap && networkPolicyConfig.mode === "restricted"
+    ? await startSandboxNetworkProxy({ domains: networkPolicyConfig.domains, timeoutMs }) : undefined;
   const env = {
     ...pythonEnvironment,
     ...(registeredNode?.buildPython ? {
@@ -612,6 +625,7 @@ export async function command(
     MYPY_CACHE_DIR: join(scratch, "mypy-cache"),
     GIT_TERMINAL_PROMPT: "0",
     ...additionalEnvironment,
+    ...(networkProxy ? networkProxy.environment : {}),
   };
   const pythonBin = join(scratch, "python-bin");
   const shellQuote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
@@ -636,7 +650,7 @@ export async function command(
       .map((path) => `(subpath ${q(path)})`)
       .join(" ");
     const dependencyWriteDenials = activeBridges
-      .map((bridge) => `(deny file-write* (subpath ${q(bridge.sourcePath)}))`)
+      .map((bridge) => `(deny file-write* (subpath ${q(bridge.sourcePath)}))(deny file-write* (subpath ${q(bridge.targetPath)}))`)
       .join("");
     const runtimeWrites = externalWritableRoots.map((root) => `(subpath ${q(root)})`).join(" ");
     const readable = `(require-any ${ancestors.join(" ")} (literal "/") (subpath "/System") (subpath "/Library") (subpath "/usr") (subpath "/bin") (subpath "/sbin") (subpath "/opt") (subpath "/private/etc") (subpath "/private/var/db") (subpath "/dev") (subpath ${q(cwd)}) (subpath ${q(scratch)}) ${dependencyReads} ${runtimeWrites})`;
@@ -696,6 +710,7 @@ export async function command(
         [cwd, scratch, ...runtimeReadRoots, ...externalWritableRoots],
         activeBridges,
         start + timeoutMs,
+        dependencyBootstrap,
       );
     const child = execa(bin, args, {
       cwd,
@@ -745,6 +760,7 @@ export async function command(
       } catch {}
     }
     if (closeBroker) await closeBroker();
+    if (networkProxy) await networkProxy.close();
     if (hostScratch) await rm(hostScratch, { recursive: true, force: true });
     for (const path of mounted.reverse())
       await rm(path, { recursive: true, force: true });

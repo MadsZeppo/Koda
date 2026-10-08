@@ -736,6 +736,7 @@ test(`Stable ${failure} prior routing state does not block scoped Aider executio
   const root = await mkdtemp(join(tmpdir(), "koda-stable-scope-fallback-"));
   const repo = join(root, "repo"), output = join(root, "output");
   const requests: any[] = [];
+  let codeCalls = 0;
   const server = createServer(async (request, response) => {
     response.setHeader("content-type", "application/json");
     if (request.url?.endsWith("/models")) {
@@ -778,10 +779,11 @@ test(`Stable ${failure} prior routing state does not block scoped Aider executio
         usage: { prompt_tokens: 20, completion_tokens: 20, cost: 0 } }));
       return;
     }
+    const edit = codeCalls++ === 0
+      ? { path: "src/a.js", content: "// scope_target\nexport function a(){ return true; }\n" }
+      : { path: "tests/a.test.js", content: "import test from 'node:test'; import assert from 'node:assert/strict'; import {a} from '../src/a.js'; test('a',()=>assert.equal(a(),true)); test('a remains true',()=>assert.equal(a(),true));\n" };
     response.end(JSON.stringify({ id: "code", model: body.model, choices: [{ index: 0,
-      message: { role: "assistant", content: null, tool_calls: [tool("fix", "write_file", {
-        path: "src/a.js", content: "// scope_target\nexport function a(){ return true; }\n",
-      })] } }], usage: { prompt_tokens: 20, completion_tokens: 20, cost: 0 } }));
+      message: { role: "assistant", content: null, tool_calls: [tool("fix", "write_file", edit)] } }], usage: { prompt_tokens: 20, completion_tokens: 20, cost: 0 } }));
   });
   try {
     await mkdir(join(repo, "src"), { recursive: true });
@@ -807,10 +809,10 @@ test(`Stable ${failure} prior routing state does not block scoped Aider executio
     assert.equal(result.status, "VERIFIED_SUCCESS", result.error);
     const events = (await readFile(join(output, "events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
     assert.deepEqual(events.find((event) => event.type === "stable_discovery_start")
-      .initial_write_scope, ["src/a.js", "src/b.js", "src/c.js"]);
+      .initial_write_scope, ["src/a.js", "src/b.js", "src/c.js", "tests/a.test.js"]);
     const lock = events.find((event) => event.type === "stable_discovery_scope_locked");
-    assert.deepEqual(lock.actual_changed_paths, ["src/a.js"]);
-    assert.deepEqual(lock.repair_write_scope, ["src/a.js"]);
+    assert.deepEqual(lock.actual_changed_paths, ["src/a.js", "tests/a.test.js"]);
+    assert.deepEqual(lock.repair_write_scope, ["src/a.js", "tests/a.test.js"]);
     assert.equal(requests.filter((request) => request.tools?.some((tool: any) =>
       tool.function.name === "lock_write_scope")).length, 0,
     "production Stable uses the exploration-backed scope directly");

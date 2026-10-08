@@ -34,9 +34,10 @@ test("final provider serialization is admitted against a conservative hard bound
   const payload = { model: "arbitrary/provider", messages: [{ role: "user", content: "å🙂漢".repeat(500) }],
     tools: [{ type: "function", function: { name: "tool", parameters: { type: "object" } } }] };
   const admitted = admitProviderPayload(payload, 1000);
-  assert.ok(Buffer.byteLength(JSON.stringify(payload)) < admitted.inputTokens);
+  assert.ok(Buffer.byteLength(JSON.stringify(payload)) > admitted.inputTokens,
+    "the provider bound must be expressed in estimated tokens, not raw UTF-8 bytes");
   assert.equal(admitted.inputTokens, providerPayloadBound(payload));
-  assert.throws(() => admitProviderPayload({ messages: [{ content: "x".repeat(MAX_PROVIDER_INPUT_TOKENS) }] }, 1000), /preflight/);
+  assert.throws(() => admitProviderPayload({ messages: [{ content: "x".repeat(MAX_PROVIDER_INPUT_TOKENS * 3) }] }, 1000), /preflight/);
   assert.throws(() => admitProviderPayload(payload, 1000, admitted.inputTokens + 999), /preflight/);
 });
 
@@ -104,7 +105,7 @@ test("TaskSpec preserves sentence punctuation and newlines inside exact literals
   assert.ok(spec.routingPrompt.includes('`first\nsecond`'));
 });
 
-test("decomposed multi-file work produces actual mutations and passes real focused and final checks", async (t) => {
+test("decomposed contributions defer checks until integration and final verification proves the result", async (t) => {
   const { implement } = await import("../src/agent/codingExecutor.js");
   const { config } = await import("../src/config.js");
   const { Budget } = await import("../src/openrouter/usage.js");
@@ -143,8 +144,13 @@ test("decomposed multi-file work produces actual mutations and passes real focus
           changedPaths: [file], wallClockMs: 1 };
       } }, compiledContext: { files: [{ path: file, snippet: "module.exports = 1;" }],
         localDependencies: [], completePaths: [file], repoMap: files } as any,
+      deferVerificationToIntegration: true,
     });
-    assert.equal(result.verification.status, "VERIFIED_SUCCESS");
+    assert.equal(result.verification.status, "CANDIDATE_NEUTRAL");
+    assert.ok(gateway.logger.events.some((event: any) =>
+      event.type === "contribution_verification_deferred" && event.subtaskId === task.id));
+    assert.equal(gateway.logger.events.some((event: any) =>
+      event.type === "completion_review" && event.subtaskId === task.id), false);
     assert.ok((await readFile(join(root, file), "utf8")).startsWith("module.exports = 2;"));
     await execa("git", ["add", file], { cwd: root });
     await execa("git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@localhost", "commit", "-qm", "integrated scoped contribution"], { cwd: root });
@@ -152,4 +158,11 @@ test("decomposed multi-file work produces actual mutations and passes real focus
   const final = await verify(root, ["node --test tests/*.test.cjs", ...files.map((file) => `node --check ${file}`)], 10000);
   assert.equal(final.status, "VERIFIED_SUCCESS");
   assert.ok(final.checks.every((check) => check.outcome === "CHECK_PASS"));
+});
+
+test('explicit plan reservations are not reduced again by generic recovery fractions',()=>{
+ const capacity=codingCapacity(15000,.225,false,true);
+ assert.equal(capacity.usd,.225);assert.equal(capacity.tokens,15000);
+ assert.ok(capacity.usd>=.174096);
+ assert.ok(codingCapacity(15000,.225,false).usd<.174096);
 });

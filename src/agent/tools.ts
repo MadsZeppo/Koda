@@ -18,7 +18,7 @@ import type { Logger } from "../telemetry/logger.js";
 import { filesystemDiff, workspaceChanges } from "../workspace/diff.js";
 import { changeCode, listWorkspaceFiles } from "../workspace/files.js";
 import { createHash } from "node:crypto";
-import { nearbyRepoPaths } from "../repo/navigation.js";
+import { discoveryNoise, nearbyRepoPaths } from "../repo/navigation.js";
 
 /** Find one formatting-equivalent span while preserving current-file offsets. */
 function whitespaceEquivalentSpan(content: string, requested: string) {
@@ -146,15 +146,16 @@ export async function safePath(root: string, input: string) {
   }
   return target;
 }
-export async function currentDiff(root: string) {
+export async function currentDiff(root: string, ignoredPaths: readonly string[] = []) {
   const local = await workspaceChanges(root);
-  if (local) return filesystemDiff(root);
-  const tracked = await git(root, "diff", "HEAD");
+  if (local) return filesystemDiff(root, ignoredPaths);
+  const tracked = await git(root, "diff", "HEAD", "--", ".",
+    ...ignoredPaths.map((path) => `:(exclude,literal)${path}`));
   const untracked = (
     await git(root, "ls-files", "--others", "--exclude-standard")
   )
     .split("\n")
-    .filter(Boolean);
+    .filter((path) => !!path && !ignoredPaths.includes(path));
   let extra = "";
   for (const p of untracked.slice(0, 30)) {
     try {
@@ -282,12 +283,12 @@ export class AgentTools {
         break;
       }
       case "list_files":
-        result = (await listWorkspaceFiles(this.root))
+        result = (await listWorkspaceFiles(this.root)).filter((path) => !discoveryNoise(path))
           .join("\n")
           .slice(0, 16000);
         break;
       case "search_code": {
-        const files = await listWorkspaceFiles(this.root);
+        const files = (await listWorkspaceFiles(this.root)).filter((path) => !discoveryNoise(path));
         const query = typeof args.query === "string" ? args.query.trim() : "";
         if (!query || query.length > 256) throw Error("Invalid search query");
         const hits: string[] = [];

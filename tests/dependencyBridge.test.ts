@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
 import type { VerificationCandidate } from "../src/repo/ecosystem.js";
 import test from "node:test";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile, lstat, readFile, realpath, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   bridgeDependencies,
   dependenciesForWorkspace,
   dependencyPathAvailable,
+  materializeDependencyTree,
 } from "../src/repo/dependencies.js";
+import { command } from "../src/repo/commands.js";
 import { profileRepo } from "../src/repo/profiler.js";
 
 const packageJson = JSON.stringify(
@@ -90,4 +92,50 @@ test("baseline verification reuses the integration dependency bridge", async () 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("isolated dependencies have a real root and relocate package/bin links without sharing writes", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "koda-local-deps-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, "source", "node_modules"), target = join(root, "candidate", "node_modules");
+  await mkdir(join(source, "pkg"), { recursive: true });
+  await mkdir(join(source, ".bin"));
+  await writeFile(join(source, "pkg", "cli.js"), "original");
+  await symlink(join(source, "pkg", "cli.js"), join(source, ".bin", "pkg"));
+  await materializeDependencyTree(source, target);
+  assert.equal((await lstat(target)).isSymbolicLink(), false);
+  assert.equal(await realpath(join(target, ".bin", "pkg")), await realpath(join(target, "pkg", "cli.js")));
+  await writeFile(join(target, "pkg", "cli.js"), "candidate");
+  assert.equal(await readFile(join(source, "pkg", "cli.js"), "utf8"), "original");
+});
+
+test("dependency materialization rejects external links and removes partial copies", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "koda-deps-escape-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, "node_modules"), target = join(root, "candidate", "node_modules");
+  await mkdir(source);
+  await writeFile(join(root, "private.txt"), "must not enter sandbox");
+  await symlink("../private.txt", join(source, "escape"));
+  await assert.rejects(materializeDependencyTree(source, target), /escapes/);
+  await assert.rejects(lstat(target), { code: "ENOENT" });
+});
+
+test("actual macOS sandbox mounts dependencies inside its root and protects both copies", { skip: process.platform !== "darwin" }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "koda-deps-sandbox-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, "source"), candidate = join(root, "candidate");
+  await mkdir(join(source, "node_modules", "pkg"), { recursive: true });
+  await mkdir(candidate);
+  await writeFile(join(source, "node_modules", "pkg", "index.js"), "module.exports=7;\n");
+  await bridgeDependencies(source, candidate);
+  await writeFile(join(candidate, "check.cjs"), `const fs=require('node:fs');const a=require('node:assert/strict');
+a.equal(fs.lstatSync('node_modules').isSymbolicLink(),false);
+a.ok(fs.realpathSync('node_modules/pkg').startsWith(process.cwd()+'/'));
+a.equal(require('pkg'),7);
+a.throws(()=>fs.writeFileSync('node_modules/pkg/index.js','bad'));
+`);
+  const result = await command(candidate, "node check.cjs");
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(await readFile(join(source, "node_modules", "pkg", "index.js"), "utf8"), "module.exports=7;\n");
+  await assert.rejects(lstat(join(candidate, "node_modules")), { code: "ENOENT" });
 });

@@ -1,4 +1,5 @@
-import { compactEcosystem, generatedPath, projectFor } from "../repo/ecosystem.js";
+import { discoveryNoise } from "../repo/navigation.js";
+import { compactEcosystem, projectFor } from "../repo/ecosystem.js";
 import type { Subtask, Plan } from "../planner/schemas.js";
 import { open, stat } from "node:fs/promises";
 import { posix } from "node:path";
@@ -11,6 +12,12 @@ export const isTestPath = (p: string) =>
   /(?:^|\/)(?:tests?|__tests__)(?:\/|$)|(?:^|\/)test_|[._](?:test|spec)\./i.test(
     p,
   );
+
+/** A runnable test, rather than documentation or a SQL migration whose name
+ * happens to contain "test". Only runnable tests can satisfy a test-writing
+ * request or prove that a repository already has a test convention. */
+export const isRunnableTestPath = (p: string) =>
+  isTestPath(p) && /\.(?:[cm]?[jt]sx?|py|go|rs|java|[ch](?:pp)?|rb)$/i.test(p);
 
 export const isSourcePath = (p: string) =>
   /\.(?:[cm]?[jt]sx?|py|go|rs|java|[ch](?:pp)?|rb)$/i.test(p) &&
@@ -315,11 +322,11 @@ export async function compileContext(
   const broadRootScope = paths.includes(".");
   const manifest = /(?:^|\/)(?:package\.json|tsconfig\.json|pyproject\.toml|go\.mod|Cargo\.toml)$/;
   const passiveInitialNoise = (file: string) =>
-    generatedPath(file) ||
+    discoveryNoise(file) ||
     /(?:^|\/)tests?\/fixtures(?:\/|$)/i.test(file);
 
   const assigned = (file: string) =>
-    paths.some(
+    (!localizedTestTask || focused || explicitlyNamed.has(file)) && paths.some(
       (p) =>
         p !== "." &&
         (file === p || file.startsWith(p.replace(/\/$/, "") + "/")),
@@ -385,9 +392,8 @@ export async function compileContext(
     )
     .slice(0, limits.scanFiles)) {
     if (
-      !/\.(?:[cm]?[jt]sx?|py|go|rs|java|[ch](?:pp)?|rb|json|toml|yaml|yml)$/.test(
-        file,
-      )
+      !/\.(?:[cm]?[jt]sx?|py|go|rs|java|[ch](?:pp)?|rb|json|toml|yaml|yml)$/.test(file) &&
+      !(assigned(file) && /\.css$/i.test(file))
     ) {
       continue;
     }

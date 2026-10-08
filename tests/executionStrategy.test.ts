@@ -5,6 +5,8 @@ import {
   allowedJointExecutionStrategies,
   chooseExecutionStrategy,
   directWritePaths,
+  requestsTestMutation,
+  explicitTaskPaths,
 } from "../src/router/executionStrategy.js";
 import type { RepoProfile } from "../src/types.js";
 function profile(
@@ -29,6 +31,15 @@ function profile(
     verificationCommands: ["npm run test"],
   };
 }
+test("prose abbreviations do not invent writable files or summon planning", () => {
+  const repo = profile();
+  const task = "Modify calculator.cjs to format values (e.g. 125 becomes 2:05), i.e. preserve the specified output. Preserve existing tests.";
+  assert.deepEqual(explicitTaskPaths(task, repo), ["calculator.cjs"]);
+  assert.equal(chooseExecutionStrategy(task, repo).execution_strategy, "direct");
+  assert.deepEqual(explicitTaskPaths("Create a.b. Export a function.", repo), ["a.b"]);
+  assert.deepEqual(explicitTaskPaths("Create `i.e.` as a new file", repo), ["i.e"]);
+  assert.deepEqual(explicitTaskPaths("Modify e.g. to return true", profile(["e.g"])), ["e.g"]);
+});
 test("execution strategy: an explicit tiny calculator correction is direct", () => {
   for (const task of [
     "Fix the calculator bug with negative inputs.",
@@ -44,6 +55,51 @@ test("execution strategy: an explicit tiny calculator correction is direct", () 
   ]);
   assert.deepEqual(directWritePaths(["calculator.cjs"], profile(), "Fix calculator and add a regression test"), [
     "calculator.cjs", "tests/calculator.test.cjs",
+  ]);
+});
+
+test("explicit Danish test requests receive a runnable bounded test scope", () => {
+  const task = "Implementér webhook-endpointet og tilføj relevante tests for signatur og dubletter.";
+  assert.equal(requestsTestMutation(task), true);
+  assert.equal(requestsTestMutation("Kør relevante tests og typecheck."), false);
+  const source = "src/app/api/webhooks/events/route.ts";
+  const withoutRunner = profile([source, "package.json"]);
+  withoutRunner.scripts = { lint: "eslint" };
+  assert.deepEqual(directWritePaths([source], withoutRunner, task), [
+    source, "package.json", "tests/app-api-webhooks-events-route.test.ts",
+  ]);
+  const withRunner = profile([source, "package.json"]);
+  withRunner.scripts = { test: "tsx --test checks/*.test.ts" };
+  assert.deepEqual(directWritePaths([source], withRunner, task), [
+    source, "checks/app-api-webhooks-events-route.test.ts",
+  ]);
+  assert.deepEqual(directWritePaths([source], withoutRunner,
+    `Only modify ${source}. Add tests if possible.`), [source]);
+  assert.deepEqual(directWritePaths([source], withRunner,
+    `Add a focused regression test for ${source}. Do not change dependencies.`), [
+    source, "checks/app-api-webhooks-events-route.test.ts",
+  ]);
+});
+test("documentation and migration names containing test do not block a new runner", () => {
+  const route = "src/app/api/webhooks/events/route.ts";
+  const repository = profile([
+    "src/app/api/bridge/webhook/route.ts",
+    "src/app/api/bridge/production/configure-webhook/route.ts",
+    "docs/BRIDGE_PRODUCTION_LIVE_TEST.md",
+    "supabase/migrations/20260630090000_bridge_production_micro_test.sql",
+    "package.json",
+  ]);
+  repository.scripts = { lint: "eslint", typecheck: "tsc --noEmit" };
+  assert.deepEqual(directWritePaths([
+    "src/app/api/bridge/webhook/route.ts",
+    "src/app/api/bridge/production/configure-webhook/route.ts",
+    route,
+  ], repository, "Opret webhook-endpointet og tilføj relevante tests."), [
+    "src/app/api/bridge/webhook/route.ts",
+    "src/app/api/bridge/production/configure-webhook/route.ts",
+    route,
+    "package.json",
+    "tests/app-api-webhooks-events-route.test.ts",
   ]);
 });
 test("a localized bug report with reproduction steps remains one worker", () => {

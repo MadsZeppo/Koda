@@ -1,0 +1,502 @@
+[
+  {
+    "task_id": "astropy__astropy-13977",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "astropy__astropy-14096",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "astropy__astropy-8872",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-10097",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-10999",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-11087",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-11133",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-11179",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-11206",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-11239",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-11400",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-11728",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-11848",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-11964",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-12143",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-12193",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-12262",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-12276",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-12419",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-12774",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-12965",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-13012",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-13128",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-13195",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-13315",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-13343",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-13363",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-13590",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-13670",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-13786",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-13809",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-13820",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-14011",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-14053",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-14170",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-14580",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-14855",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-15037",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-15252",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-15368",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-15380",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-15467",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-15554",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-15569",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-15930",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-15957",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-15973",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-16032",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-16100",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "django__django-16256",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "matplotlib__matplotlib-14623",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "matplotlib__matplotlib-20826",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "matplotlib__matplotlib-22871",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "matplotlib__matplotlib-23299",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "matplotlib__matplotlib-23412",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "matplotlib__matplotlib-24627",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "matplotlib__matplotlib-25332",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "matplotlib__matplotlib-25479",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "matplotlib__matplotlib-25775",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "matplotlib__matplotlib-25960",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "matplotlib__matplotlib-26113",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "matplotlib__matplotlib-26291",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "matplotlib__matplotlib-26342",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "matplotlib__matplotlib-26466",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "pallets__flask-5014",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "psf__requests-1766",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "pydata__xarray-2905",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "pydata__xarray-6461",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "pydata__xarray-7393",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "pylint-dev__pylint-4604",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "pytest-dev__pytest-7490",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "scikit-learn__scikit-learn-13142",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "scikit-learn__scikit-learn-13328",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "scikit-learn__scikit-learn-14629",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "scikit-learn__scikit-learn-15100",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "scikit-learn__scikit-learn-25102",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "scikit-learn__scikit-learn-25973",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "scikit-learn__scikit-learn-26323",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "sphinx-doc__sphinx-7590",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "sphinx-doc__sphinx-7757",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "sphinx-doc__sphinx-8120",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "sphinx-doc__sphinx-8459",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "sphinx-doc__sphinx-8475",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "sphinx-doc__sphinx-8595",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "sphinx-doc__sphinx-9229",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "sphinx-doc__sphinx-9320",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "sympy__sympy-12419",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "sympy__sympy-13647",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "sympy__sympy-13974",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "sympy__sympy-15017",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "sympy__sympy-18211",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "sympy__sympy-18698",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "sympy__sympy-19040",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "sympy__sympy-19783",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "sympy__sympy-19954",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "sympy__sympy-21379",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "sympy__sympy-21930",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "sympy__sympy-23950",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "sympy__sympy-24562",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  },
+  {
+    "task_id": "sympy__sympy-24661",
+    "decision": "ABSTAIN",
+    "supported_candidates": []
+  }
+]

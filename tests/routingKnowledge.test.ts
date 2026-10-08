@@ -133,6 +133,30 @@ test("long-tail p90 latency can demote an otherwise equivalent economical plan",
   assert.ok(result.considered.find((entry) => entry.model.id === "long-tail")!.latencyP90Ms! > 80_000);
 });
 
+test("agentic recovery latency does not make the same model's Aider route deadline-infeasible", () => {
+  const calls = (provider: string, values: number[]): OperationalCall[] => values.map((wallClockMs) => ({
+    type: "operational_call", timestamp: "2026-09-01", runId: provider, subtaskId: "fix",
+    stage: "implement", taskBucket: "localized_bugfix", modelRequested: "recovered",
+    modelServed: "recovered", provider, wallClockMs, outcome: "response", costUsd: .01,
+  }));
+  const operations = [
+    ...calls("agentic", [180_000, 220_000, 260_000]),
+    ...calls("aider", [4_000, 5_000, 6_000, 7_000, 120_000, 130_000]),
+  ];
+  const result = optimizeSpecialists([model("recovered", .1)], fp(), features, [], {
+    maxOutputTokens: 4096,
+    codingAttemptTimeoutMs: 90_000,
+    modelTimeoutMs: { implementation: 90_000 },
+    routing: routingSchema.parse({ costWeight: 0, latencyWeight: 1 }),
+  } as Config, 100, operations);
+  const candidate = result.considered[0]!;
+  assert.equal(candidate.deadlineFeasible, true);
+  assert.equal(candidate.hardRejection, undefined);
+  assert.ok((candidate.latencyP50Ms ?? Infinity) < 90_000);
+  assert.ok((candidate.latencyP90Ms ?? 0) > 90_000,
+    "long-tail risk remains visible to plan scoring without becoming incompatibility");
+});
+
 test("Aider trajectory economics distinguish localized and broad tasks and learn limit overruns", () => {
   const direct = fp("strong");
   const agentic = { ...direct, executionStrategy: "stable", scope: "multi-file" as const,

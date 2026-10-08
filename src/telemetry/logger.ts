@@ -1,11 +1,19 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { localOpenRouterKey } from '../provider/transport.js';
 export class Logger {
+  private readonly observers = new Set<(event: Readonly<Record<string, any>>) => void>();
+  /** Observers receive detached events and cannot change authoritative execution. */
+  subscribe(observer: (event: Readonly<Record<string, any>>) => void) {
+    this.observers.add(observer);
+    return () => { this.observers.delete(observer); };
+  }
   events: any[] = [];
   constructor(
     readonly directory: string,
     readonly runId: string,
     readonly quiet = false,
+    readonly synthetic = false,
   ) {
     mkdirSync(directory, { recursive: true });
   }
@@ -15,13 +23,17 @@ export class Logger {
       timestamp: new Date().toISOString(),
       type,
       ...data,
+      ...(this.synthetic ? { synthetic: true } : {}),
     };
     let line = JSON.stringify(raw);
-    const secret = process.env.OPENROUTER_API_KEY;
+    const secret = localOpenRouterKey();
     if (secret) line = line.split(secret).join("[REDACTED]");
     const event = JSON.parse(line);
     this.events.push(event);
     appendFileSync(join(this.directory, "events.jsonl"), line + "\n");
+    for (const observer of this.observers) {
+      try { observer(structuredClone(event)); } catch { /* Shadow evidence cannot abort execution. */ }
+    }
     if (this.quiet) return;
     const d = event;
     const label = d.subtaskId ? ` ${d.subtaskId}` : "";

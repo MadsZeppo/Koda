@@ -7,6 +7,12 @@ import { explicitTaskPaths } from "./executionStrategy.js";
 export type ProfileConfidence = "high" | "medium" | "low";
 
 export interface SemanticTaskAssessment {
+  /** Optional shadow-only semantic boundary resolution; never a routing input. */
+  securityAssessment?: {
+    resolution: "security" | "non_security" | "unresolved";
+    confidence: number;
+    evidence: string;
+  };
   semanticDifficulty: "easy" | "normal" | "hard" | "frontier";
   repoReasoning: "low" | "medium" | "high";
   localizationDifficulty: "low" | "medium" | "high";

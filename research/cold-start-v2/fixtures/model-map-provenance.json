@@ -1,0 +1,17 @@
+{
+  "project": "https://github.com/ynulihao/LLMRouterBench",
+  "releaseRepository": "NPULH/LLMRouterBench",
+  "releaseRevision": "0e5af1b84bf73437a01a1849c0f1d2468baa93fc",
+  "archiveSha256": "b79f8cde1a6f029c2efa663a3a3b6f7748defb22341fe59f328cebef6648c8f1",
+  "configurationRevision": "c77cb0506949d8f959e97967d2fefca0e8ff1b05",
+  "configurationUrl": "https://github.com/ynulihao/LLMRouterBench/blob/c77cb0506949d8f959e97967d2fefca0e8ff1b05/config/data_collector_proprietary_model_config.yaml",
+  "configurationSha256": "8f167197aabd010fd2e54df58284ae46a27c600a4fa08a6473b5d8c2993ee7f6",
+  "gpt5Mapping": {
+    "requestedIdentity": "GPT-5-medium",
+    "releaseDirectory": "gpt-5",
+    "canonicalAlias": "gpt-5",
+    "apiModelName": "openai/gpt-5",
+    "reasoningEffort": "medium",
+    "evidence": "Official collector configuration specifies gpt-5 reasoning_effort=medium. SWE result filename additionally contains gpt-5-medium. GPT-5-chat is excluded."
+  }
+}

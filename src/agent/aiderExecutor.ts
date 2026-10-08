@@ -1,4 +1,5 @@
 import { MAX_PROVIDER_INPUT_TOKENS } from "../context/packetPolicy.js";
+import { providerTransport, liteLLMTransport } from '../provider/transport.js';
 import { mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { tmpdir } from "node:os";
@@ -264,6 +265,8 @@ export function buildAiderPrompt(
     [
       "Use the attached repository files as the primary implementation context.",
       "Implement the complete task with the smallest correct change.",
+      "When adding tests, cover legal empty inputs and boundary cases relevant to the requested API, not only the happy path. Preserve the task's input domain; do not invent extra validation requirements.",
+      "Derive each expected test result independently from the original contract: manually trace counts, ordering and tie rules. Empty input means a legal empty value, never a missing argument unless explicitly required. During repair, read the failing assertion and source together; distinguish a wrong implementation from a wrong newly generated expectation. Change a test expectation only with concrete contract evidence, never merely to match current output; preserve pre-existing tests and all required behaviors. Do not add unrelated edge cases during repair.",
       "Do not ask the user to add a file and do not merely explain the change.",
       "Files marked read-only are evidence, not mutation targets.",
     ].join(" "),
@@ -404,7 +407,7 @@ export function buildAiderArgs(
   },
   format: AiderEditFormat,
 ) {
-  const model = aiderOpenRouterModel(input.model);
+  const model = liteLLMTransport(input.model, input.baseUrl).model;
 
   const mapTokens = 0;
 
@@ -488,7 +491,7 @@ export function buildAiderArgs(
 
 export function aiderMetadata(input: CodingWorkerInput) {
   return {
-    [aiderOpenRouterModel(input.model)]: {
+    [liteLLMTransport(input.model, input.baseUrl).model]: {
       max_tokens: input.maxOutputTokens,
       max_input_tokens:
         input.contextWindowTokens ?? input.maxTokens,
@@ -508,7 +511,7 @@ export function aiderMetadata(input: CodingWorkerInput) {
               input.completionPricePerMillion / 1e6,
           }),
 
-      litellm_provider: "openrouter",
+      litellm_provider: providerTransport(input.baseUrl).mode === "backend" ? "openai" : "openrouter",
       mode: "chat",
     },
   };
@@ -709,8 +712,8 @@ export class AiderExecutor implements CodingWorker {
       CodingWorkerResult["formatAttempts"]
     > = [];
 
-    const secret =
-      process.env.OPENROUTER_API_KEY?.trim() ?? "";
+    const transport = providerTransport(input.baseUrl);
+    const secret = transport.apiKey;
 
     const redact = (value: string) =>
       (
@@ -888,8 +891,9 @@ export class AiderExecutor implements CodingWorker {
               ),
               env: {
                 ...process.env,
-                OPENROUTER_API_KEY:
-                  secret,
+                OPENROUTER_API_KEY: transport.mode === "direct-openrouter" ? secret : undefined,
+                KODA_PROVIDER_API_KEY: secret,
+            KODA_PROVIDER_MODE: transport.mode,
               },
             },
           );
@@ -1010,25 +1014,27 @@ export class AiderExecutor implements CodingWorker {
               process.env.LANG ??
               "C.UTF-8",
 
-            OPENROUTER_API_KEY:
-              secret,
+            OPENROUTER_API_KEY: transport.mode === "direct-openrouter" ? secret : undefined,
+            OPENAI_API_KEY: transport.mode === "backend" ? secret : undefined,
+            OPENAI_API_BASE: transport.mode === "backend" ? transport.baseUrl : undefined,
+            KODA_PROVIDER_API_KEY: secret,
+            KODA_PROVIDER_MODE: transport.mode,
 
+            LITELLM_LOCAL_MODEL_COST_MAP: "True",
             NO_COLOR: "1",
 
             PYTHONDONTWRITEBYTECODE:
               "1",
           };
 
-        const model =
-          aiderOpenRouterModel(
-            input.model,
-          );
+        const model = liteLLMTransport(input.model, input.baseUrl).model;
 
         await writeFile(
           requestPath,
           JSON.stringify(
             {
               model,
+              routedModel: input.model,
               prompt: files.prompt,
               report: reportPath,
               ledger: ledgerPath,
@@ -1043,7 +1049,8 @@ export class AiderExecutor implements CodingWorker {
               maxTokens: input.maxTokens,
               maxInputTokens: MAX_PROVIDER_INPUT_TOKENS,
               budgetUsd: input.budgetUsd,
-              baseUrl: input.baseUrl,
+              baseUrl: transport.baseUrl,
+              providerMode: transport.mode,
               requestTimeoutMs:
                 input.requestTimeoutMs,
               modelMetadata:
@@ -1350,16 +1357,18 @@ export class AiderExecutor implements CodingWorker {
           | string
           | undefined;
 
-        if (
+        if (/WRITE_SCOPE_VIOLATION/.test(result.stderr)) {
+          failure = "write_scope_violation";
+        } else if (ledger?.outputLimitReached === true ||
+          /exceeded output limit|output tokens:[^\n]*--\s*exceeded|finish_reason["':\s]+length/i.test(`${result.stdout}\n${result.stderr}`)) {
+          failure = "output_limit";
+        } else if (
           typeof report?.failureKind ===
             "string" &&
           report.failureKind
         ) {
           failure =
             report.failureKind;
-        } else if (ledger?.outputLimitReached === true ||
-          /exceeded output limit|output tokens:[^\n]*--\s*exceeded|finish_reason["':\s]+length/i.test(`${result.stdout}\n${result.stderr}`)) {
-          failure = "output_limit";
         } else if (
           !this.options.runner &&
           !report

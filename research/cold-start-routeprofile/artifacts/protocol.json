@@ -1,0 +1,28 @@
+{
+  "seed": 20261007,
+  "variants": [
+    "flat",
+    "similarity",
+    "structured_graph",
+    "trainable_graph",
+    "irt"
+  ],
+  "regimes": [
+    0,
+    4,
+    8,
+    16,
+    32
+  ],
+  "allowedRegret": 0.02,
+  "latentDimensions": 24,
+  "neighborhoods": 8,
+  "decoder": "L2 logistic C=1; disjoint profile/decoder task groups",
+  "transfer": "other-model validation residual .95 quantile; confidence anchors Hoeffding .95",
+  "selection": "LCB >= strongest UCB - existing .02 regret; no prices invented",
+  "kodaFinal100": "sealed; never read outcomes",
+  "hyperparameterTuning": false,
+  "upstreamReproduction": false,
+  "adaptation": "RouteProfile heterogeneous neighbourhood propagation and shared query-model edge decoder, local TFIDF/SVD instead of pretrained BERT/GPU HAN/GAT",
+  "paidCalls": 0
+}

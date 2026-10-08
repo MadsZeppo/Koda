@@ -78,6 +78,20 @@ class MockHandler(BaseHTTPRequestHandler):
 
 
 class BridgeTest(unittest.TestCase):
+    def test_search_preserves_read_budget_for_matching_evidence(self):
+        from bridge import RepositoryExecutor, SearchCodeAction, ReadFileAction
+        with tempfile.TemporaryDirectory() as root:
+            repo = Path(root)
+            for index in range(30):
+                (repo / f"a{index:02}.ts").write_text("export const unrelated = 1;\n")
+            (repo / "zz-quota.ts").write_text("export const tokenLimit = 8192;\n")
+            state = {"files_inspected": set(), "max_files_read": 1, "tool_calls": 0}
+            RepositoryExecutor(repo, "search", state)(SearchCodeAction(query="tokenLimit", glob="*.ts", limit=20))
+            self.assertEqual(state["files_inspected"], {"zz-quota.ts"})
+            RepositoryExecutor(repo, "read", state)(ReadFileAction(path="zz-quota.ts", start_line=1, end_line=20))
+            self.assertEqual(state["tool_calls"], 2)
+            self.assertEqual(state["files_inspected"], {"zz-quota.ts"})
+
     def test_real_sdk_agent_navigates_with_read_only_tools(self):
         MockHandler.calls = []
         MockHandler.source_path = "src/budget.ts"

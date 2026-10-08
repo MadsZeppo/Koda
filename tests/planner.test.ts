@@ -963,12 +963,23 @@ test("explicit dependent source targets plan locally, run independent roots in p
       },
     ],
   };
+  let rootStarts = 0;
+  let releaseRoots!: () => void;
+  const rootsStarted = new Promise<void>(resolve => { releaseRoots = resolve; });
   const m = await mock(async (body) => {
     assert.ok(
       !body.messages[0].content.startsWith("Compile"),
       "repository-backed dependency planning must not call a planner model",
     );
-    await new Promise((resolve) => setTimeout(resolve, 75));
+    if (++rootStarts <= 2) {
+      if (rootStarts === 2) releaseRoots();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([rootsStarted, new Promise<void>((_, reject) => {
+          timer = setTimeout(() => reject(Error("Independent workers did not overlap")), 10_000);
+        })]);
+      } finally { clearTimeout(timer); }
+    }
     const input = JSON.parse(body.messages[1].content);
     const path = input.allowed_write_paths[0];
     assert.deepEqual(input.allowed_write_paths, [path]);
@@ -1738,6 +1749,7 @@ for (const malformed of [false])
           },
         ],
       };
+      let codingCalls = 0;
       const m = await mock((body) => {
         const system = body.messages[0].content as string;
         if (system.startsWith("Compile")) {
@@ -1777,8 +1789,13 @@ for (const malformed of [false])
               });
         }
         assert.equal(input.subtask.id, "fix-verification");
-        assert.ok(input.evidence.relevantFiles.includes("src/a.ts"));
-        assert.deepEqual(input.allowed_write_paths, ["src/a.ts"]);
+        if (codingCalls === 0)
+          assert.ok(input.evidence.relevantFiles.includes("src/a.ts"));
+        assert.ok(input.allowed_write_paths.includes("src/a.ts"));
+        assert.ok(input.allowed_write_paths.includes("test/a.test.ts"));
+        const edit = codingCalls++ === 0
+          ? { path: "src/a.ts", content: "export function a(){return 1}\n" }
+          : { path: "test/a.test.ts", content: "import {test} from 'node:test'; import assert from 'node:assert/strict'; import {a} from '../src/a.ts'; test('a',()=>assert.equal(a(),1)); test('a stays stable',()=>assert.equal(a(),1));\n" };
         return {
           role: "assistant",
           content: null,
@@ -1788,10 +1805,7 @@ for (const malformed of [false])
               type: "function",
               function: {
                 name: "write_file",
-                arguments: JSON.stringify({
-                  path: "src/a.ts",
-                  content: "export function a(){return 1}\n",
-                }),
+                arguments: JSON.stringify(edit),
               },
             },
           ],

@@ -287,3 +287,22 @@ test("provider context checks use the largest single turn, not cumulative repeat
   assert.equal(policy.nonViableLimitKind, undefined);
   assert.equal(policy.viable, true);
 });
+
+test('progressive complex workers use configured session deadline while discovery remains bounded',()=>{
+ const input={...base,configuredTimeoutMs:120_000,remainingMs:90_000,fingerprint:fingerprint({scope:'cross-component',expectedFiles:5,crossComponent:true,localizationConfidence:'low'})};
+ assert.equal(attemptLimitPolicy(input).timeoutMs,90_000);
+ assert.equal(attemptLimitPolicy({...input,boundedDiscovery:true}).timeoutMs,45_000);
+ assert.equal(attemptLimitPolicy({...input,remainingMs:30_000}).timeoutMs,30_000);
+});
+
+test('native progressive admission separates dispatch minimum from trajectory forecast and retains hard budgets',()=>{
+ const input={...base,promptBytes:32_000,remainingTokens:15_000,stageMaxTokens:15_000,remainingUsd:.15,plannedBudgetUsd:.15,stageMaxUsd:.15,
+  promptPricePerMillion:2,completionPricePerMillion:10,fingerprint:fingerprint({scope:'multi-file',crossComponent:true,expectedFiles:5,localizationConfidence:'low'})};
+ const conservative=attemptLimitPolicy(input);
+ const progressive=attemptLimitPolicy({...input,progressiveCompaction:true});
+ assert.equal(conservative.viable,false);
+ assert.equal(progressive.viable,true);
+ assert.ok(progressive.desiredTrajectoryTokens>progressive.maxTokens,'forecast remains conservative rather than pretending the full trajectory fits');
+ assert.equal(progressive.maxTokens,15_000);assert.equal(progressive.budgetUsd,.15);
+ assert.equal(attemptLimitPolicy({...input,progressiveCompaction:true,remainingUsd:.001}).nonViableLimitKind,'cost_limit');
+});

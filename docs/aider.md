@@ -16,8 +16,11 @@ export KODA_AIDER_PYTHON="$HOME/.cache/koda/aider/bin/python"
 Alternatively, install the `aider` executable on PATH or set `AIDER_BIN` to its
 entry point. Koda discovers and checks the owning interpreter. Missing or
 incompatible runtimes return `AIDER_UNAVAILABLE`, without model-quality evidence.
-Set `OPENROUTER_API_KEY` in the environment. It is never put in arguments,
-request files or telemetry. Captured diagnostics redact it.
+By default set `KODA_API_URL` to the Koda backend. The bridge uses the backend
+endpoint and a public SDK placeholder; it never receives the server's OpenRouter
+key. Explicit `KODA_PROVIDER_MODE=direct-openrouter` development runs instead
+require a local `OPENROUTER_API_KEY`. Direct-mode credentials are never put in
+arguments, request files or telemetry. Captured diagnostics redact them.
 
 ## Invocation
 

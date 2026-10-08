@@ -42,6 +42,7 @@ export interface RecoveryObservation {
 }
 
 export interface FrozenExecutionPolicy<T extends ControlCandidate = ControlCandidate> {
+  readonly authority?: "legacy" | "cold-start" | "openrouter-auto";
   readonly id: string;
   readonly taskFingerprint: Readonly<TaskFingerprint>;
   readonly routingMode?: "quality_safe" | "bounded_zero_eligible_fallback";
@@ -235,6 +236,12 @@ export function chooseAdaptiveRecovery<T extends ControlCandidate>(
     failureMode !== "operational" &&
     (observation.codingAttempts ?? attempted.size) >= policy.maxCodingAttempts
   ) return undefined;
+  // The cold-start authority freezes only its admitted start and explicit
+  // reference rescue. Unknown reference quality is not a fabricated score.
+  if ((policy.authority === "cold-start" || policy.authority === "openrouter-auto")) {
+    return policy.approvedCandidateSet.find((candidate) =>
+      !attempted.has(candidate.model.id) && !candidate.hardRejection);
+  }
   const previous = policy.approvedCandidateSet.find(
     (candidate) => candidate.model.id === observation.previousModel,
   );

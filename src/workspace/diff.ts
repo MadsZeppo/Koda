@@ -27,8 +27,8 @@ export async function workspaceChanges(path: string) {
       )
     : undefined;
 }
-export async function filesystemDiff(path: string) {
-  const changes = (await workspaceChanges(path)) ?? [];
+export async function filesystemDiff(path: string, ignoredPaths: readonly string[] = []) {
+  const changes = ((await workspaceChanges(path)) ?? []).filter((change) => !ignoredPaths.includes(change.path));
   let text = changes.map((c) => `${c.type.toUpperCase()} ${c.path}`).join("\n");
   for (const change of changes.filter((c) => c.type !== "delete").slice(0, 30))
     try {

@@ -1,0 +1,102 @@
+[
+  {
+    "project": "acrouter",
+    "repository": "LanceZPF/agent-as-a-router",
+    "commit": "e43839edb0d5d0a9feec2f7078019406ab4d64bd",
+    "asset": "LICENSE",
+    "url": "https://raw.githubusercontent.com/LanceZPF/agent-as-a-router/e43839edb0d5d0a9feec2f7078019406ab4d64bd/LICENSE",
+    "license": "MIT",
+    "sha256": "1126322e2cc8d165adc4c792eeb195717de2bcc7b39be1ce77959d78e87ef685",
+    "use": "methodological reference; no code copied"
+  },
+  {
+    "project": "acrouter",
+    "repository": "LanceZPF/agent-as-a-router",
+    "commit": "e43839edb0d5d0a9feec2f7078019406ab4d64bd",
+    "asset": "src/routing/trained_routers.py",
+    "url": "https://raw.githubusercontent.com/LanceZPF/agent-as-a-router/e43839edb0d5d0a9feec2f7078019406ab4d64bd/src/routing/trained_routers.py",
+    "license": "MIT",
+    "sha256": "b57b7488ec97af664b59954d21ab40fc14a0db300239024a25cb56a18c851d2a",
+    "use": "methodological reference; no code copied"
+  },
+  {
+    "project": "acrouter",
+    "repository": "LanceZPF/agent-as-a-router",
+    "commit": "e43839edb0d5d0a9feec2f7078019406ab4d64bd",
+    "asset": "src/routing/data_manager.py",
+    "url": "https://raw.githubusercontent.com/LanceZPF/agent-as-a-router/e43839edb0d5d0a9feec2f7078019406ab4d64bd/src/routing/data_manager.py",
+    "license": "MIT",
+    "sha256": "a4874a1e8b5cf0e8b488805dd652bd25d256f5858e3e61a395b07253b186a307",
+    "use": "methodological reference; no code copied"
+  },
+  {
+    "project": "acrouter",
+    "repository": "LanceZPF/agent-as-a-router",
+    "commit": "e43839edb0d5d0a9feec2f7078019406ab4d64bd",
+    "asset": "README.md",
+    "url": "https://raw.githubusercontent.com/LanceZPF/agent-as-a-router/e43839edb0d5d0a9feec2f7078019406ab4d64bd/README.md",
+    "license": "MIT",
+    "sha256": "8ec7008b3e729b7a043fa876ccaae1708c9c8fd82acfa47af7162a627bd555b8",
+    "use": "methodological reference; no code copied"
+  },
+  {
+    "project": "twin",
+    "repository": "CommonstackAI/TwinRouterBench",
+    "commit": "7cbb0deac8f697b5faa8489c309560e53d2ef088",
+    "asset": "LICENSE",
+    "url": "https://raw.githubusercontent.com/CommonstackAI/TwinRouterBench/7cbb0deac8f697b5faa8489c309560e53d2ef088/LICENSE",
+    "license": "Apache-2.0",
+    "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "use": "methodological reference; no code copied"
+  },
+  {
+    "project": "twin",
+    "repository": "CommonstackAI/TwinRouterBench",
+    "commit": "7cbb0deac8f697b5faa8489c309560e53d2ef088",
+    "asset": "data/static/manifest.json",
+    "url": "https://raw.githubusercontent.com/CommonstackAI/TwinRouterBench/7cbb0deac8f697b5faa8489c309560e53d2ef088/data/static/manifest.json",
+    "license": "Apache-2.0",
+    "sha256": "e575b8cc8e33bba993f2d1bcf09b4ee6940fbb098c9255a9c8e5ef7c6771e726",
+    "use": "methodological reference; no code copied"
+  },
+  {
+    "project": "twin",
+    "repository": "CommonstackAI/TwinRouterBench",
+    "commit": "7cbb0deac8f697b5faa8489c309560e53d2ef088",
+    "asset": "data/static/question_bank.jsonl",
+    "url": "https://raw.githubusercontent.com/CommonstackAI/TwinRouterBench/7cbb0deac8f697b5faa8489c309560e53d2ef088/data/static/question_bank.jsonl",
+    "license": "Apache-2.0",
+    "sha256": "5b4f90c24643b214a9b0f26bf4e05afc742554262f4ef405e0b3b4a4cce503f4",
+    "use": "weak coding state/tier supervision"
+  },
+  {
+    "project": "twin",
+    "repository": "CommonstackAI/TwinRouterBench",
+    "commit": "7cbb0deac8f697b5faa8489c309560e53d2ef088",
+    "asset": "swerouter/router.py",
+    "url": "https://raw.githubusercontent.com/CommonstackAI/TwinRouterBench/7cbb0deac8f697b5faa8489c309560e53d2ef088/swerouter/router.py",
+    "license": "Apache-2.0",
+    "sha256": "5b64122c97d62eef4562fc68e205cc8e8a18c7ad232232f7584f5f3ce62a001f",
+    "use": "methodological reference; no code copied"
+  },
+  {
+    "project": "swesmith",
+    "repository": "SWE-bench/SWE-smith",
+    "commit": "9b74ac08118a85c39c356802f7961893af73e07f",
+    "asset": "LICENSE",
+    "url": "https://raw.githubusercontent.com/SWE-bench/SWE-smith/9b74ac08118a85c39c356802f7961893af73e07f/LICENSE",
+    "license": "MIT",
+    "sha256": "f5485bde0430fdbecd6efc6b704ab330257f4581e51d90687cc265b92c35202b",
+    "use": "deferred; no trajectories imported"
+  },
+  {
+    "project": "llmrouter",
+    "repository": "ulab-uiuc/LLMRouter",
+    "commit": "338335d24e29c26f66b0f11dc9a3b50fe3e742c1",
+    "asset": "LICENSE",
+    "url": "https://raw.githubusercontent.com/ulab-uiuc/LLMRouter/338335d24e29c26f66b0f11dc9a3b50fe3e742c1/LICENSE",
+    "license": "MIT",
+    "sha256": "905c5b3e88f78dc96ed4d0b8ec1c0a20fbb3122988b7d992be64d751836ecc92",
+    "use": "optional baseline deferred"
+  }
+]

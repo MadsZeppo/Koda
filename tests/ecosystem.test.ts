@@ -619,8 +619,11 @@ test("automatic project-local checks execute in cwd; source mutations are reject
       undefined,
       checks,
     );
-    assert.equal(bad.status, "FAILED");
+    assert.equal(bad.status, "NOT_FULLY_VERIFIED");
+    assert.equal(bad.checks[0]!.outcome, "INFRA_FAILURE");
+    assert.equal(bad.checks[0]!.unavailable, "verification_source_mutation");
     assert.match(bad.checks[0]!.stderr, /modified repository source/);
+    assert.match(bad.checks[0]!.stderr, /Verification changed paths: packages\/a\/value.txt/);
     assert.equal(
       await readFile(join(f.root, "packages/a/value.txt"), "utf8"),
       "correct",
@@ -1112,7 +1115,7 @@ test(`workspace DIRECT final verification: ${baselineFails ? "unchanged baseline
     assert.equal(result.execution_strategy, "direct");
     assert.equal(result.plannerModelCalls, 0);
     assert.equal(calls, 1);
-    assert.equal(result.status, baselineFails ? "CANDIDATE_IMPROVEMENT" : "FAILED");
+    assert.equal(result.status, baselineFails ? "VERIFIED_SUCCESS" : "FAILED");
     assert.equal(result.verificationDimensions!.test, "PASS");
     assert.equal(result.verificationDimensions!.check, "FAIL");
     assert.equal(
@@ -1185,5 +1188,75 @@ test("recursive workspace contracts retain local availability and unsupported ma
     );
   } finally {
     await f.close();
+  }
+});
+
+for (const gitRepo of [true, false]) test(`verification permits untracked compiler caches but rejects source mutation (${gitRepo ? "git" : "folder"})`, async () => {
+  const cache = JSON.stringify({ version: "5.9.3", fileNames: ["value.ts"], root: [1] });
+  const f = await fixture({ "package.json": pkg({ typecheck: "node check.cjs" }),
+    "value.ts": "export const value = 1;\n",
+    "check.cjs": `require('node:fs').writeFileSync('tsconfig.tsbuildinfo', ${JSON.stringify(cache)});`,
+  });
+  try {
+    if (!gitRepo) await rm(join(f.root, ".git"), { recursive: true, force: true });
+    let p = await f.profile();
+    let candidates = verificationPlan(p, ["value.ts"], true);
+    const result = await verify(f.root, ["npm run typecheck"], 10000, undefined, undefined, candidates);
+    assert.equal(result.status, "VERIFIED_SUCCESS", JSON.stringify(result));
+    await writeFile(join(f.root, "check.cjs"), `require('node:fs').writeFileSync('tsconfig.tsbuildinfo', ${JSON.stringify(cache)});require('node:fs').writeFileSync('value.ts','wrong');`);
+    p = await f.profile(); candidates = verificationPlan(p, ["value.ts"], true);
+    const rejected = await verify(f.root, ["npm run typecheck"], 10000, undefined, undefined, candidates);
+    assert.equal(rejected.status, "NOT_FULLY_VERIFIED", JSON.stringify(rejected));
+    assert.equal(rejected.checks[0]!.unavailable, "verification_source_mutation");
+    assert.match(rejected.checks[0]!.stderr, /Verification changed paths: value.ts/);
+    assert.equal(await readFile(join(f.root, "value.ts"), "utf8"), "export const value = 1;\n");
+    const relative = verificationAgainstBaseline(rejected, rejected);
+    assert.equal(relative.status, "NOT_FULLY_VERIFIED");
+  } finally { await f.close(); }
+});
+
+test("tracked compiler cache and invalid cache contents remain protected", async () => {
+  for (const tracked of [true, false]) {
+    const f = await fixture({ "package.json": pkg({ typecheck: "node check.cjs" }),
+      ...(tracked ? { "tsconfig.tsbuildinfo": JSON.stringify({version:"5.9.3",fileNames:["original.ts"]}) } : {}),
+      "check.cjs": tracked
+        ? "require('node:fs').writeFileSync('tsconfig.tsbuildinfo',JSON.stringify({version:'5.9.3',fileNames:['changed.ts']}))"
+        : "require('node:fs').writeFileSync('tsconfig.tsbuildinfo','not a compiler cache')",
+    });
+    try {
+      const candidates = verificationPlan(await f.profile(), [], true);
+      const result = await verify(f.root, ["npm run typecheck"], 10000, undefined, undefined, candidates);
+      assert.equal(result.status, "NOT_FULLY_VERIFIED");
+      assert.match(result.checks[0]!.stderr, /Verification changed paths: tsconfig.tsbuildinfo/);
+    } finally { await f.close(); }
+  }
+});
+
+test("Next build route-type refresh is permitted; other generated-declaration edits are rejected", async () => {
+  const before = '/// <reference types="next" />\n/// <reference types="next/image-types/global" />\nimport "./.next/dev/types/routes.d.ts";\n\n// NOTE: This file should not be edited\n// see framework docs\n';
+  const after = before.replace('/dev/types/', '/types/');
+  const {nextGeneratedTypeRefresh}=await import('../src/verifier/verifier.js');
+  assert.equal(nextGeneratedTypeRefresh(before,after),true);
+  assert.equal(nextGeneratedTypeRefresh(before,after+'declare const hacked: any;\n'),false);
+  assert.equal(nextGeneratedTypeRefresh(before,after.replace('next/image-types/global','unrelated')),false);
+  for (const declaredNext of [true,false]) {
+    const f=await fixture({'package.json':pkg({build:'node build.cjs'},declaredNext?{dependencies:{next:'16.0.0'}}:{}),
+      'next-env.d.ts':before,'build.cjs':`require('node:fs').writeFileSync('next-env.d.ts',${JSON.stringify(after)});`});
+    try {
+      if (declaredNext) {
+        await mkdir(join(f.root, "node_modules/next"), { recursive: true });
+        await writeFile(join(f.root, "node_modules/next/package.json"), '{"name":"next","version":"16.0.0"}');
+      }
+      const candidates=verificationPlan(await f.profile(),['next-env.d.ts'],true);
+      const result=await verify(f.root,['npm run build'],10000,undefined,undefined,candidates);
+      assert.equal(result.status,declaredNext?'VERIFIED_SUCCESS':'NOT_FULLY_VERIFIED',JSON.stringify(result));
+      assert.equal(await readFile(join(f.root,'next-env.d.ts'),'utf8'),before);
+      if(declaredNext) {
+        await writeFile(join(f.root,'build.cjs'),`require('node:fs').writeFileSync('next-env.d.ts',${JSON.stringify(after+'declare const hacked: any;\n')});`);
+        const bad=await verify(f.root,['npm run build'],10000,undefined,undefined,candidates);
+        assert.equal(bad.status,'NOT_FULLY_VERIFIED');
+        assert.equal(bad.checks[0]!.unavailable,'verification_source_mutation');
+      }
+    } finally {await f.close();}
   }
 });
