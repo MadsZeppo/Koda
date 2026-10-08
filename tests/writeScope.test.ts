@@ -11,7 +11,7 @@ import {
 } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { WriteScope } from "../src/repo/writeScope.js";
+import { scopedCommand, WriteScope } from "../src/repo/writeScope.js";
 import { AgentTools } from "../src/agent/tools.js";
 import { Logger } from "../src/telemetry/logger.js";
 import { git } from "../src/repo/commands.js";
@@ -186,6 +186,20 @@ test("shell transactions discard sibling/ignored/deleted writes, preserve earlie
     await rm(f.root, { recursive: true, force: true });
   }
 });
+test("scoped disposable commands may update local Git metadata without copying it back", async (t) => {
+  const f = await fixture();
+  t.after(() => rm(f.root, { recursive: true, force: true }));
+  const beforeGitConfig = await readFile(join(f.repo, ".git/config"), "utf8");
+  const result = await scopedCommand(f.repo, f.scope, async (copy) => {
+    await writeFile(join(copy, ".git/config"), "[changed]\nvalue = true\n");
+    await writeFile(join(copy, "src/a.ts"), "candidate source\n");
+    return { command: "test runner", cwd: copy, exitCode: 0, stdout: "", stderr: "", wallClockMs: 1, timedOut: false };
+  }, 5000);
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(await readFile(join(f.repo, "src/a.ts"), "utf8"), "candidate source\n");
+  assert.equal(await readFile(join(f.repo, ".git/config"), "utf8"), beforeGitConfig);
+});
+
 test("focused worker context excludes independent siblings but retains tests and read-only imports", async () => {
   const f = await fixture();
   try {

@@ -80,7 +80,7 @@ import {
   discoverExistingNavigationOwner,
   requestsNavigationMutation,
 } from "./openHandsExplorer.js";
-import { planCodingHandoff } from "./handoffPlanner.js";
+import { planCodingHandoff, verificationRepairHandoff } from "./handoffPlanner.js";
 import { execa } from "execa";
 import {
   completionReviewMessages,
@@ -1363,7 +1363,7 @@ export async function implement(
   let operationalRetries = 0;
   const retriedTransientModels = new Set<string>();
   let completionContinuations = 0;
-  let verificationRepairUsed = false;
+  let verificationRepairRounds = 0;
   let verificationRepairPending = false;
   let verificationFailureBeforeRepair: VerificationResult | undefined;
   let retainedReviewChanges: CompletionReviewInput["fileChanges"] = [];
@@ -1522,6 +1522,18 @@ export async function implement(
             writeScope.paths[0] !== ".",
         });
 
+    // A concrete verification regression needs progressive diagnosis, not
+    // another one-shot edit packet. Keep the same model, candidate and scope.
+    if (verificationRepairPending && handoff && !injectedWorker) {
+      gateway.logger.log("execution_mode_fallback", {
+        subtaskId: subtask.id,
+        from: handoff.mode,
+        to: "agentic",
+        reason: "verification_repair_requires_progressive_diagnosis",
+        model,
+      });
+      handoff = verificationRepairHandoff(handoff);
+    }
     if (handoff?.mode === "aider" && !injectedWorker) {
       const gitAvailable =
         (
@@ -1740,7 +1752,7 @@ export async function implement(
       // Only the explicit tiny fast path hands off after the first edit.
       // Progressive Agentic tasks and completion repair may require more edits.
       returnOnMutation:
-        (!completionRepair || completionRepair.unresolvedRequirementIds.includes("VERIFICATION_REGRESSION")) &&
+        !completionRepair &&
         writeScope.paths.length === 1 &&
         (!!options.tinyDirect ||
           (fingerprint.scope === "single" &&
@@ -3274,15 +3286,15 @@ export async function implement(
       !options.stableRepair &&
       !((executionPlan?.authority === "cold-start" || executionPlan?.authority === "openrouter-auto") &&
         executionPlan.approvedCandidateSet.some(candidate => candidate.model.id !== model && !excluded.includes(candidate.model.id))) &&
-      !verificationRepairUsed
+      verificationRepairRounds < (worker instanceof AgenticCodingWorker ? 2 : 1)
     ) {
-      verificationRepairUsed = true;
+      verificationRepairRounds++;
       retainedReviewChanges = candidateFileChanges;
       retainedReviewPaths = candidateReviewPaths;
       verificationRepairPending = true;
       verificationFailureBeforeRepair = attemptVerification;
       diagnostics = [
-        "Repair only the reported failures against the original task contract. Read the implementation and failing test before deciding what to change. Diagnose each failing assertion as implementation error, newly authored expectation error, or infrastructure; derive the expected result independently from the original contract and legal input. Inspect source and failing assertions together. A newly generated test may have a miscalculated expected result or an out-of-contract input; establish concrete contract evidence before correcting it. Never weaken existing requirements or pre-existing tests. Do not add unrelated edge cases during this repair.",
+        "Repair all reported failures against the original task contract before finishing, not only the first assertion. Read the implementation and failing test before deciding what to change. Diagnose each failing assertion as implementation error, newly authored expectation error, or infrastructure; derive the expected result independently from the original contract and legal input. Inspect source and failing assertions together. A newly generated test may have a miscalculated expected result or an out-of-contract input; establish concrete contract evidence before correcting it. Never weaken existing requirements or pre-existing tests. Do not add unrelated edge cases during this repair.",
         `Changed files: ${result.changedPaths.join(", ")}`,
         ...candidateVerification.checks
           .filter((check) => check.outcome === "CHECK_FAIL")
@@ -3318,6 +3330,7 @@ export async function implement(
         );
       }
       gateway.logger.log("verification_repair", {
+        repair_round: verificationRepairRounds,
         subtaskId: subtask.id,
         model,
         changed_paths: result.changedPaths,

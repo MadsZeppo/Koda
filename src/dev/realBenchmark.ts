@@ -11,12 +11,16 @@ import {
   benchmarkArms,
 } from "./claudeBenchmark.js";
 import { runtimeInfrastructureFailure } from "../verifier/verifier.js";
-import { snapshotTree } from "../workspace/files.js";
+import { changesBetween, snapshotTree } from "../workspace/files.js";
+import type { Snapshot } from "../workspace/files.js";
 import { codexCost } from "./codexCost.js";
 
 export const arms = ["routing-v1", "codex", "strongest", "cheapest"] as const;
 // Resolve Koda's runtime dependency here, never relative to the target repo.
 export const benchmarkTsxLoader = import.meta.resolve("tsx");
+export function benchmarkChangedPaths(before: Snapshot, after: Snapshot) {
+  return changesBetween(before, after).map((change) => change.path);
+}
 const check = z.object({
   argv: z.array(z.string()).min(1),
   timeoutMs: z.number().positive().default(120000),
@@ -212,7 +216,7 @@ async function atomic(path: string, value: unknown) {
   await writeFile(`${path}.tmp`, JSON.stringify(value, null, 2));
   await rename(`${path}.tmp`, path);
 }
-async function command(
+export async function benchmarkCheck(
   c: z.infer<typeof check>,
   cwd: string,
   extra: string[] = [],
@@ -253,6 +257,7 @@ export async function runRealBenchmark(options: {
   claudeModels?: string[];
   selectedArms?: string[];
   limit?: number;
+  baseline?: (repo:string, oracle:string, verification:z.infer<typeof check>[], acceptance:z.infer<typeof check>)=>Promise<{checks:Awaited<ReturnType<typeof benchmarkCheck>>[];oracle:Awaited<ReturnType<typeof benchmarkCheck>>}>;
   execute?: (job: {
     arm: string;
     repo: string;
@@ -461,10 +466,10 @@ export async function runRealBenchmark(options: {
           JSON.stringify(oracleHashes[task.id])
         )
           throw Error("Oracle changed after benchmark inputs were frozen");
-        const baseline: Awaited<ReturnType<typeof command>>[] = [];
-        for (const c of task.verification)
-          baseline.push(await command(c, repo));
-        const baselineOracle = await command(task.acceptance, oracle, [repo]);
+        const evidence=options.baseline ? await options.baseline(repo,oracle,task.verification,task.acceptance) : undefined;
+        const baseline: Awaited<ReturnType<typeof benchmarkCheck>>[] = evidence?.checks ?? [];
+        if(!evidence) for (const c of task.verification) baseline.push(await benchmarkCheck(c,repo));
+        const baselineOracle=evidence?.oracle ?? await benchmarkCheck(task.acceptance,oracle,[repo]);
         await atomic(join(root, "baseline.json"), {
           checks: baseline,
           oracle: baselineOracle,
@@ -473,6 +478,7 @@ export async function runRealBenchmark(options: {
           throw Error(
             `Baseline environment unavailable: ${task.id}; prepare dependencies/check commands before spending`,
           );
+        const originalSnapshot = await snapshotTree(repo);
         state.reservations.push(id);
         await atomic(join(output, "state.json"), state);
         const start = Date.now();
@@ -557,17 +563,12 @@ export async function runRealBenchmark(options: {
         } catch {}
         const candidateSnapshot = await snapshotTree(repo);
         const after = [];
-        for (const c of task.verification) after.push(await command(c, repo));
-        const accepted = await command(task.acceptance, oracle, [repo]);
-        const diff = await execa(
-          "git",
-          ["status", "--porcelain", "-z", "--untracked-files=all"],
-          { cwd: repo },
-        );
-        const paths = diff.stdout
-          .split("\0")
-          .filter(Boolean)
-          .map((p) => p.slice(3));
+        for (const c of task.verification) after.push(await benchmarkCheck(c, repo));
+        const accepted = await benchmarkCheck(task.acceptance, oracle, [repo]);
+        // Track candidate changes from frozen file snapshots. The prepared
+        // container relocates .git while materializing ignored native
+        // dependencies, so post-run correctness cannot depend on Git metadata.
+        const paths = benchmarkChangedPaths(originalSnapshot, candidateSnapshot);
         const scopeOk = paths.every((p) =>
           task.writeScope.some(
             (s) =>

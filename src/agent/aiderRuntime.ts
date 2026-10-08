@@ -36,3 +36,24 @@ export async function ensureAiderRuntime(env: NodeJS.ProcessEnv = process.env) {
   }
   throw Error("AIDER_UNAVAILABLE: install aider-chat and set KODA_AIDER_PYTHON to its Python interpreter (or AIDER_BIN to its entry point)");
 }
+
+/** Preserve managed-Python aliases used by pyvenv.cfg inside the read-only sandbox. */
+export async function aiderSandboxReadRoots(python: string) {
+  const venv = dirname(dirname(python));
+  const roots = new Set([venv, dirname(dirname(await realpath(python)))]);
+  try {
+    const config = await readFile(join(venv, "pyvenv.cfg"), "utf8");
+    const home = config.match(/^home\s*=\s*(.+)$/m)?.[1]?.trim();
+    if (home?.startsWith("/")) {
+      const base = /(?:^|\/)(?:bin|Scripts)$/.test(home) ? dirname(home) : home;
+      const resolved = await realpath(base);
+      roots.add(resolved);
+      // A canonical mount alone hides the alias through which CPython locates
+      // its base installation. Mount the alias's containing runtime directory.
+      if (base !== resolved) roots.add(dirname(base));
+    }
+  } catch (error: any) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  return [...roots];
+}

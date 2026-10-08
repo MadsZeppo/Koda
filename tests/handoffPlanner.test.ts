@@ -202,3 +202,15 @@ test("only unresolved root scope keeps the emergency progressive fallback", asyn
  const large=await planCodingHandoff({...input,routedModel:"provider/reference"});
  assert.equal(large.mode,"agentic","concrete fallback must still honor bounded packet safety");
  });
+
+test("verification repair uses progressive native execution without changing bounded packet or paths", async () => {
+ const {verificationRepairHandoff} = await import("../src/agent/handoffPlanner.js");
+ for (const mode of ["aider", "direct", "agentic"] as const) {
+  const plan = {mode,estimatedPromptBytes:1024,reason:"original",aiderFiles:{editable:["src/a.ts"],readOnly:["tests/a.test.ts"]}};
+  const repair=verificationRepairHandoff(plan);
+  assert.equal(repair.mode,"agentic");
+  assert.equal(repair.estimatedPromptBytes,1024);
+  assert.deepEqual(repair.aiderFiles,plan.aiderFiles);
+  assert.equal(plan.mode,mode);
+ }
+});

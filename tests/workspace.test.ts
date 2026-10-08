@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { createServer as createNetServer } from "node:net";
 import {
   chmod,
   link,
@@ -25,6 +26,7 @@ import { profileRepo } from "../src/repo/profiler.js";
 import {
   command,
   git,
+  linuxGitMetadataMountArguments,
   linuxTemporaryMountArguments,
 } from "../src/repo/commands.js";
 import { config } from "../src/config.js";
@@ -505,6 +507,54 @@ test("Linux /tmp workspaces have mountpoints before /tmp becomes read-only", asy
     } finally {
       await rm(parent, { recursive: true, force: true });
     }
+  }
+});
+
+test("Linux coding sandboxes can opt into writable Git metadata only for disposable copies", () => {
+  const cwd = "/tmp/koda-workspaces/run-example/aider-copy";
+  assert.deepEqual(linuxGitMetadataMountArguments(cwd), [
+    "--ro-bind", `${cwd}/.git`, `${cwd}/.git`,
+  ]);
+  assert.deepEqual(linuxGitMetadataMountArguments(cwd, true), []);
+});
+
+test("sandbox broker preserves the disposable Git metadata write opt-in", async (t) => {
+  if (process.platform !== "darwin") return;
+  const f = await sandbox("koda-broker-git-metadata-");
+  const socket = join(f.parent, "broker.sock");
+  let received: any;
+  const server = createNetServer((client) => {
+    let payload = "";
+    client.on("data", (chunk) => {
+      payload += chunk.toString();
+      if (!payload.includes("\n")) return;
+      received = JSON.parse(payload);
+      client.end(JSON.stringify({ result: {
+        command: received.cmd, cwd: received.cwd, exitCode: 0,
+        stdout: "ok", stderr: "", wallClockMs: 1, timedOut: false,
+      } }));
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socket, resolve);
+  });
+  const previousSocket = process.env.KODA_SANDBOX_BROKER;
+  const previousToken = process.env.KODA_SANDBOX_BROKER_TOKEN;
+  process.env.KODA_SANDBOX_BROKER = socket;
+  process.env.KODA_SANDBOX_BROKER_TOKEN = "test-broker-token";
+  try {
+    const result = await command(f.root, "printf ok", 5000, false, undefined, [], false,
+      undefined, process.env, false, ".", {}, [], [], true);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(received?.writableGitMetadata, true);
+  } finally {
+    if (previousSocket === undefined) delete process.env.KODA_SANDBOX_BROKER;
+    else process.env.KODA_SANDBOX_BROKER = previousSocket;
+    if (previousToken === undefined) delete process.env.KODA_SANDBOX_BROKER_TOKEN;
+    else process.env.KODA_SANDBOX_BROKER_TOKEN = previousToken;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(f.parent, { recursive: true, force: true });
   }
 });
 

@@ -9,9 +9,9 @@ shape and meaning, as well as names and paths.
 
 Verification repair retains the candidate and original baseline. Native Agentic repair uses the
 normal bounded attempt step, token, dollar and time limits rather than a single
-forced-mutation turn. Other execution modes retain their existing step bound. A newly authored expectation may be corrected only with
+forced-mutation turn. Production verification repair from DirectEdit or Aider switches the same model to native Agentic execution on the retained candidate. Injected/custom workers retain their own protocol and step bound. A newly authored expectation may be corrected only with
 contract evidence; pre-existing tests and requirements must not be weakened.
-Every repaired candidate must pass authoritative verification and completion.
+Native repair does not return on the first mutation. Up to two repair rounds may continue on the retained candidate with refreshed authoritative failure diagnostics; a round must mutate to continue, and all existing run budgets still apply. Every repaired candidate must pass authoritative verification and completion.
 
 Provider interruption is operational, not quality evidence. Unknown usage consumes
 the bounded reservation. If partial implementation passes checks but lacks required

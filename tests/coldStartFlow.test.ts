@@ -183,12 +183,12 @@ test('real pipeline blocks wrong public return shape and never applies it',async
  assert.notEqual(summary.applyResult,'applied');
 });
 
-for(const failure of ['implementation','new-expectation'] as const) test(`bounded verification repair diagnoses ${failure} with fresh source and assertion reads`,async(t)=>{
+for(const failure of ['implementation','new-expectation','partial-repair'] as const) test(`bounded verification repair diagnoses ${failure} with fresh source and assertion reads`,async(t)=>{
  const root=await mkdtemp(join(tmpdir(),'koda-contract-repair-'));t.after(()=>rm(root,{recursive:true,force:true}));
  const repo=join(root,'repo');await mkdir(join(repo,'src'),{recursive:true});await mkdir(join(repo,'tests'),{recursive:true});
  await writeFile(join(repo,'src/value.cjs'),'exports.value=1;\n');
  const original="const {test}=require('node:test');const a=require('node:assert/strict');test('existing positive invariant',()=>a.ok(require('../src/value.cjs').value>0));\n";
- const testSource=(expected:number)=>original+`test('requested value',()=>a.equal(require('../src/value.cjs').value,${expected}));\n`;
+ const testSource=(expected:number)=>original+`test('requested value',()=>a.equal(require('../src/value.cjs').value,${expected}));\n`+(failure==='partial-repair'?`test('second requested value',()=>a.equal(require('../src/value.cjs').value,${expected===3?4:expected}));\n`:'');
  await writeFile(join(repo,'tests/value.test.cjs'),original);
  await writeFile(join(repo,'package.json'),JSON.stringify({scripts:{test:'node --test tests/*.test.cjs',typecheck:'node --check src/value.cjs'}}));
  const keys=['NODE_ENV','KODA_PROVIDER_MODE','KODA_API_URL','OPENROUTER_API_KEY'];const prior=new Map(keys.map(k=>[k,process.env[k]]));
@@ -206,20 +206,20 @@ for(const failure of ['implementation','new-expectation'] as const) test(`bounde
   codingWorkerFactory:(gateway)=>{
    const worker=new AgenticCodingWorker(gateway.budget,gateway.logger,async()=>{
     turn++;let calls;
-    if(round===1)calls=turn===1?[call('read_file',{path:'src/value.cjs'}),call('read_file',{path:'tests/value.test.cjs'})]:turn===2?[call('write_file',{path:'src/value.cjs',content:`exports.value=${failure==='implementation'?3:2};\n`}),call('write_file',{path:'tests/value.test.cjs',content:testSource(failure==='new-expectation'?3:2)})]:[];
+    if(round===1)calls=turn===1?[call('read_file',{path:'src/value.cjs'}),call('read_file',{path:'tests/value.test.cjs'})]:turn===2?[call('write_file',{path:'src/value.cjs',content:`exports.value=${failure==='implementation'?3:2};\n`}),call('write_file',{path:'tests/value.test.cjs',content:testSource(failure==='implementation'?2:3)})]:[];
     else if(turn<=2){const path=turn===1?'src/value.cjs':'tests/value.test.cjs';repairReads.push(path);calls=[call('read_file',{path})];}
-    else calls=turn===3?[call('write_file',{path:failure==='implementation'?'src/value.cjs':'tests/value.test.cjs',content:failure==='implementation'?'exports.value=2;\n':testSource(2)})]:[];
+    else calls=turn===3?[call('write_file',{path:failure==='implementation'?'src/value.cjs':'tests/value.test.cjs',content:failure==='implementation'?'exports.value=2;\n':failure==='partial-repair'&&round===2?testSource(3).replace('value,3)', 'value,2)'):testSource(2)})]:[];
     return {model:id,usage:{prompt_tokens:50,completion_tokens:20,cost:.00001},message:{content:calls.length?null:'Done',tool_calls:calls}};
    });
    const originalRun=worker.run.bind(worker);worker.run=async(input)=>{
     round++;turn=0;
-    if(round===2){assert.ok(input.maxSteps>=3);assert.equal(input.context?.completionRepair?.mutationRequiredBeforeDiscovery,false);}
+    if(round>=2){assert.ok(input.maxSteps>=3);assert.equal(input.returnOnMutation,false);assert.equal(input.context?.completionRepair?.mutationRequiredBeforeDiscovery,false);}
     return originalRun(input);
    };return worker;
   },repositoryExplorerFactory:()=>({explore:({repoPath,task,profile})=>deterministicRepositoryExploration(repoPath,task,profile)})});
  assert.equal(result.status,'VERIFIED_SUCCESS',result.error);
- assert.equal(round,2);
- assert.deepEqual(repairReads,['src/value.cjs','tests/value.test.cjs']);
+ assert.equal(round,failure==='partial-repair'?3:2);
+ assert.deepEqual(repairReads,failure==='partial-repair'?['src/value.cjs','tests/value.test.cjs','src/value.cjs','tests/value.test.cjs']:['src/value.cjs','tests/value.test.cjs']);
  assert.equal(await readFile(join(repo,'src/value.cjs'),'utf8'),'exports.value=2;\n');
  assert.equal(await readFile(join(repo,'tests/value.test.cjs'),'utf8'),testSource(2));
 });

@@ -21,7 +21,7 @@ import type {
   CodingWorkerInput,
   CodingWorkerResult,
 } from "./codingWorker.js";
-import { ensureAiderRuntime } from "./aiderRuntime.js";
+import { ensureAiderRuntime, aiderSandboxReadRoots } from "./aiderRuntime.js";
 
 export type AiderEditFormat = "native" | "diff" | "whole";
 
@@ -1241,17 +1241,13 @@ export class AiderExecutor implements CodingWorker {
                       dirname(
                         bridgePath,
                       ),
-                      dirname(
-                        dirname(binary),
-                      ),
-                      dirname(
-                        dirname(
-                          await realpath(
-                            binary,
-                          ),
-                        ),
-                      ),
+                      ...await aiderSandboxReadRoots(binary),
                     ],
+
+                    // Aider runs inside scopedCommand's disposable copy. It
+                    // needs Git's local config/lock files writable; the outer
+                    // scope ignores .git and never copies that metadata back.
+                    true,
                   );
           } catch (error) {
             result = {

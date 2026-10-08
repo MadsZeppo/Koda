@@ -14,6 +14,7 @@ import OpenAI from "openai";
 import { startKodaBackend } from "../src/backend/proxy.js";
 import {
   providerTransport,
+  liteLLMTransport,
   BACKEND_CLIENT_CREDENTIAL,
 } from "../src/provider/transport.js";
 import { config } from "../src/config.js";
@@ -120,6 +121,61 @@ test("backend preserves the selected model, tools, parameters and preferences an
   });
   assert.deepEqual(await (await send(backend.url, body)).json(), completion);
   assert.equal(calls, 1);
+});
+
+test("backend proxies OpenAI Responses API calls with server-only authorization", async (t) => {
+  const body = {
+    model: "openai/gpt-5.6-sol",
+    input: [{ role: "user", content: [{ type: "input_text", text: "Inspect" }] }],
+    tools: [{ type: "function", name: "read_file", parameters: { type: "object" } }],
+    tool_choice: "auto",
+    max_output_tokens: 256,
+  };
+  const responseBody = {
+    id: "resp_mock",
+    object: "response",
+    status: "completed",
+    output: [{ id: "msg_mock", type: "message", role: "assistant", content: [{ type: "output_text", text: "Read the file." }] }],
+    usage: { input_tokens: 12, output_tokens: 4, total_tokens: 16 },
+  };
+  let calls = 0;
+  const backend = await proxy(t, (req, res, actual) => {
+    calls++;
+    assert.equal(req.url, "/v1/responses");
+    assert.equal(req.headers.authorization, `Bearer ${SERVER_KEY}`);
+    assert.deepEqual(actual, body);
+    res.end(JSON.stringify(responseBody));
+  });
+  const response = await fetch(backend.url + "/v1/responses", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${BACKEND_CLIENT_CREDENTIAL}`,
+    },
+    body: JSON.stringify(body),
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), responseBody);
+  assert.equal(calls, 1);
+});
+
+test("backend rejects malformed successful Responses API payloads as protocol failures", async (t) => {
+  const backend = await proxy(t, (_req, res) => {
+    res.end(JSON.stringify({ id: "resp_bad", object: "response", status: "completed" }));
+  });
+  const response = await fetch(backend.url + "/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "openai/gpt-5.6-sol", input: "Inspect" }),
+  });
+  assert.equal(response.status, 502);
+  assert.match((await response.json()).error.message, /malformed response \(invalid_response_object\)/);
+});
+
+test("backend LiteLLM model prefix does not duplicate an OpenAI-prefixed model ID", (t) => {
+  environment(t, { KODA_PROVIDER_MODE: "backend", KODA_API_URL: "http://localhost:8787" });
+  assert.equal(liteLLMTransport("openai/gpt-5.6-sol", "https://openrouter.ai/api/v1").model, "openai/gpt-5.6-sol");
+  assert.equal(liteLLMTransport("anthropic/claude-sonnet-4", "https://openrouter.ai/api/v1").model, "openai/anthropic/claude-sonnet-4");
 });
 
 test("backend never returns its key in response bodies, errors or forwarded headers", async (t) => {

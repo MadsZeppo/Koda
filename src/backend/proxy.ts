@@ -63,6 +63,9 @@ export async function startKodaBackend(
       return;
     }
     const chat = req.method === "POST" && path === "/v1/chat/completions";
+    // OpenHands' LiteLLM transport uses the OpenAI Responses API for current
+    // OpenAI models. Keep it on the same server-key-only proxy as chat calls.
+    const responses = req.method === "POST" && path === "/v1/responses";
     const decision = req.method === "POST" && path === "/api/alpha/decisions";
     const metadata =
       req.method === "GET" &&
@@ -74,7 +77,7 @@ export async function startKodaBackend(
       res.writeHead(status, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message, type } }));
     };
-    if (!chat && !decision && !metadata) {
+    if (!chat && !responses && !decision && !metadata) {
       fail(404, "Unknown Koda provider endpoint", "invalid_request");
       return;
     }
@@ -230,6 +233,15 @@ export async function startKodaBackend(
             // worker as an output limit rather than lose usage in a proxy 502.
             if (!truncated)
               for (const tool of tools ?? []) JSON.parse(tool.function.arguments);
+          } else if (responses) {
+            protocolFailure = "invalid_response_object";
+            if (
+              data?.object !== "response" ||
+              typeof data.id !== "string" ||
+              typeof data.status !== "string" ||
+              !Array.isArray(data.output)
+            )
+              throw Error("Malformed Responses API result");
           }
         } catch {
           fail(

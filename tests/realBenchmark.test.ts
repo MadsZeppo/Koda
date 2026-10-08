@@ -8,10 +8,11 @@ import {
   realBenchmarkSchema,
   comparisonReport,
   runRealBenchmark,
+  benchmarkChangedPaths,
   benchmarkTsxLoader,
   type BenchmarkRow,
 } from "../src/dev/realBenchmark.js";
-import { benchmarkPlan } from "../src/dev/realBenchmarkWorker.js";
+import { benchmarkPlan, configureFixedBenchmarkModel } from "../src/dev/realBenchmarkWorker.js";
 test("benchmark TS runtime loads from Koda in a target repo without node_modules", async () => {
   const repo = await mkdtemp(join(tmpdir(), "koda-runtime-loader-"));
   try {
@@ -204,4 +205,17 @@ test("benchmark plan freezes only selected compatible models", () => {
   assert.deepEqual(selected.qualityCascadeModelIds, ["strong"]);
   assert.equal(base.initialModel, "old");
   assert.ok(Object.isFrozen(selected));
+});
+
+test('fixed-model control is isolated to explicit benchmark config and pins every role',()=>{
+ const cfg:any={modelPool:{models:[{id:'cheap'},{id:'strong'}]},routing:{authority:'openrouter-auto'},registry:{CODER:'cheap',REVIEWER:'cheap'}};
+ const original=structuredClone(cfg);configureFixedBenchmarkModel(cfg);assert.deepEqual(cfg,original);
+ configureFixedBenchmarkModel(cfg,'strong');assert.equal(cfg.forceModel,'strong');assert.deepEqual(cfg.modelPool.models,[{id:'strong'}]);assert.ok(Object.values(cfg.registry).every(m=>m==='strong'));
+ assert.throws(()=>configureFixedBenchmarkModel(original,'missing'),/not configured/);
+});
+
+test("benchmark mutation detection works from snapshots when a container temporarily hides Git",()=>{
+ const before:any={files:{"src/a.py":{hash:"old",mode:0o644,size:3},"src/gone.py":{hash:"gone",mode:0o644,size:4}},fileCount:2,totalBytes:7};
+ const after:any={files:{"src/a.py":{hash:"new",mode:0o644,size:3},"src/new.py":{hash:"new",mode:0o644,size:3}},fileCount:2,totalBytes:6};
+ assert.deepEqual(benchmarkChangedPaths(before,after),["src/a.py","src/gone.py","src/new.py"]);
 });

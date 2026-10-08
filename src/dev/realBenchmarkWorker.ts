@@ -194,6 +194,16 @@ export function benchmarkPlan(
   });
 }
 
+export function configureFixedBenchmarkModel(cfg:Config,model?:string) {
+  if(model) {
+      if(!cfg.modelPool?.models.some(m=>m.id===model))throw Error("Fixed benchmark model is not configured");
+      cfg.forceModel=model;
+      cfg.modelPool!.models=cfg.modelPool!.models.filter(m=>m.id===model);
+      cfg.routing.authority="legacy";
+      cfg.registry=Object.fromEntries(Object.keys(cfg.registry).map(role=>[role,model])) as Config["registry"];
+    }
+}
+
 export async function benchmarkWorker(jobPath: string) {
   const job = JSON.parse(await readFile(jobPath, "utf8"));
   if (
@@ -234,6 +244,7 @@ export async function benchmarkWorker(jobPath: string) {
       forceModel: undefined,
     });
     configureBenchmarkRouting(cfg, job.arm);
+    configureFixedBenchmarkModel(cfg,job.fixedModel);
     cfg.routing.stateDirectory = job.stateDirectory;
     await run({
       repo: job.repo,

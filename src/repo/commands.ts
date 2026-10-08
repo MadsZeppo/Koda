@@ -43,6 +43,13 @@ export function linuxTemporaryMountArguments(cwd: string, scratch: string, readR
     "--remount-ro", "/tmp", "--tmpfs", scratch];
 }
 
+/** Keep Git metadata immutable in normal command sandboxes. Coding engines that
+ * operate on a disposable scoped copy may opt in so their local Git bookkeeping
+ * works; scopedCommand deliberately never copies .git metadata back. */
+export function linuxGitMetadataMountArguments(cwd: string, writableGitMetadata = false): string[] {
+  return writableGitMetadata ? [] : ["--ro-bind", join(cwd, ".git"), join(cwd, ".git")];
+}
+
 /** Reuse existing environments only when their interpreter and import paths can
  * be made available read-only without importing the original candidate source. */
 export async function pythonSandboxEnvironment(
@@ -212,6 +219,7 @@ async function brokeredCommand(
   nodeEnvironment?: NodeRuntimeEnvironment,
   writableRuntimeRoots: string[] = [],
   additionalReadRoots: string[] = [],
+  writableGitMetadata = false,
 ) {
   const socket = process.env.KODA_SANDBOX_BROKER;
   const token = process.env.KODA_SANDBOX_BROKER_TOKEN;
@@ -245,6 +253,7 @@ async function brokeredCommand(
           nodeEnvironment,
           writableRuntimeRoots,
           additionalReadRoots,
+          writableGitMetadata,
           additionalEnvironment: {
             OPENROUTER_API_KEY: additionalEnvironment.OPENROUTER_API_KEY,
             KODA_PROVIDER_API_KEY: additionalEnvironment.KODA_PROVIDER_API_KEY,
@@ -421,6 +430,7 @@ async function sandboxBroker(
           additionalEnvironment,
           writableRuntimeRoots,
           [...new Set(additionalReadRoots)],
+          !!message.writableGitMetadata,
         );
         client.end(JSON.stringify({ result }));
       } catch (error) {
@@ -458,6 +468,7 @@ export async function command(
   additionalEnvironment: NodeJS.ProcessEnv = {},
   writableRuntimeRoots: string[] = [],
   additionalReadRoots: string[] = [],
+  writableGitMetadata = false,
 ): Promise<CommandResult> {
   const dependencyBridges =
     inheritedBridges ?? (await dependenciesForWorkspace(cwd));
@@ -479,7 +490,7 @@ export async function command(
         command(copy, cmd, remaining, readOnly, undefined, dependencyBridges,
           strictPythonEnvironment, pythonSourceRoot, effectivePythonEnvironment,
           dependencyBootstrap, nodeProjectRoot, additionalEnvironment, writableRuntimeRoots,
-          additionalReadRoots),
+          additionalReadRoots, writableGitMetadata),
       timeoutMs,
     );
   const brokered = await brokeredCommand(
@@ -498,6 +509,7 @@ export async function command(
     registeredNode,
     writableRuntimeRoots,
     additionalReadRoots,
+    writableGitMetadata,
   );
   if (brokered) return brokered;
   const start = Date.now();
@@ -685,7 +697,7 @@ export async function command(
     const gitMetadata = join(cwd, ".git");
     try {
       await lstat(gitMetadata);
-      args.push("--ro-bind", gitMetadata, gitMetadata);
+      args.push(...linuxGitMetadataMountArguments(cwd, writableGitMetadata));
     } catch (error: any) {
       if (error.code !== "ENOENT") throw error;
     }

@@ -72,7 +72,7 @@ export function liteLLMTransport(
     ...transport,
     model:
       transport.mode === "backend"
-        ? `openai/${model}`
+        ? `openai/${model.replace(/^openai\//, "")}`
         : provider === "openrouter"
           ? `openrouter/${model}`
           : model,

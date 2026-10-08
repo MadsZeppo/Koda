@@ -482,3 +482,8 @@ export async function planCodingHandoff(
             : "localized concrete scope is handed directly to Aider",
   };
 }
+
+/** Verification repair needs fresh reads and bounded edits on the existing candidate. */
+export function verificationRepairHandoff(plan: CodingHandoffPlan): CodingHandoffPlan {
+  return {...plan, mode: "agentic", reason: "Read candidate and failing assertions before bounded repair"};
+}

@@ -61,7 +61,8 @@
     "cold-start-v3:smoke": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 research/cold-start-v3/.venv/bin/python research/cold-start-v3/src/cli.py smoke",
     "cold-start-v3:unit": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 research/cold-start-v3/.venv/bin/python -m unittest discover -s research/cold-start-v3/tests -v",
     "benchmark:auto-frontier": "tsx src/dev/autoFrontierPilot.ts",
-    "benchmark:claude-suite": "tsx src/dev/claudeTierSuite.ts"
+    "benchmark:claude-suite": "tsx src/dev/claudeTierSuite.ts",
+    "benchmark:validation": "tsx src/dev/validationSuite.ts"
   },
   "dependencies": {
     "commander": "^14.0.0",
